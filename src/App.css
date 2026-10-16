@@ -1,0 +1,1161 @@
+:root {
+  --bg: #f7f7f8;
+  --fg: #1c1c1e;
+  --muted: #6b6b70;
+  --line: #e2e2e6;
+  --accent: #2f6feb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font: 14px/1.5 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+  color: var(--fg);
+  background: #fff;
+}
+
+button {
+  padding: 6px 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+input,
+select,
+textarea {
+  font: inherit;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 9px;
+  background: #fff;
+  color: var(--fg);
+}
+
+input {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 12px;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 6px 0;
+}
+
+.path {
+  word-break: break-all;
+  margin: 4px 0;
+}
+
+.grow {
+  flex: 1;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+/* 塞进 .row 的输入框要跟着按钮伸缩，不能带默认的整行下边距 */
+.row input {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.cmdline {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.cmdline code {
+  flex: 1;
+  min-width: 0;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.cmdline .ico-btn {
+  width: 22px;
+  height: 22px;
+  margin-top: 2px;
+}
+
+/* 复制成功只换个绿色对勾，长命令旁边再塞一行文案会挤掉 code */
+.cmdline .ico-btn.ok {
+  color: #17a34a;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #b9b9be;
+  flex: none;
+}
+
+.dot.ok {
+  background: #17a34a;
+}
+
+.error {
+  background: #fdecec;
+  border-color: #f3c2c2;
+  color: #8a1c1c;
+}
+
+.detail {
+  background: #fff8e6;
+  border-color: #f0dfa8;
+}
+
+.error,
+.detail {
+  padding: 8px 10px;
+  border: 1px solid;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  font-size: 12px;
+}
+
+.error.inline {
+  margin: 4px 0;
+  padding: 2px 6px;
+}
+
+.floater {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 80vw;
+  z-index: 30;
+  margin: 0;
+}
+
+/* 启动检测页：铺满整个窗口，动作条钉在底部 */
+.setup {
+  height: 100vh;
+  overflow: auto;
+  background: #fff;
+}
+
+.setup-inner {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0 48px 28px;
+}
+
+.setup-inner .drag {
+  margin: 0 -48px;
+}
+
+.setup-inner h1 {
+  font-size: 22px;
+  margin: 0 0 6px;
+}
+
+.setup-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: auto;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+.setup-foot .row {
+  margin-top: 0;
+}
+
+button.big {
+  padding: 9px 22px;
+  font-size: 15px;
+}
+
+/* 内核路径这类长 token 不带空格，不换行就会顶破容器 */
+code {
+  overflow-wrap: anywhere;
+}
+
+.step {
+  display: flex;
+  gap: 12px;
+  padding: 16px 0;
+  border-top: 1px solid var(--line);
+}
+
+.step h3 {
+  font-size: 14px;
+  margin: 0 0 6px;
+}
+
+.badge {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #ececef;
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+}
+
+.step.ok .badge {
+  background: #17a34a;
+  color: #fff;
+}
+
+.badge svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* 主布局：左工作区，右对话 */
+/* 沉浸式标题栏（titleBarStyle: Overlay + hiddenTitle）下的拖拽条：
+   透明带子贴着窗口顶边、通栏铺满，红绿灯压在它上面，按住空白处就能拖窗口 */
+.drag {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: 48px;
+  margin: 0 -12px;
+}
+
+/* 自绘的窗口标题：红绿灯右边就是它 */
+.wtitle {
+  padding-left: 78px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  opacity: 0.72;
+  user-select: none;
+}
+
+.shell2 {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  height: 100vh;
+}
+
+.side {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 12px 12px;
+  background: var(--bg);
+  border-right: 1px solid var(--line);
+  min-height: 0;
+}
+
+.side .newbox {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.side .newbox button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.side .wsbox {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-height: 0;
+}
+
+.side .wsbox header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.wslist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1;
+  overflow: auto;
+}
+
+.wslist li.ws {
+  padding: 1px 0;
+}
+
+.wslist .wsrow {
+  display: flex;
+  align-items: center;
+  border-radius: 6px;
+}
+
+.wslist .wsrow:hover {
+  background: #ececef;
+}
+
+.wslist li.ws.on > .wsrow {
+  background: #e6ecf8;
+}
+
+.wslist .wsname {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: none;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 5px 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wslist .wsname .ico {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+}
+
+/* 区块头的图标按钮：文字版"+ 添加"像个漏了色的链接，换成 20×20 幽灵按钮 */
+.ico-btn {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  padding: 0;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+
+.ico-btn:hover {
+  background: #ececf0;
+  color: var(--fg);
+}
+
+.ico-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.ico-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sess {
+  list-style: none;
+  margin: 2px 0 4px;
+  padding: 0 0 0 12px;
+}
+
+.sess li {
+  display: flex;
+  align-items: center;
+  border-radius: 6px;
+  padding: 0 2px;
+}
+
+.sess li.on {
+  background: #e6ecf8;
+}
+
+.sess .link {
+  flex: 1;
+  border: 0;
+  background: none;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 5px 6px;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.sess .x,
+.wslist .x {
+  border: 0;
+  background: none;
+  color: var(--muted);
+  padding: 0 6px;
+  /* 常显的 × 让每一行都像待清理项；opacity 保留占位，悬浮时不抖行宽 */
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.sess li:hover .x,
+.wslist .wsrow:hover .x,
+.sess .x:focus-visible,
+.wslist .x:focus-visible {
+  opacity: 1;
+}
+
+.sess .pad {
+  padding: 5px 6px;
+  font-size: 12px;
+}
+
+.side footer {
+  display: flex;
+  gap: 6px;
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 48px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bar .muted {
+  flex: 1;
+}
+
+/* 顶栏右侧的会话累计用量 */
+.bar .stat {
+  flex: none;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 处理中的心跳：排队阶段没有任何字节，静止的文字看起来就像卡死 */
+.busy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.busy .pulse {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* 右下角两个下拉：原生控件在 WKWebView 里是一对蓝灰方框，压成灰底胶囊、箭头自绘 */
+.chip {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: none;
+  max-width: 240px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 5px 26px 5px 11px;
+  font-size: 12px;
+  color: var(--fg);
+  background-color: #f1f1f4;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 5l3 3 3-3' fill='none' stroke='%236b6b70' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 12px 12px;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.chip:hover {
+  background-color: #e6e6ea;
+}
+
+.chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.chip:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.policy {
+  max-width: 116px;
+}
+
+.thread {
+  flex: 1;
+  overflow: auto;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+/* 对话区 + 右侧轮次刻度 */
+.body {
+  position: relative;
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.rail {
+  flex: none;
+  width: 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 14px 0;
+  overflow: auto;
+  border-left: 1px solid var(--line);
+  background: #fcfcfd;
+}
+
+.rail button {
+  flex: none;
+  width: 14px;
+  height: 3px;
+  padding: 0;
+  border: 0;
+  border-radius: 2px;
+  background: #d7d7dc;
+  transition:
+    width 0.16s ease,
+    height 0.16s ease,
+    background 0.16s ease;
+}
+
+.rail button:hover,
+.rail button:focus-visible {
+  width: 22px;
+  height: 6px;
+  background: #8e8e96;
+}
+
+.rail button.on {
+  background: var(--accent);
+}
+
+/* 刻度条的悬浮预览 */
+.tip {
+  position: absolute;
+  right: 36px;
+  transform: translateY(-50%);
+  max-width: 320px;
+  background: #1c1c1e;
+  color: #f2f2f4;
+  border-radius: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  pointer-events: none;
+  z-index: 10;
+  animation: tip-in 0.14s ease-out;
+}
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+    transform: translateY(-50%) translateX(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-50%) translateX(0);
+  }
+}
+
+.msg {
+  padding: 10px 0 12px;
+}
+
+.msg + .msg {
+  border-top: 1px solid var(--line);
+}
+
+.msg.user {
+  background: #f4f6fa;
+  border-radius: 10px;
+  padding: 8px 12px;
+  margin: 6px 0;
+}
+
+.msg header {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.msg footer {
+  margin-top: 8px;
+}
+
+.msg .text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  font: inherit;
+}
+
+.fold {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  margin: 6px 0;
+  background: #fbfbfc;
+}
+
+.fold summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 工具卡标题行：工具名 + 一行摘要 + 状态，收起时也要看得出这步在干什么 */
+.fold.tool > summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.fold.tool > summary b {
+  flex: none;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.fold.tool > summary .arg {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fold.tool > summary .st {
+  flex: none;
+  font-size: 11px;
+}
+
+.fold.tool > summary .st.running,
+.fold.tool > summary .st.pending {
+  color: #b26a00;
+}
+
+.fold.tool > summary .st.error {
+  color: #8a1c1c;
+}
+
+.fold.tool > summary .st.completed {
+  color: #17a34a;
+}
+
+.code {
+  background: #1c1c1e;
+  color: #e8e8ea;
+  padding: 8px 10px;
+  border-radius: 6px;
+  overflow: auto;
+  max-height: 260px;
+  font-size: 12px;
+}
+
+.code.out {
+  background: #f2f2f4;
+  color: var(--fg);
+}
+
+.code.err {
+  background: #fdecec;
+  border: 1px solid #f3c2c2;
+  color: #8a1c1c;
+}
+
+/* 思考过程展开后单独滚，不然一轮长思考能把整屏顶走 */
+.text.scroll {
+  max-height: 200px;
+  overflow: auto;
+}
+
+/* 代码块/正文的复制角标：悬浮或键盘聚焦才显形，挂在 wrapper 上不随块内滚动跑掉 */
+.codewrap {
+  position: relative;
+}
+
+.codewrap .cp {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 24px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: rgba(28, 28, 30, 0.5);
+  color: #f2f2f4;
+  opacity: 0;
+  transition:
+    opacity 0.12s ease,
+    background 0.12s ease;
+}
+
+.codewrap .cp svg {
+  width: 13px;
+  height: 13px;
+}
+
+.codewrap:hover .cp,
+.codewrap .cp:focus-visible {
+  opacity: 1;
+}
+
+.codewrap .cp:hover {
+  background: rgba(28, 28, 30, 0.78);
+}
+
+.composer {
+  flex: none;
+  background: #fff;
+  padding: 10px 20px 14px;
+  border-top: 1px solid var(--line);
+}
+
+textarea:disabled {
+  background: #f6f7f9;
+  color: var(--muted);
+}
+
+/* 跨工作区只读预览条：内核按 x-opencode-directory 分区，读能跨区、发不能 */
+.robar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 8px;
+  padding: 5px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f4f6fa;
+  color: var(--fg);
+}
+
+.composer textarea {
+  width: 100%;
+  min-height: 76px;
+  resize: vertical;
+}
+
+.toast {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  background: #fff8e6;
+  border: 1px solid #f0dfa8;
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+
+/* 授权条：内核在 manual_mode 下会一直等 reply，不给出入口就是永久"处理中" */
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.ask {
+  border: 1px solid #f0dfa8;
+  background: #fff8e6;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+
+.ask header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.ask .pat {
+  list-style: none;
+  margin: 0 0 4px;
+  padding: 6px 8px;
+  max-height: 150px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+/* 设置面板 */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.32);
+  display: grid;
+  place-items: center;
+  z-index: 20;
+}
+
+.panel {
+  width: 560px;
+  max-width: 92vw;
+  max-height: 88vh;
+  overflow: auto;
+  background: #fff;
+  border-radius: 14px;
+  padding: 20px 24px;
+}
+
+.panel header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.panel h2 {
+  font-size: 17px;
+  margin: 0;
+}
+
+.panel h3 {
+  font-size: 13px;
+  color: var(--muted);
+  margin: 18px 0 6px;
+}
+
+/* 命令面板：挂在输入框上方，键盘优先，所以选中行要有明显底色 */
+.slash {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.08);
+  max-height: 260px;
+  overflow: auto;
+}
+
+.slash button {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  padding: 5px 8px;
+  font-size: 12px;
+  text-align: left;
+}
+
+.slash button.on {
+  background: #e6ecf8;
+}
+
+.slash b {
+  flex: none;
+  font-weight: 500;
+  color: var(--accent);
+}
+
+.slash .desc {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.slash .tag {
+  flex: none;
+  font-size: 11px;
+  color: #8a5a00;
+  background: #fff3d6;
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.slash .keys {
+  display: flex;
+  gap: 10px;
+  padding: 4px 8px 2px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+
+/* 子任务列表：task 派出去的会话是独立 session，点开就是只读预览 */
+.kids ul {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+
+.kids .link {
+  border: 0;
+  background: none;
+  padding: 3px 6px;
+  font-size: 12px;
+  text-align: left;
+  border-radius: 6px;
+}
+
+.kids .link:hover {
+  background: #ececf0;
+}
+
+.agent {
+  max-width: 150px;
+}
+
+/* 设置面板里的技能/MCP 只读清单 */
+.cap {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.cap li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.cap b {
+  flex: none;
+  font-weight: 500;
+}
+
+.cap span:last-child {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+/* AK 尾号用等宽，免得 1/l、0/O 分不清是哪把钥匙 */
+.mask {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+/* 设置面板：左侧菜单切页，右侧内容自己滚，比一栏到底好找 */
+.panel.settings {
+  display: flex;
+  width: 780px;
+  height: 540px;
+  max-height: 88vh;
+  padding: 0;
+  overflow: hidden;
+}
+
+.tabs {
+  flex: none;
+  width: 142px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 8px;
+  background: var(--bg);
+  border-right: 1px solid var(--line);
+}
+
+.tabs button {
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  text-align: left;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.tabs button:hover {
+  background: #ececf0;
+  color: var(--fg);
+}
+
+.tabs button.on {
+  background: #fff;
+  color: var(--fg);
+  font-weight: 500;
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+.pane {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 16px 22px 22px;
+}
+
+.side footer .ico-btn {
+  width: 26px;
+  height: 26px;
+}
+
+.side footer .ico-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.about {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 0 0 14px;
+  font-size: 13px;
+}
+
+.about dt {
+  color: var(--muted);
+}
+
+.about dd {
+  margin: 0;
+  /* 长 URL 要能折断，但技术栈这类带空格的一行不该在词中间断 */
+  overflow-wrap: anywhere;
+}
+
+.about .repo {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+
+.about .repo:hover {
+  color: var(--muted);
+}
+
+/* 关于页底部的技术栈，一行一个 */
+.stack {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+}
+
+.stack code {
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* 自绘右键菜单：原生菜单已在 main.tsx 全局压掉 */
+.ctx {
+  position: fixed;
+  z-index: 40;
+  min-width: 160px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fff;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.16);
+}
+
+.ctx button {
+  padding: 6px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  text-align: left;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.ctx button:hover {
+  background: #ececf0;
+}
+
+.ctx button.danger {
+  color: #d0342c;
+}
+
+.ctx button.danger:hover {
+  background: #fbe9e7;
+}

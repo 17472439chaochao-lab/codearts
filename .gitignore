@@ -1,0 +1,36 @@
+# ---- Node 前端产物与依赖 ----
+/node_modules/
+/dist/
+/dist-ssr/
+*.local
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- Rust / Tauri ----
+/src-tauri/target/
+/src-tauri/gen/schemas/
+
+# ---- 系统与编辑器 ----
+.DS_Store
+*.swp
+.idea/
+# 只保留推荐的插件清单，个人调试配置不进仓库
+.vscode/*
+!.vscode/extensions.json
+
+# ---- 日志 ----
+*.log
+
+# ---- 凭据：任何时候都不提交 ----
+# AK/SK 只该待在内核 HOME 的 cli.env 或本应用的 secrets 目录（0600 文件）里
+.env
+.env.*
+!.env.example
+cli.env
+*.pem
+*.key
+*.p12
+
+# ---- 内核选中本目录为工作区时留下的运行态 ----
+.codeartsdoer/

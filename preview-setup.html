@@ -1,0 +1,82 @@
+<!doctype html>
+<!--
+  首屏向导的浏览器预览台：用 @tauri-apps/api/mocks 顶掉 Rust IPC，
+  不装 CLI、不改本机配置也能看 Setup 的每种状态。
+  仅开发期看样式用：vite build 的入口只有 index.html，这个文件不会进包。
+  先起着 npm run tauri dev（或 npm run dev），然后浏览器打开
+    /preview-setup.html            全新机器：三项全空
+    /preview-setup.html?state=cli  只缺码道 CLI
+    /preview-setup.html?state=cred 装了 CLI、缺凭据
+    /preview-setup.html?state=dir  只差项目目录
+    /preview-setup.html?state=ready 三项齐了（进主界面，作对照）
+-->
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CodeArts Desktop · 首屏预览</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module">
+      import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
+
+      const state = new URLSearchParams(location.search).get("state") ?? "fresh";
+      // 用假路径，别把开发机的工作目录写进预览台
+      const kernelBin = "/Users/you/.codeartsdoer/installers/bin/codearts";
+      const projectDir = "/Users/you/work/demo";
+      const otherDir = "/Users/you/work/other";
+      const installed = state !== "fresh" && state !== "cli";
+      const hasCredentials = state === "ready" || state === "dir" || state === "cli";
+      const hasDir = state === "ready";
+
+      mockWindows("main");
+      mockIPC((cmd, payload) => {
+        if (cmd === "api_request") {
+          if (payload?.method === "GET" && payload?.path === "/session")
+            return [
+              {
+                id: "ses_a1",
+                title: "示例会话 A",
+                directory: projectDir,
+                time: { created: Date.now(), updated: Date.now() },
+              },
+              {
+                id: "ses_b1",
+                title: "另一个区的会话",
+                directory: otherDir,
+                time: { created: Date.now(), updated: Date.now() },
+              },
+            ];
+          return null;
+        }
+        if (cmd === "env_check")
+          return {
+            kernelInstalled: installed,
+            kernelBin: installed ? kernelBin : null,
+            hasCredentials,
+            projectDir: hasDir ? projectDir : null,
+            projects: hasDir ? [projectDir, otherDir] : [],
+            kernelHome: "/Users/you",
+          };
+        if (cmd === "kernel_upgrade") return "codearts upgrade\n当前已是最新版本 26.9.26";
+        if (cmd === "plugin:opener|open_url") return null;
+        if (cmd === "plugin:opener|reveal_item_in_dir") return null;
+        if (cmd === "kernel_status")
+          return {
+            running: false,
+            healthy: false,
+            port: null,
+            projectDir: hasDir ? projectDir : null,
+            version: null,
+            detail: null,
+          };
+        if (cmd === "credentials_status")
+          return { saved: hasCredentials, inCliEnv: false, akMask: null };
+        return null;
+      });
+
+      await import("/src/main.tsx");
+    </script>
+  </body>
+</html>
