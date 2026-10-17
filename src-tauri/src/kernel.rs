@@ -251,18 +251,8 @@ impl Kernel {
         ])
         .current_dir(&project);
         kernel_env(&mut cmd, &home, &data_dir, &ak, &sk);
-        cmd.env("OPENCODE_CONFIG", home.join(".codeartsdoer/codearts_cli.json").display().to_string())
-            .env("OPENCODE_CONFIG_FILE", "codearts_cli.json,codearts_cli.jsonc")
-            .env("OPENCODE_CHANNEL", "latest")
-            .env("OPENCODE_MODE", "tui")
-            .env("SCENARIO", "codeartsdoer")
-            .env("PLUGIN_ENV", "hc")
-            .env("CODEAGENT_USE_MESSAGE_FEEDBACK", "false")
-            .env("OMO_SEND_ANONYMOUS_TELEMETRY", "0")
-            .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
-            .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
-            .env("OPENCODE_ALWAYS_NOTIFY_UPDATE", "false")
-            .env("CODEARTS_SERVER_PASSWORD", &endpoint.password)
+        scenario_env(&mut cmd, &home);
+        cmd.env("CODEARTS_SERVER_PASSWORD", &endpoint.password)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -346,12 +336,16 @@ impl Kernel {
     /// `codearts upgrade` 是内核唯一的自更新入口（serve 里 autoupdate 被我们关了）。
     /// 它会覆盖 installers/bin/codearts，所以先停掉在跑的实例，跑完再按原样拉回来。
     pub async fn upgrade(&self, app: &tauri::AppHandle) -> Result<String> {
-        let (bin, home, data_dir, ak, sk, restart) = {
+        let (bin, home, data_dir, project, ak, sk, restart) = {
             let _gate = self.gate.lock().await;
             let settings = Settings::load(app)?;
             let bin = settings.kernel_bin()?;
             let home = settings.kernel_home();
             let data_dir = settings.kernel_data_dir();
+            // 从 Finder 启动时进程 cwd 是 /，upgrade 也会做文件夹信任检查；
+            // 用当前工作区当 cwd，并确保它在白名单里
+            let project = settings.project_dir()?;
+            trust::trust_folder(&data_dir, &project)?;
             // upgrade 也要鉴权：先取凭据，缺了就直接报错，别把在跑的内核白白停掉
             let (ak, sk) = self.credentials(&home)?;
             let restart = self.status_obj().running;
@@ -359,12 +353,13 @@ impl Kernel {
                 self.shutdown_inner().await;
                 let _ = app.emit("kernel-status", self.status_obj());
             }
-            (bin, home, data_dir, ak, sk, restart)
+            (bin, home, data_dir, project, ak, sk, restart)
         };
 
         let mut cmd = Command::new(&bin);
-        cmd.arg("upgrade");
+        cmd.arg("upgrade").current_dir(&project);
         kernel_env(&mut cmd, &home, &data_dir, &ak, &sk);
+        scenario_env(&mut cmd, &home);
         let out = cmd
             .output()
             .await
@@ -581,6 +576,24 @@ fn kernel_env(cmd: &mut Command, home: &std::path::Path, data_dir: &std::path::P
         .env("CODEARTS_CLI_AK", ak)
         .env("CODEARTS_CLI_SK", sk)
         .env_remove("NODE_TLS_REJECT_UNAUTHORIZED");
+}
+
+/// serve 与 upgrade 共用的产品场景变量；少了 SCENARIO，upgrade 会按匿名产品的路径和通道走
+fn scenario_env(cmd: &mut Command, home: &std::path::Path) {
+    cmd.env(
+        "OPENCODE_CONFIG",
+        home.join(".codeartsdoer/codearts_cli.json").display().to_string(),
+    )
+    .env("OPENCODE_CONFIG_FILE", "codearts_cli.json,codearts_cli.jsonc")
+    .env("OPENCODE_CHANNEL", "latest")
+    .env("OPENCODE_MODE", "tui")
+    .env("SCENARIO", "codeartsdoer")
+    .env("PLUGIN_ENV", "hc")
+    .env("CODEAGENT_USE_MESSAGE_FEEDBACK", "false")
+    .env("OMO_SEND_ANONYMOUS_TELEMETRY", "0")
+    .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+    .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
+    .env("OPENCODE_ALWAYS_NOTIFY_UPDATE", "false");
 }
 
 fn reap_stored_pid() {
