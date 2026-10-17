@@ -50,7 +50,8 @@ pub struct FileContent {
 pub struct PlanEntry {
     name: String,
     path: String,
-    /// workspace = 工作区内 .opencode/plans；kernel = 内核数据目录（非 Git 工作区）
+    /// workspace = 工作区内的 .codeartsdoer/plans（兼容 .opencode/plans）；
+    /// kernel = 内核数据目录或家目录下的 plans
     source: String,
     size: u64,
     mtime: u64,
@@ -82,7 +83,8 @@ pub fn plan_read(app: tauri::AppHandle, path: String) -> Result<FileContent> {
     read_plan(&roots, &path)
 }
 
-/// 内核把计划写在仓库的 `.opencode/plans`；非 Git 工作区则写进数据目录的 `plans`。
+/// 内核实际把计划写在 `<工作区>/.codeartsdoer/plans/<功能名>/plan.md`（实测模板），
+/// `.opencode/plans` 只作为旧版兼容；非 Git 工作区再把数据目录的 `plans` 兜上。
 /// 符号链接解析后必须仍落在仓库或数据目录内，否则丢掉这个根。
 fn plan_roots(settings: &Settings) -> Vec<PlanRoot> {
     let mut roots = Vec::new();
@@ -93,10 +95,18 @@ fn plan_roots(settings: &Settings) -> Vec<PlanRoot> {
             .find(|p| p.join(".git").exists())
             .unwrap_or(project.as_path())
             .to_path_buf();
-        let logical = base.join(".opencode").join("plans");
-        if let Some(root) = contained_plan_root(&logical, &base) {
-            roots.push(("workspace", root));
+        for rel in [".codeartsdoer/plans", ".opencode/plans"] {
+            let logical = base.join(rel);
+            if let Some(root) = contained_plan_root(&logical, &base) {
+                roots.push(("workspace", root));
+            }
         }
+    }
+    // `{{.codeartsdoer}}` 也可能落到用户目录；CLI 在非仓库目录会用它
+    let home = settings.kernel_home();
+    let logical = home.join(".codeartsdoer").join("plans");
+    if let Some(root) = contained_plan_root(&logical, &home) {
+        roots.push(("kernel", root));
     }
     let data = settings.kernel_data_dir();
     let logical = data.join("plans");
@@ -138,32 +148,53 @@ fn collect_plans(roots: &[PlanRoot]) -> Vec<PlanEntry> {
     let mut seen = HashSet::new();
     for (source, root) in roots {
         let Ok(root) = root.canonicalize() else { continue };
-        let Ok(entries) = std::fs::read_dir(&root) else { continue };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".md") {
-                continue;
-            }
-            let Ok(md) = entry.metadata() else { continue };
-            if !md.is_file() {
-                continue;
-            }
-            let Ok(path) = entry.path().canonicalize() else { continue };
-            // 符号链接指回另一个计划根时只列一次
-            if !path.starts_with(&root) || !seen.insert(path.clone()) {
-                continue;
-            }
-            plans.push(PlanEntry {
-                name,
-                path: path.display().to_string(),
-                source: (*source).to_string(),
-                size: md.len(),
-                mtime: mtime_of(&md),
-            });
-        }
+        walk_plans(&root, &root, 0, source, &mut plans, &mut seen);
     }
     plans.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.name.cmp(&b.name)));
     plans
+}
+
+/// 计划是一个功能一个目录，最多再向下找几层，避免把整个工作区扫一遍
+fn walk_plans(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    source: &str,
+    plans: &mut Vec<PlanEntry>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    const MAX_DEPTH: usize = 3;
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(ft) = entry.file_type() else { continue };
+        let path = entry.path();
+        if ft.is_dir() {
+            if depth < MAX_DEPTH && !name.starts_with('.') {
+                walk_plans(root, &path, depth + 1, source, plans, seen);
+            }
+            continue;
+        }
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let Ok(md) = entry.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let Ok(path) = path.canonicalize() else { continue };
+        // 符号链接指回另一个计划根时只列一次
+        if !path.starts_with(root) || !seen.insert(path.clone()) {
+            continue;
+        }
+        plans.push(PlanEntry {
+            name,
+            path: path.display().to_string(),
+            source: source.to_string(),
+            size: md.len(),
+            mtime: mtime_of(&md),
+        });
+    }
 }
 
 fn read_plan(roots: &[PlanRoot], path: &str) -> Result<FileContent> {
@@ -372,9 +403,11 @@ mod tests {
         settings.kernel_home = Some(root.0.display().to_string());
 
         let roots = plan_roots(&settings);
-        assert_eq!(roots[0].1, repo.join(".opencode").join("plans"));
+        assert_eq!(roots[0].1, repo.join(".codeartsdoer").join("plans"));
+        assert_eq!(roots[1].1, repo.join(".opencode").join("plans"));
+        assert_eq!(roots[2].1, root.0.join(".codeartsdoer").join("plans"));
         assert_eq!(
-            roots[1].1,
+            roots[3].1,
             root.0.join(".codeartsdoer").join("cli-data").join("plans")
         );
     }
@@ -385,16 +418,23 @@ mod tests {
         let plans = root.0.join("plans");
         std::fs::create_dir_all(plans.join("old.md")).unwrap();
         std::fs::write(plans.join("1760000000000-first-plan.md"), "# 计划\n").unwrap();
+        std::fs::create_dir_all(plans.join("auth-refactor")).unwrap();
+        std::fs::write(plans.join("auth-refactor").join("plan.md"), "# 认证重构\n").unwrap();
         std::fs::write(plans.join("notes.txt"), "x").unwrap();
 
         let roots = vec![("kernel", plans.clone())];
         let listed = collect_plans(&roots);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].name, "1760000000000-first-plan.md");
-        assert_eq!(listed[0].source, "kernel");
+        assert_eq!(listed.len(), 2);
+        let first = listed.iter().find(|p| p.name.ends_with("first-plan.md")).unwrap();
+        assert_eq!(first.source, "kernel");
         assert_eq!(
-            read_plan(&roots, &listed[0].path).unwrap().content.as_deref(),
+            read_plan(&roots, &first.path).unwrap().content.as_deref(),
             Some("# 计划\n")
+        );
+        let nested = listed.iter().find(|p| p.path.contains("auth-refactor")).unwrap();
+        assert_eq!(
+            read_plan(&roots, &nested.path).unwrap().content.as_deref(),
+            Some("# 认证重构\n")
         );
 
         let outside = root.0.join("outside.md");

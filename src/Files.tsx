@@ -70,6 +70,14 @@ function fmtSize(n: number): string {
 /** 内核用 `<会话创建时间>-<slug>.md` 命名，时间戳没有展示价值 */
 const planTitle = (name: string) => name.replace(/\.md$/i, "").replace(/^\d{10,}-/, "");
 
+/** 规划模式写 `<feature>/plan.md`；文件名本身没信息量时用目录名 */
+const planLabel = (p: PlanEntry) => {
+  const title = planTitle(p.name);
+  if (title.toLowerCase() !== "plan") return title;
+  const parts = p.path.split("/").filter(Boolean);
+  return parts.length > 1 ? parts[parts.length - 2] : title;
+};
+
 function fmtWhen(ms: number): string {
   if (!ms) return "";
   const d = new Date(ms);
@@ -215,7 +223,7 @@ export function FilePanel({
   useEffect(() => {
     if (tab !== "plans") return;
     return loadPlans();
-  }, [tab, loadPlans, version, root]);
+  }, [tab, loadPlans, version, root, session?.id]);
 
   // 内核写完文件会连发多次 file.edited；收拢成一次刷新，新增文件不必手动点
   useEffect(() => {
@@ -326,8 +334,10 @@ export function FilePanel({
             )}
           </p>
           {crossWs && <p className="fhint">该会话属于其他工作区，切过去才能查看这些文件</p>}
-          {!session || crossWs ? null : !wsDiffs.length ? (
-            <p className="fhint">当前会话还没有文件改动</p>
+          {crossWs ? null : !wsDiffs.length ? (
+            <p className="fhint">
+              {session ? "当前会话还没有文件改动" : "打开一个会话后显示它改过的文件"}
+            </p>
           ) : (
             <ul className="chlist">
               {wsDiffs.map((d) => {
@@ -384,7 +394,7 @@ export function FilePanel({
                   >
                     <FileIcon />
                     <span className="cinfo">
-                      <b>{planTitle(p.name)}</b>
+                      <b>{planLabel(p)}</b>
                       <span>
                         {PLAN_SOURCE_CN[p.source] ?? p.source}
                         {p.mtime ? ` · ${fmtWhen(p.mtime)}` : ""}
@@ -396,7 +406,7 @@ export function FilePanel({
             </ul>
           )}
           <p className="fnote dim">
-            Git 工作区存在 &lt;工作区&gt;/.opencode/plans；没有 Git 的工作区存在内核数据目录的 plans
+            计划由内核写在 &lt;工作区&gt;/.codeartsdoer/plans/&lt;功能名&gt;/plan.md
           </p>
         </div>
       )}

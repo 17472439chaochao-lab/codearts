@@ -209,8 +209,13 @@ export const permissionConfig = {
 
 export const sessions = {
   list: (dir?: string | null) => api<Session[]>("GET", "/session", undefined, dir),
+  get: (id: string, dir?: string | null) =>
+    api<Session>("GET", `/session/${id}`, undefined, dir),
   create: (title: string, dir?: string | null) =>
     api<Session>("POST", "/session", { title }, dir),
+  /** 内核的自动起名偶发失败会停在「新会话」，壳侧在首轮发送后用它兜底 */
+  update: (id: string, title: string, dir?: string | null) =>
+    api<Session>("PATCH", `/session/${id}`, { title }, dir),
   remove: (id: string, dir?: string | null) =>
     api<Session>("DELETE", `/session/${id}`, undefined, dir),
   messages: (id: string, dir?: string | null) =>

@@ -1284,13 +1284,20 @@ code {
   opacity: 1;
 }
 
+/* 停止用深色圆形 + 白色圆角方块，和蓝色发送键同尺寸但一眼能认出是"中断" */
 .send.stop {
-  background: #f1f1f4;
-  color: var(--fg);
+  background: #1c1c1e;
+  color: #fff;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
 .send.stop:hover:not(:disabled) {
-  background: #e5e5ea;
+  background: #000;
+}
+
+.send.stop svg {
+  width: 16px;
+  height: 16px;
 }
 
 .thread {
@@ -1621,6 +1628,65 @@ textarea:disabled {
   width: 100%;
   min-height: 76px;
   resize: vertical;
+}
+
+/* 输入区里的截图缩略图：发送前可逐张移除，避免 base64 直接铺进正文 */
+.attachrow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+.attach {
+  position: relative;
+  flex: none;
+  width: 64px;
+  height: 64px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f6f7f9;
+}
+
+.attach img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.attach button {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(28, 28, 30, 0.72);
+  color: #fff;
+  font-size: 12px;
+  line-height: 18px;
+  cursor: pointer;
+}
+
+.attach button:hover {
+  background: #000;
+}
+
+/* 消息里的图片附件：限制高度和宽度，别把整条时间线撑变形 */
+.partimg {
+  display: block;
+  max-width: min(420px, 100%);
+  max-height: 360px;
+  margin: 6px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  object-fit: contain;
 }
 
 .toast {
@@ -2353,6 +2419,122 @@ button.primary {
   max-height: 30vh;
   overflow: auto;
   margin: 7px 0 1px;
+}
+
+/*
+ * 轮末待办：和步骤胶囊分开，收在这一轮最底部一行。
+ * 跑着的时候由 .todofly 悬浮显示，结束后才落到这里。
+ */
+.turnTodo {
+  width: fit-content;
+  max-width: 100%;
+  margin: 2px 0 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: #fff;
+}
+
+.turnsum + .turnTodo {
+  margin-top: -6px;
+}
+
+.turnTodo > summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.turnTodo > summary .ck {
+  flex: none;
+  color: #17a34a;
+}
+
+.turnTodo > summary .pin {
+  flex: none;
+  color: var(--muted);
+}
+
+.turnTodo[open] {
+  border-radius: 10px;
+}
+
+.turnTodo .todoRows {
+  max-height: 30vh;
+  overflow: auto;
+  margin: 7px 0 1px;
+}
+
+/* 轮末待办夹在胶囊和下一轮之间，补回被邻接选择器断掉的分隔线 */
+.turnTodo + .msg {
+  border-top: 1px solid var(--line);
+}
+
+/* 运行中的悬浮清单：固定在对话区右上角，滚动时也看得到 */
+.todofly {
+  position: absolute;
+  top: 10px;
+  right: 34px;
+  z-index: 6;
+  width: min(320px, 42vw);
+  max-height: 38vh;
+  display: flex;
+  flex-direction: column;
+  padding: 6px 10px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 8px 28px rgba(20, 20, 30, 0.12);
+  backdrop-filter: blur(8px);
+}
+
+.todofly.folded {
+  width: auto;
+  padding: 4px 10px;
+}
+
+.tfhead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+
+.tfhead b {
+  font-weight: 500;
+}
+
+.tfprog {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #eef3fd;
+  color: var(--accent);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tfchev {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.todofly .todoRows {
+  max-height: 32vh;
+  overflow: auto;
+  margin-top: 6px;
+}
+
+.todofly .pulse-dot {
+  animation: filepulse 1.4s ease-out infinite;
 }
 
 /* 展开后的步骤清单：每步一行摘要，整行可点跳回那条消息 */

@@ -59,6 +59,46 @@ type MenuItem = { label: string; danger?: boolean; run: () => void };
 
 type Menu = { x: number; y: number; items: MenuItem[] };
 
+/** 粘贴进输入框的图片：data URL 直接随 prompt 发给内核，不落盘 */
+type Attachment = { id: string; name: string; mime: string; url: string; size: number };
+
+/** 截图通常只有几百 KB；给个上限，别让整段 base64 把输入区撑爆 */
+const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
+const IMAGE_MAX_COUNT = 4;
+const DEFAULT_TITLES = new Set(["", "新会话", "New session", "Untitled", "untitled"]);
+
+function imageTitle(raw: string, images: number): string {
+  const first = raw.split(/\r?\n/).map((s) => s.trim()).find(Boolean) ?? "";
+  const compact = first.replace(/\s+/g, " ");
+  if (compact) return compact.length > 40 ? `${compact.slice(0, 40)}…` : compact;
+  return images > 1 ? `图片会话（${images} 张）` : "图片会话";
+}
+
+const imgSize = (n: number) =>
+  n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+
+function readImage(file: File): Promise<Attachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = String(reader.result ?? "");
+      if (!url.startsWith("data:")) {
+        reject(new Error("读取图片失败"));
+        return;
+      }
+      resolve({
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name: file.name || `粘贴图片-${Date.now()}.${file.type.split("/")[1] || "png"}`,
+        mime: file.type || "image/png",
+        url,
+        size: file.size,
+      });
+    };
+    reader.onerror = () => reject(new Error("读取图片失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
 /** 上次用的模型：内核 /provider 的 default 每次重启都可能变，用户的选择要自己记住 */
 const MODEL_KEY = "codearts.model";
 const AGENT_KEY = "codearts.agent";
@@ -208,6 +248,8 @@ export default function Chat({
   const pending = useRef<string | null>(null);
   const [msgs, setMsgs] = useState<Message[]>([]);
   const [input, setInput] = useState("");
+  /** 输入区待发送的截图；只保存在内存里，发送或移除即丢弃 */
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
   /**
    * 忙的是"哪条会话"而不是整个界面：从跑着的 A 切到空闲的 B，
    * 单布尔会卡在"处理中"，点停止还会 abort 到 B 头上。
@@ -544,7 +586,13 @@ export default function Chat({
     setDelAsk(null);
     setFileView(null);
     setSessionDiffs([]);
+    setAttachments([]);
   }, [dir]);
+
+  // 切换会话时截图不要跟着漂过去，避免把 A 会话的图误发到 B
+  useEffect(() => {
+    setAttachments([]);
+  }, [active]);
 
   useEffect(() => {
     setFileView(null);
@@ -1032,26 +1080,88 @@ export default function Chat({
     setTip({ text, top: t.top - b.top + t.height / 2 });
   }
 
+  /**
+   * 内核自动起名插件偶发 AI_NoOutputGeneratedError，会把标题停在「新会话」。
+   * 壳侧在首轮后隔几秒补一次标题；若内核随后自己起好了就不再覆盖。
+   */
+  function scheduleTitleFallback(sid: string, title: string, where: string) {
+    for (const wait of [2500, 7000, 15000]) {
+      window.setTimeout(async () => {
+        try {
+          const cur = await sessions.get(sid, where);
+          if (cur.title && !DEFAULT_TITLES.has(cur.title.trim())) return;
+          const updated = await sessions.update(sid, title, where);
+          setList((l) => l.map((s) => (s.id === sid ? { ...s, ...updated } : s)));
+        } catch {
+          // 内核重启、工作区切换或会话已删：放弃这次兜底
+          return;
+        }
+      }, wait);
+    }
+  }
+
+  /** 粘贴/拖入的截图先进输入区，发送时转成 file part */
+  async function addImages(files: File[]) {
+    const room = IMAGE_MAX_COUNT - attachments.length;
+    if (room <= 0) {
+      setErr(`最多添加 ${IMAGE_MAX_COUNT} 张图片`);
+      return;
+    }
+    const take = files.slice(0, room);
+    const tooBig = take.filter((f) => f.size > IMAGE_MAX_BYTES);
+    if (tooBig.length) {
+      setErr(`单张图片不能超过 ${IMAGE_MAX_BYTES / 1024 / 1024} MB`);
+    }
+    const ok = take.filter((f) => f.size <= IMAGE_MAX_BYTES);
+    if (!ok.length) return;
+    try {
+      const loaded = await Promise.all(ok.map(readImage));
+      setAttachments((prev) => [...prev, ...loaded].slice(0, IMAGE_MAX_COUNT));
+      setErr(null);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  function onPasteImages(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const files = Array.from(e.clipboardData?.items ?? [])
+      .filter((it) => it.kind === "file" && it.type.startsWith("image/"))
+      .map((it) => it.getAsFile())
+      .filter((f): f is File => !!f);
+    if (!files.length) return;
+    // 有图片就不要把 path/文本形式再插进 textarea；纯文本粘贴保持浏览器默认行为
+    e.preventDefault();
+    void addImages(files);
+  }
+
   async function send() {
     if (sending.current || readOnly || busy || perms.length > 0 || asks.length > 0) return;
     const raw = input.trim();
-    if (!raw) {
+    const imgs = attachments;
+    if (!raw && !imgs.length) {
       setErr("输入为空");
       return;
     }
     // 侧栏标题用原始输入：命令模板展开后是几百字，标题栏放不下
     const text = expandSlash(raw, cmds);
+    const parts: unknown[] = [];
+    if (text) parts.push({ type: "text", text });
+    for (const a of imgs) {
+      parts.push({ type: "file", mime: a.mime, url: a.url, filename: a.name });
+    }
     setErr(null);
     setToast(null);
     // 一次回车只发一条：IME 提交候选词和真正发送会连着派发两个 Enter keydown，
     // 两个处理函数拿到的是同一次渲染的 input 闭包，setInput 挡不住第二次
     sending.current = true;
     setInput("");
+    setAttachments([]);
     setDismissed(null);
     try {
       let id = active;
+      const title = imageTitle(raw, imgs.length);
       if (!id) {
-        const s = await sessions.create(raw.slice(0, 40), dir);
+        const s = await sessions.create(title, dir);
         id = s.id;
         setActive(id);
         reloadList();
@@ -1059,7 +1169,7 @@ export default function Chat({
       // 先标 busy：prompt 返回前 SSE 可能已 idle，事后再 add 会卡在 Stop
       setBusySet((s) => new Set(s).add(id));
       try {
-        await sessions.prompt(id, [{ type: "text", text }], dir, model, agent);
+        await sessions.prompt(id, parts, dir, model, agent);
         stick.current = true;
       } catch (e) {
         setBusySet((s) => {
@@ -1069,6 +1179,10 @@ export default function Chat({
           return next;
         });
         throw e;
+      }
+      // 当前标题还是默认值就补一条；已有好标题（含内核自动生成）的不动
+      if (!activeSess || DEFAULT_TITLES.has(activeSess.title.trim())) {
+        scheduleTitleFallback(id, title, dir);
       }
     } catch (e) {
       setErr(String(e));
@@ -1180,6 +1294,8 @@ export default function Chat({
   const tot = totals(msgs);
   /** 每轮小结的底账：切轮、数步、给每步拉一行摘要，详见 turnsOf */
   const { stat: turnStat, owner: turnOf } = turnsOf(msgs, busy);
+  /** 全完成的旧清单不该在新一轮里继续悬浮，等内核写新清单再出现 */
+  const openTodos = todos.some((t) => t.status !== "completed" && t.status !== "cancelled");
 
   /** 父会话里那条 task 工具记录只给一个子会话 id，过程全在子会话的帧上 */
   const kidOf = (p: Part) =>
@@ -1671,8 +1787,15 @@ export default function Chat({
               // 这一轮的最后一条（再往下就是新的用户消息）后面挂这轮的小结胶囊
               const ends = mi === msgs.length - 1 || msgs[mi + 1].info.role === "user";
               const isLast = mi === msgs.length - 1;
+              const turnRunning = isLast && busy;
               const tk = ends ? turnOf[mi] : "";
               const st = tk ? turnStat[tk] : undefined;
+              // 最新一轮优先用事件快照（比分片里的 todowrite 新），历史轮用 part 还原
+              const turnTodo = turnTodos[tk]?.length
+                ? turnTodos[tk]
+                : isLast && todos.length
+                  ? todos
+                  : st?.todos;
               return (
                 <Fragment key={m.info.id}>
                   <article id={`m-${m.info.id}`} className={`msg ${m.info.role}`}>
@@ -1696,17 +1819,19 @@ export default function Chat({
                     )}
                   </article>
                   {st && (
-                    <TurnSum
-                      running={isLast && busy}
-                      pulse={editPulse}
-                      steps={st.steps}
-                      tools={st.tools}
-                      diffs={st.diffs}
-                      list={st.list}
-                      onJump={jumpTo}
-                      onOpenFile={openDiffFile}
-                      todos={turnTodos[tk] ?? (isLast ? todos : undefined)}
-                    />
+                    <>
+                      <TurnSum
+                        running={turnRunning}
+                        pulse={editPulse}
+                        steps={st.steps}
+                        tools={st.tools}
+                        diffs={st.diffs}
+                        list={st.list}
+                        onJump={jumpTo}
+                        onOpenFile={openDiffFile}
+                      />
+                      {!turnRunning && <TurnTodo todos={turnTodo} />}
+                    </>
                   )}
                 </Fragment>
               );
@@ -1721,6 +1846,8 @@ export default function Chat({
             )}
             {!msgs.length && !busy && active && <p className="muted">等待内核回复…</p>}
           </section>
+
+          {busy && openTodos && <TodoFly todos={todos} pulse={editPulse} />}
 
           {turns.length > 1 && (
             <nav className="rail" aria-label="轮次导航" onMouseLeave={() => setTip(null)}>
@@ -1845,6 +1972,24 @@ export default function Chat({
               </li>
             </ul>
           )}
+          {!!attachments.length && (
+            <div className="attachrow" aria-label="待发送的图片">
+              {attachments.map((a) => (
+                <div className="attach" key={a.id}>
+                  <img src={a.url} alt={a.name} title={`${a.name} · ${imgSize(a.size)}`} />
+                  <button
+                    type="button"
+                    onClick={() => setAttachments((list) => list.filter((x) => x.id !== a.id))}
+                    title="移除这张图片"
+                    aria-label={`移除 ${a.name}`}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+              <span className="muted small">粘贴的截图会随消息一起发给内核</span>
+            </div>
+          )}
           <textarea
             value={input}
             disabled={readOnly}
@@ -1854,11 +1999,12 @@ export default function Chat({
                   ? "子任务会话只读，回到父会话才能继续"
                   : "只读预览，切到该工作区后才能继续对话"
                 : live
-                  ? "描述要做的改动，/ 唤起命令，Enter 发送"
+                  ? "描述要做的改动，可粘贴截图，/ 唤起命令，Enter 发送"
                   : "先启动内核"
             }
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKey}
+            onPaste={onPasteImages}
           />
           <div className="row">
             <div className="ctrls">
@@ -1926,7 +2072,7 @@ export default function Chat({
                 aria-label="停止"
               >
                 <svg viewBox="0 0 16 16" aria-hidden="true">
-                  <rect x="5" y="5" width="6" height="6" rx="1.1" fill="currentColor" />
+                  <rect x="4.2" y="4.2" width="7.6" height="7.6" rx="1.7" fill="currentColor" />
                 </svg>
               </button>
             ) : (
@@ -2361,8 +2507,18 @@ const Block = memo(function Block({
       return <ReasoningFold part={part} autoOpen={autoOpen} />;
     case "tool":
       return <ToolCard part={part} onCopy={onCopy} kid={kid} />;
-    case "file":
-      return <p className="hint">附件：{part.filename ?? part.url}</p>;
+    case "file": {
+      const url = String(part.url ?? "");
+      const name = part.filename ?? "图片附件";
+      // 图片走 data URL 进消息；直接摊 url 会把整段 base64 当正文显示
+      if (
+        (String(part.mime ?? "").startsWith("image/") || url.startsWith("data:image/")) &&
+        (url.startsWith("data:") || url.startsWith("blob:") || url.startsWith("http"))
+      ) {
+        return <img className="partimg" src={url} alt={name} title={name} />;
+      }
+      return <p className="hint">附件：{name && name !== "图片附件" ? name : url}</p>;
+    }
     // @提及的 agent：不渲染的话提名就在时间线上凭空消失
     case "agent": {
       const nm = String((part as any).name ?? "");
@@ -2763,7 +2919,20 @@ type TurnStat = {
   diffs: FileDiff[];
   /** 每一步一行的摘要，胶囊展开时列出来 */
   list: { id: string; label: string }[];
+  /** 重开会话时事件快照没了，从这一轮的 todowrite part 还原清单 */
+  todos: Todo[];
 };
+
+/** `todowrite` 的入参就是整份清单；`todoread` 则把 JSON 放在 output 里 */
+function todosOfPart(part: Part): Todo[] | undefined {
+  if (part.type !== "tool" || (part.tool !== "todowrite" && part.tool !== "todoread")) return undefined;
+  const s = part.state as any;
+  const input = s?.input?.todos;
+  if (Array.isArray(input) && input.every((x: any) => typeof x?.content === "string")) {
+    return input as Todo[];
+  }
+  return part.tool === "todoread" ? parseTodos(s?.output) : undefined;
+}
 
 const clip = (s: string, n = 80) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
@@ -2812,7 +2981,13 @@ function turnsOf(msgs: Message[], busy: boolean): { stat: Record<string, TurnSta
     if (m.info.role === "user") {
       cur = m.info.id;
       const d = (m.info as any).summary?.diffs;
-      stat[cur] = { steps: 0, tools: 0, diffs: Array.isArray(d) ? (d as FileDiff[]) : [], list: [] };
+      stat[cur] = {
+        steps: 0,
+        tools: 0,
+        diffs: Array.isArray(d) ? (d as FileDiff[]) : [],
+        list: [],
+        todos: [],
+      };
       stepMsgs[cur] = [];
     }
     owner.push(cur);
@@ -2821,6 +2996,10 @@ function turnsOf(msgs: Message[], busy: boolean): { stat: Record<string, TurnSta
       if (m.info.role === "assistant") {
         s.steps += 1;
         stepMsgs[cur].push(m);
+      }
+      for (const p of m.parts) {
+        const t = todosOfPart(p);
+        if (t) s.todos = t;
       }
       // subtask 是 task 工具的另一种呈现形态，同源，两边都算才不漏"派活"这步
       s.tools += m.parts.filter((p) => p.type === "tool" || p.type === "subtask").length;
@@ -2838,8 +3017,8 @@ function turnsOf(msgs: Message[], busy: boolean): { stat: Record<string, TurnSta
 }
 
 /**
- * 一轮对话的小结胶囊：挂在该轮末尾，收起就一行「✓ 步骤 N / N · 清单 x/y · F 个文件已修改 +a -d」，
- * 展开看每一步做了什么（跑着的这步实时更新）、清单和逐文件改动。跑着的轮一直显示，纯唠嗑的一轮不出现。
+ * 一轮对话的执行小结：只报步骤和文件改动，待办清单单独由 TurnTodo 挂在轮末。
+ * 收起就一行「✓ 步骤 N / N · F 个文件已修改 +a -d」，展开看每一步做了什么。
  */
 function TurnSum({
   running,
@@ -2850,7 +3029,6 @@ function TurnSum({
   list,
   onJump,
   onOpenFile,
-  todos,
 }: {
   running: boolean;
   pulse: number;
@@ -2860,13 +3038,10 @@ function TurnSum({
   list: { id: string; label: string }[];
   onJump?: (id: string) => void;
   onOpenFile?: (d: FileDiff) => void;
-  todos?: Todo[];
 }) {
-  if (!running && !tools && !diffs.length && !todos?.length) return null;
+  if (!running && !tools && !diffs.length) return null;
   const add = diffs.reduce((n, d) => n + (d.additions ?? 0), 0);
   const del = diffs.reduce((n, d) => n + (d.deletions ?? 0), 0);
-  const done = todos ? todos.filter((t) => t.status === "completed" || t.status === "cancelled").length : 0;
-  const doing = running ? todos?.find((t) => t.status === "in_progress") : undefined;
   return (
     <details className="fold turnsum">
       <summary>
@@ -2878,12 +3053,6 @@ function TurnSum({
           </span>
         )}
         <span>{running ? (steps ? `正在执行 · ${steps} 步` : "正在执行…") : `步骤 ${steps} / ${steps}`}</span>
-        {!!todos?.length && (
-          <span className="muted">
-            · 清单 {done}/{todos.length}
-            {doing ? ` · ${doing.content}` : ""}
-          </span>
-        )}
         {!!diffs.length && (
           <span className="muted">
             · {diffs.length} 个文件已修改
@@ -2909,7 +3078,6 @@ function TurnSum({
           ))}
         </ol>
       )}
-      {!!todos?.length && <TodoRows todos={todos} />}
       {!!diffs.length && (
         <ul className="flist">
           {diffs.map((d, i) => (
@@ -2933,6 +3101,61 @@ function TurnSum({
         </ul>
       )}
     </details>
+  );
+}
+
+const doneCount = (todos: Todo[]) =>
+  todos.filter((t) => t.status === "completed" || t.status === "cancelled").length;
+
+/**
+ * 轮末待办：与步骤胶囊分开，收在该轮最底部。跑着的时候不在这里出现，
+ * 由 TodoFly 悬浮展示；一轮结束后才落到这里，回看时按轮归档。
+ */
+function TurnTodo({ todos }: { todos?: Todo[] }) {
+  if (!todos?.length) return null;
+  const done = doneCount(todos);
+  const all = done === todos.length;
+  const doing = todos.find((t) => t.status === "in_progress");
+  return (
+    <details className="fold turnTodo">
+      <summary>
+        <span className={all ? "ck" : "pin"} aria-hidden="true">
+          {all ? "✓" : "☐"}
+        </span>
+        <span>待办 {done} / {todos.length}</span>
+        {!all && doing && <span className="muted"> · {doing.content}</span>}
+      </summary>
+      <TodoRows todos={todos} />
+    </details>
+  );
+}
+
+/** 运行中的悬浮清单：绝对定位在对话区右上角，不随消息滚走，可折叠 */
+function TodoFly({ todos, pulse }: { todos: Todo[]; pulse: number }) {
+  const [fold, setFold] = useState(false);
+  if (!todos.length) return null;
+  const done = doneCount(todos);
+  return (
+    <aside className={`todofly ${fold ? "folded" : ""}`} aria-label="运行中的待办清单">
+      <button
+        type="button"
+        className="tfhead"
+        onClick={() => setFold((v) => !v)}
+        aria-expanded={!fold}
+        title={fold ? "展开待办清单" : "收起待办清单"}
+      >
+        <span className="pulse-dot" key={pulse} aria-hidden="true" />
+        <b>待办清单</b>
+        <span className="tfprog">
+          {done}/{todos.length}
+        </span>
+        <span className="grow" />
+        <span className="tfchev" aria-hidden="true">
+          {fold ? "▸" : "▾"}
+        </span>
+      </button>
+      {!fold && <TodoRows todos={todos} />}
+    </aside>
   );
 }
 

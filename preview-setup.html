@@ -836,6 +836,21 @@ class OldExportController
             window.__emit("session.deleted", { sessionID: id });
             return { id, title: parentTitle, directory: projectDir, time: { created: now, updated: now } };
           }
+          if (payload?.method === "GET" && /^\/session\/[^/]+$/.test(path)) {
+            const id = path.split("/")[2];
+            return { id, title: parentTitle, directory: projectDir, time: { created: now, updated: now } };
+          }
+          if (payload?.method === "PATCH" && /^\/session\/[^/]+$/.test(path)) {
+            const id = path.split("/")[2];
+            // 标题兜底兜底：真内核返回更新后的 session，mock 也要保持一致
+            parentTitle = String(payload?.body?.title ?? parentTitle);
+            return { id, title: parentTitle, directory: projectDir, time: { created: now, updated: now } };
+          }
+          if (payload?.method === "POST" && /^\/session\/[^/]+\/prompt_async$/.test(path)) {
+            // 粘贴截图时把 parts 留在控制台里，核对 file part 的 data URL
+            window.__lastPrompt = payload?.body;
+            return null;
+          }
           if (payload?.method === "GET" && /^\/session\/[^/]+\/todo$/.test(path))
             return state === "todo" && path === `/session/${PARENT}/todo` ? todoList : [];
           if (payload?.method === "GET" && /^\/session\/[^/]+\/diff$/.test(path))
