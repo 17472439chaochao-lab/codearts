@@ -9,6 +9,20 @@
     /preview-setup.html?state=cred 装了 CLI、缺凭据
     /preview-setup.html?state=dir  只差项目目录
     /preview-setup.html?state=ready 三项齐了（进主界面，作对照）
+    /preview-setup.html?state=task 内核在线，会话正在跑 task 子任务
+      进主界面后点侧栏「示例会话 A」，再用 window.__replay(400) 放子会话的事件帧；
+      待决区还会带一张子会话的授权卡和反问卡，window.__kidPend(600) 看它们实时弹出来
+    /preview-setup.html?state=ask 内核在线，会话卡在 question 工具上，composer 上方出题
+      选完点「提交回答」，body 会存到 window.__lastAnswer 并回放 question.replied 帧
+    /preview-setup.html?state=todo 内核在线，会话里有一张 todowrite 卡 + 轮末小结胶囊带清单进度
+      window.__advance(900) 会连发 5 帧 todo.updated，看胶囊里的清单一路走到全部完成
+    /preview-setup.html?state=stream 内核在线，一条会话里凑齐 agent/subtask/patch/retry/compaction 各类 part
+      window.__live(900) 把新接入的事件连着放一遍：busy→retry 状态、压缩提示、新版本提示、
+      危险命令横幅、file.edited 脉冲（跑着的胶囊小点跟着跳），最后回 idle；
+      展开胶囊能看到每一步一行摘要（跑着的那步实时变成"执行 xx · yy"），点一行跳回那条消息
+      window.__rename() 改名、window.__removeMsg() 撤消息，看 session.updated / message.removed 即时生效
+      window.__bridge("down") 再 window.__bridge("open")，看事件流横幅与重连后的自动补齐
+      侧栏会话行上的 × 连点两次走完「删除二次确认」，外层列表用它验证 session.deleted 的清理
 -->
 <html lang="zh-CN">
   <head>
@@ -20,6 +34,7 @@
     <div id="root"></div>
     <script type="module">
       import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
+      import { emit } from "@tauri-apps/api/event";
 
       const state = new URLSearchParams(location.search).get("state") ?? "fresh";
       // 用假路径，别把开发机的工作目录写进预览台
@@ -27,27 +42,855 @@
       const projectDir = "/Users/you/work/demo";
       const otherDir = "/Users/you/work/other";
       const installed = state !== "fresh" && state !== "cli";
-      const hasCredentials = state === "ready" || state === "dir" || state === "cli";
-      const hasDir = state === "ready";
+      const hasCredentials = state !== "fresh" && state !== "dir";
+      const hasDir = state === "ready" || state === "task" || state === "ask" || state === "todo" || state === "stream";
+      // task / ask / todo / stream 场景要的是内核在线：Chat 只在 healthy 时才发请求、才接事件流
+      const healthy = state === "task" || state === "ask" || state === "todo" || state === "stream";
+      const now = Date.now();
+
+      const PARENT = "ses_a1";
+      const KID = "ses_k1";
+      /** stream 场景演示 session.updated 改名 / session.deleted 删除：mock 数据得跟着动，重拉列表才一致 */
+      let parentTitle =
+        state === "task"
+          ? "梳理商户管理身份逻辑"
+          : state === "ask"
+            ? "角色互斥处理方案"
+            : state === "todo"
+              ? "按方案改并同步清单"
+              : state === "stream"
+                ? "改动汇总与自动重试"
+                : "示例会话 A";
+      const deleted = new Set();
+      /** question 工具的待答队列：options 摊成卡片，答完内核才继续 */
+      const askReq = {
+        id: "que_demo1",
+        sessionID: PARENT,
+        questions: [
+          {
+            header: "目标记录已有其他角色时怎么处理",
+            question: "当给某账号设置新角色、但它已经持有另一个互斥角色时，应该怎么处理？",
+            options: [
+              { label: "直接拒绝并提示", description: "要求先解除原角色。逻辑最简单、最安全。" },
+              { label: "自动切换", description: "自动释放原角色再设新角色。更顺畅，但可能误操作。" },
+              { label: "二次确认后切换", description: "弹窗确认再切。体验最好，但改动较大。" },
+            ],
+          },
+          {
+            header: "历史兼任数据怎么办",
+            question: "库里已经存在同时兼任两个角色的历史数据，这次要一起处理吗？",
+            multiple: true,
+            options: [
+              { label: "保留不动", description: "只禁止以后新增兼任。改动最小。" },
+              { label: "写迁移脚本", description: "迁移清理，需要确认保留哪个角色。" },
+            ],
+          },
+        ],
+        tool: { messageID: "msg_a2", callID: "call_q1" },
+      };
+      // 子会话发起的待决项：sessionID 是 KID，父界面上要标出"来自子任务"并给跳转
+      const kidAskReq = {
+        id: "que_kid1",
+        sessionID: KID,
+        questions: [
+          {
+            header: "身份判定的口径",
+            question: "MerchantManagerService 里超管的判定要不要把平台运营也算进去？",
+            options: [
+              { label: "只算平台超管", description: "业务员和运营都不放行。" },
+              { label: "平台超管 + 运营", description: "运营也按管理权限处理。" },
+            ],
+          },
+        ],
+        tool: { messageID: "kmsg_2", callID: "call_qk1" },
+      };
+      const kidPermReq = {
+        id: "per_kid1",
+        sessionID: KID,
+        permission: "bash",
+        patterns: ["php artisan tinker --execute='...'"],
+        always: ["bash"],
+        executeMode: "sandbox",
+        tool: { messageID: "kmsg_2", callID: "call_pk1" },
+      };
+      const kidPart = (id, extra) => ({
+        id,
+        sessionID: KID,
+        messageID: "kmsg_2",
+        type: "tool",
+        callID: `call_${id}`,
+        ...extra,
+      });
+      // 内核实测：task 工具的父侧只有一个 metadata.sessionId，过程全在子会话的帧上
+      const parentMsgs = [
+        {
+          info: {
+            id: "msg_u1",
+            role: "user",
+            sessionID: PARENT,
+            time: { created: now - 90000 },
+            agent: "build",
+          },
+          parts: [
+            {
+              id: "prt_u1",
+              type: "text",
+              sessionID: PARENT,
+              messageID: "msg_u1",
+              text: "梳理一下商户管理那边的身份判定逻辑，先给我结论。",
+            },
+          ],
+        },
+        {
+          info: {
+            id: "msg_a1",
+            role: "assistant",
+            sessionID: PARENT,
+            time: { created: now - 88000 },
+            agent: "build",
+            modelID: "deepseek-v3",
+            providerID: "huawei",
+          },
+          parts: [
+            {
+              id: "prt_task",
+              type: "tool",
+              sessionID: PARENT,
+              messageID: "msg_a1",
+              callID: "call_task",
+              tool: "task",
+              state: {
+                status: "running",
+                input: {
+                  description: "探索商户管理身份逻辑",
+                  subagent_type: "explore",
+                  prompt: "找出商户管理中判定超管/业务员的代码位置",
+                },
+                title: "探索商户管理身份逻辑",
+                metadata: { sessionId: KID },
+                time: { start: now - 40000 },
+              },
+            },
+          ],
+        },
+      ];
+
+      // question 工具在父会话上只是一张停在 running 的工具卡，真正的选项要走 /question 队列
+      const askMsgs = [
+        {
+          info: {
+            id: "msg_u2",
+            role: "user",
+            sessionID: PARENT,
+            time: { created: now - 70000 },
+            agent: "build",
+          },
+          parts: [
+            {
+              id: "prt_u2",
+              type: "text",
+              sessionID: PARENT,
+              messageID: "msg_u2",
+              text: "角色互斥这块给我定个处理方案，动手前先跟我确认。",
+            },
+          ],
+        },
+        {
+          info: {
+            id: "msg_a2",
+            role: "assistant",
+            sessionID: PARENT,
+            time: { created: now - 66000 },
+            agent: "build",
+            modelID: "deepseek-v3",
+            providerID: "huawei",
+          },
+          parts: [
+            {
+              id: "prt_q1",
+              type: "tool",
+              sessionID: PARENT,
+              messageID: "msg_a2",
+              callID: "call_q1",
+              tool: "question",
+              state: {
+                status: "running",
+                input: { questions: askReq.questions },
+                time: { start: now - 20000 },
+              },
+            },
+          ],
+        },
+      ];
+
+      /** todowrite：内核整体覆盖一份清单，input 与 output 是同一份内容 */
+      const todoList = [
+        { content: "梳理现有的角色判定入口", status: "completed", priority: "high" },
+        { content: "给互斥关系加一条数据库约束", status: "completed", priority: "high" },
+        { content: "改造切换身份的接口，走二次确认", status: "in_progress", priority: "high" },
+        { content: "补一组覆盖并发切换的用例", status: "pending", priority: "medium" },
+        { content: "顺手把旧的导出脚本重写一遍", status: "cancelled", priority: "low" },
+        { content: "跑一遍回归并整理改动说明", status: "pending", priority: "high" },
+      ];
+      const todoMsgs = [
+        {
+          info: {
+            id: "msg_u3",
+            role: "user",
+            sessionID: PARENT,
+            time: { created: now - 200000 },
+            agent: "build",
+          },
+          parts: [
+            {
+              id: "prt_u3",
+              type: "text",
+              sessionID: PARENT,
+              messageID: "msg_u3",
+              text: "按刚才的方案改，改完把清单同步一下。",
+            },
+          ],
+        },
+        {
+          info: {
+            id: "msg_a3",
+            role: "assistant",
+            sessionID: PARENT,
+            time: { created: now - 190000 },
+            agent: "build",
+            modelID: "deepseek-v3",
+            providerID: "huawei",
+          },
+          parts: [
+            {
+              id: "prt_tw1",
+              type: "tool",
+              sessionID: PARENT,
+              messageID: "msg_a3",
+              callID: "call_tw1",
+              tool: "todowrite",
+              state: {
+                status: "completed",
+                input: { todos: todoList },
+                title: "6 todos",
+                metadata: { truncated: false },
+                output: "[\n  {\n    \"content\": \"梳理现有的角色判定入口\",\n    \"status\": \"completed\",\n    \"priority\": \"high\"\n  }\n]",
+                time: { start: now - 150000, end: now - 149000 },
+              },
+            },
+          ],
+        },
+      ];
+
+      /** 文件面板的假数据：树、预览内容、会话 diff 三者共用同一批路径 */
+      const svcBefore = `<?php
+// 商户管理服务：角色判定集中在这里
+class MerchantManagerService
+{
+    public function isSuperAdmin($user)
+    {
+        return $user->role === 'super_admin';
+    }
+
+    public function canManage($user, $merchant)
+    {
+        return $this->isSuperAdmin($user);
+    }
+}
+`;
+      const svcAfter = `<?php
+// 商户管理服务：角色判定集中在这里
+class MerchantManagerService
+{
+    public function isSuperAdmin($user)
+    {
+        return $user->role === 'super_admin'
+            || $user->role === 'platform_ops';
+    }
+
+    public function canManage($user, $merchant)
+    {
+        if ($this->isSuperAdmin($user)) {
+            return true;
+        }
+
+        return $merchant->owner_id === $user->id;
+    }
+}
+`;
+      const migrationCode = `<?php
+
+use Illuminate\\Database\\Migrations\\Migration;
+use Illuminate\\Database\\Schema\\Blueprint;
+use Illuminate\\Support\\Facades\\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('merchant_managers', function (Blueprint $table) {
+            $table->unique('user_id');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('merchant_managers', function (Blueprint $table) {
+            $table->dropUnique(['user_id']);
+        });
+    }
+};
+`;
+      const oldController = `<?php
+
+class OldExportController
+{
+    public function export()
+    {
+        return response()->download(storage_path('exports/merchants.csv'));
+    }
+}
+`;
+      const changelog = `# CHANGELOG
+
+## 2026-10-16
+- 商户角色互斥：同一账号只能持有一个管理角色
+- 新增迁移 2026_10_16_role_exclusive
+- 旧导出脚本已废弃
+`;
+      const svcPath = "/Users/you/work/demo/app/Services/Merchants/MerchantManagerService.php";
+      const migrationPath = "/Users/you/work/demo/database/migrations/2026_10_16_role_exclusive.php";
+      const oldPath = "/Users/you/work/demo/app/Http/Controllers/OldExportController.php";
+      const changelogPath = "/Users/you/work/demo/CHANGELOG.md";
+      const demoTree = {
+        "": [
+          { name: "app", path: "app", dir: true, size: 0, mtime: now },
+          { name: "database", path: "database", dir: true, size: 0, mtime: now },
+          { name: "CHANGELOG.md", path: "CHANGELOG.md", dir: false, size: changelog.length, mtime: now },
+        ],
+        app: [
+          { name: "Http", path: "app/Http", dir: true, size: 0, mtime: now },
+          { name: "Services", path: "app/Services", dir: true, size: 0, mtime: now },
+        ],
+        "app/Http": [{ name: "Controllers", path: "app/Http/Controllers", dir: true, size: 0, mtime: now }],
+        "app/Http/Controllers": [
+          { name: "OldExportController.php", path: "app/Http/Controllers/OldExportController.php", dir: false, size: oldController.length, mtime: now },
+        ],
+        "app/Services": [{ name: "Merchants", path: "app/Services/Merchants", dir: true, size: 0, mtime: now }],
+        "app/Services/Merchants": [
+          { name: "MerchantManagerService.php", path: "app/Services/Merchants/MerchantManagerService.php", dir: false, size: svcAfter.length, mtime: now },
+        ],
+        database: [{ name: "migrations", path: "database/migrations", dir: true, size: 0, mtime: now }],
+        "database/migrations": [
+          { name: "2026_10_16_role_exclusive.php", path: "database/migrations/2026_10_16_role_exclusive.php", dir: false, size: migrationCode.length, mtime: now },
+        ],
+      };
+      const demoFiles = {
+        "app/Services/Merchants/MerchantManagerService.php": svcAfter,
+        "database/migrations/2026_10_16_role_exclusive.php": migrationCode,
+        "app/Http/Controllers/OldExportController.php": oldController,
+        "CHANGELOG.md": changelog,
+      };
+      /** 文件栏「计划」页签：工作区与内核数据目录各来一份 */
+      const demoPlanWorkspace = {
+        name: "1760700000000-merchant-role-migration.md",
+        path: "/Users/you/work/demo/.opencode/plans/1760700000000-merchant-role-migration.md",
+        source: "workspace",
+        size: 1160,
+        mtime: now - 60_000,
+      };
+      const demoPlanKernel = {
+        name: "1759900000000-login-refactor.md",
+        path: "/Users/you/.codeartsdoer/cli-data/plans/1759900000000-login-refactor.md",
+        source: "kernel",
+        size: 880,
+        mtime: now - 86_400_000,
+      };
+      const demoPlans = [demoPlanWorkspace, demoPlanKernel];
+      const demoPlanFiles = {
+        [demoPlanWorkspace.path]: `# 商户角色互斥迁移计划
+
+## 目标
+同一账号只能持有一个管理角色。
+
+## 改动
+- app/Services/Merchants/MerchantManagerService.php：角色写入前先清理旧角色
+- database/migrations/2026_10_16_role_exclusive.php：新增唯一约束
+
+## 验证
+1. 给同一账号写两个角色，确认第二个被拒绝
+2. 跑迁移与现有角色用例
+`,
+        [demoPlanKernel.path]: `# 登录页重构计划
+
+## 目标
+把登录表单拆成独立组件，补齐错误提示。
+
+## 步骤
+- 抽出 LoginForm
+- 把请求逻辑移到 hooks
+- 补键盘提交与错误态
+
+## 验证
+- 空密码、错误密码、成功登录三条路径
+`,
+      };
+      /** `/session/:id/diff` 的返回：before/after 全文，文件面板据此算逐行 diff */
+      const streamDiffFull = [
+        { file: svcPath, before: svcBefore, after: svcAfter, additions: 8, deletions: 2, status: "modified" },
+        { file: migrationPath, before: "", after: migrationCode, additions: 24, deletions: 0, status: "added" },
+        { file: oldPath, before: oldController, after: "", additions: 0, deletions: 12, status: "deleted" },
+      ];
+
+      /** stream 场景的每轮改动：挂在用户消息的 summary.diffs 上，胶囊展开时逐文件列出，状态三种各来一条 */
+      const streamDiffs = [
+        {
+          file: "/Users/you/work/demo/app/Services/Merchants/MerchantManagerService.php",
+          additions: 18,
+          deletions: 6,
+          status: "modified",
+        },
+        {
+          file: "/Users/you/work/demo/database/migrations/2026_10_16_role_exclusive.php",
+          additions: 34,
+          deletions: 0,
+          status: "added",
+        },
+        {
+          file: "/Users/you/work/demo/app/Http/Controllers/OldExportController.php",
+          additions: 0,
+          deletions: 12,
+          status: "deleted",
+        },
+      ];
+
+      /** stream 场景的消息：一条 assistant 走 agent/subtask/patch，另一条演示 retry/compaction */
+      const richMsgs = [
+        {
+          info: {
+            id: "msg_s1",
+            role: "user",
+            sessionID: PARENT,
+            time: { created: now - 600000 },
+            agent: "build",
+            // 内核在一轮收尾时把该轮改动写进用户消息的 summary，胶囊的"3 个文件已修改"就来自这里
+            summary: { diffs: streamDiffs },
+          },
+          parts: [
+            {
+              id: "prt_su1",
+              type: "text",
+              sessionID: PARENT,
+              messageID: "msg_s1",
+              text: "按刚才的方案把互斥改完，顺手看下旧导出脚本还有没有留的必要。",
+            },
+          ],
+        },
+        {
+          info: {
+            id: "msg_s2",
+            role: "assistant",
+            sessionID: PARENT,
+            time: { created: now - 590000, completed: now - 560000 },
+            agent: "build",
+            modelID: "deepseek-v3",
+            providerID: "huawei",
+            cost: 0.031,
+            tokens: { input: 38000, output: 2100, reasoning: 900, total: 40100 },
+          },
+          parts: [
+            { id: "prt_sa1", type: "agent", name: "build", source: "user", sessionID: PARENT, messageID: "msg_s2" },
+            { id: "prt_ss1", type: "step-start", sessionID: PARENT, messageID: "msg_s2" },
+            {
+              id: "prt_st1",
+              type: "text",
+              text: "方案落到代码里了，改动如下。",
+              sessionID: PARENT,
+              messageID: "msg_s2",
+            },
+            {
+              id: "prt_sp1",
+              type: "patch",
+              hash: "9f2c1ab",
+              files: streamDiffs.map((d) => d.file),
+              sessionID: PARENT,
+              messageID: "msg_s2",
+            },
+            {
+              id: "prt_ssub",
+              type: "subtask",
+              prompt: "检查旧导出脚本还有没有别的调用方，没有就标废弃。",
+              description: "排查导出脚本引用",
+              agent: "explore",
+              sessionID: PARENT,
+              messageID: "msg_s2",
+            },
+            { id: "prt_sf1", type: "step-finish", sessionID: PARENT, messageID: "msg_s2" },
+          ],
+        },
+        {
+          info: {
+            id: "msg_s3",
+            role: "assistant",
+            sessionID: PARENT,
+            time: { created: now - 480000, completed: now - 470000 },
+            agent: "build",
+            modelID: "deepseek-v3",
+            providerID: "huawei",
+          },
+          parts: [
+            {
+              id: "prt_sr1",
+              type: "retry",
+              attempt: 2,
+              error: { name: "APIError", data: { message: "上游 429 Too Many Requests" } },
+              time: { start: now - 480000, end: now - 476000 },
+              sessionID: PARENT,
+              messageID: "msg_s3",
+            },
+            { id: "prt_sc1", type: "compaction", auto: true, overflow: true, sessionID: PARENT, messageID: "msg_s3" },
+            {
+              id: "prt_st2",
+              type: "text",
+              text: "重试后接着跑完了：导出脚本没有别的调用方，已标废弃，实现没动。",
+              sessionID: PARENT,
+              messageID: "msg_s3",
+            },
+          ],
+        },
+        {
+          info: {
+            id: "msg_s4",
+            role: "user",
+            sessionID: PARENT,
+            time: { created: now - 460000 },
+            agent: "build",
+            // 第二轮只动了一个文件，胶囊该各自算各自的
+            summary: { diffs: [streamDiffs[1]] },
+          },
+          parts: [
+            {
+              id: "prt_su4",
+              type: "text",
+              sessionID: PARENT,
+              messageID: "msg_s4",
+              text: "顺手把废弃说明补进变更日志。",
+            },
+          ],
+        },
+        {
+          info: {
+            id: "msg_s5",
+            role: "assistant",
+            sessionID: PARENT,
+            time: { created: now - 450000, completed: now - 440000 },
+            agent: "build",
+            modelID: "deepseek-v3",
+            providerID: "huawei",
+            cost: 0.008,
+            tokens: { input: 21000, output: 800, reasoning: 200, total: 22000 },
+          },
+          parts: [
+            { id: "prt_ss2", type: "step-start", sessionID: PARENT, messageID: "msg_s5" },
+            {
+              id: "prt_t5",
+              type: "tool",
+              sessionID: PARENT,
+              messageID: "msg_s5",
+              callID: "call_t5",
+              tool: "edit",
+              state: {
+                status: "completed",
+                input: { filePath: "/Users/you/work/demo/CHANGELOG.md" },
+                title: "CHANGELOG.md",
+                output: "written",
+                time: { start: now - 448000, end: now - 445000 },
+              },
+            },
+            {
+              id: "prt_st5",
+              type: "text",
+              text: "变更日志里补了一行废弃说明。",
+              sessionID: PARENT,
+              messageID: "msg_s5",
+            },
+          ],
+        },
+      ];
+
+      // 子会话的历史：重开会话时靠 children + message 两个接口回灌，卡片不该是空的
+      const kidMsgs = [
+        {
+          info: { id: "kmsg_1", role: "user", sessionID: KID, time: { created: now - 40000 } },
+          parts: [
+            {
+              id: "kprt_ku",
+              type: "text",
+              sessionID: KID,
+              messageID: "kmsg_1",
+              text: "找出商户管理中判定超管/业务员的代码位置",
+            },
+          ],
+        },
+        {
+          info: {
+            id: "kmsg_2",
+            role: "assistant",
+            sessionID: KID,
+            time: { created: now - 39000 },
+            agent: "explore",
+          },
+          parts: [
+            { id: "kprt_s1", type: "step-start", sessionID: KID, messageID: "kmsg_2" },
+            {
+              id: "kprt_x1",
+              type: "text",
+              text: "先看根目录，再定位 Merchant 相关实现。",
+              sessionID: KID,
+              messageID: "kmsg_2",
+            },
+            kidPart("kprt_t1", {
+              tool: "bash",
+              state: {
+                status: "completed",
+                input: { command: "ls app" },
+                title: "查看项目根目录结构",
+                output: "Interfaces\nModels\nServices",
+                time: { start: now - 30000, end: now - 29000 },
+              },
+            }),
+            kidPart("kprt_t2", {
+              tool: "grep",
+              state: {
+                status: "completed",
+                input: { pattern: "超管|业务员|is_admin" },
+                title: "超管|业务员|is_admin",
+                output: "app/Services/Merchants/MerchantManagerService.php:88",
+                time: { start: now - 26000, end: now - 24000 },
+              },
+            }),
+          ],
+        },
+      ];
+
+      /** 子会话按内核真实节奏推过来的帧，__replay 会逐条 emit */
+      const kidFrames = [
+        ["message.updated", { sessionID: KID, info: { id: "kmsg_1", role: "user", sessionID: KID, time: { created: now - 40000 } } }],
+        ["message.updated", { sessionID: KID, info: { id: "kmsg_2", role: "assistant", sessionID: KID, time: { created: now - 39000 }, agent: "explore", modelID: "deepseek-v3", providerID: "huawei" } }],
+        ["message.part.updated", { sessionID: KID, part: { id: "kprt_s1", type: "step-start", sessionID: KID, messageID: "kmsg_2" } }],
+        ["message.part.updated", { sessionID: KID, part: { id: "kprt_r1", type: "reasoning", text: "", sessionID: KID, messageID: "kmsg_2", time: { start: now - 39000 } } }],
+        ["message.part.delta", { sessionID: KID, messageID: "kmsg_2", partID: "kprt_r1", field: "text", delta: "商户管理的身份判定大概率在 MerchantManagerService 里，先看目录结构。" }],
+        ["message.part.updated", { sessionID: KID, part: { id: "kprt_x1", type: "text", text: "先看根目录，再定位 Merchant 相关实现。", sessionID: KID, messageID: "kmsg_2" } }],
+        ["message.part.updated", { sessionID: KID, part: kidPart("kprt_t1", { tool: "bash", state: { status: "running", input: { command: "ls app" }, title: "查看项目根目录结构", time: { start: now - 30000 } } }) }],
+        ["message.part.updated", { sessionID: KID, part: kidPart("kprt_t1", { tool: "bash", state: { status: "completed", input: { command: "ls app" }, title: "查看项目根目录结构", output: "Interfaces\nModels\nServices", metadata: { truncated: false }, time: { start: now - 30000, end: now - 29000 } } }) }],
+        ["message.part.updated", { sessionID: KID, part: kidPart("kprt_t2", { tool: "grep", state: { status: "running", input: { pattern: "超管|业务员|is_admin" }, title: "超管|业务员|is_admin", time: { start: now - 26000 } } }) }],
+        ["message.part.updated", { sessionID: KID, part: kidPart("kprt_t2", { tool: "grep", state: { status: "completed", input: { pattern: "超管|业务员|is_admin" }, title: "超管|业务员|is_admin", output: "app/Services/Merchants/MerchantManagerService.php:88", time: { start: now - 26000, end: now - 24000 } } }) }],
+        ["message.part.updated", { sessionID: KID, part: kidPart("kprt_t3", { tool: "read", state: { status: "running", input: { filePath: "/Users/you/work/demo/app/Services/Merchants/MerchantManagerService.php" }, title: "app/Services/Merchants/MerchantManagerService.php", time: { start: now - 20000 } } }) }],
+        ["session.status", { sessionID: PARENT, status: { type: "busy" } }],
+      ];
+
+      window.__replay = (gap = 400) => {
+        kidFrames.forEach(([type, properties], i) =>
+          setTimeout(() => emit("kernel-event", { type, properties }), i * gap),
+        );
+        return kidFrames.length;
+      };
+      window.__emit = (type, properties) => emit("kernel-event", { type, properties });
+
+      /** 子会话在跑的中途抛出的待决帧：先看审批、再看反问，都带 KID */
+      const kidPendFrames = [
+        ["permission.asked", kidPermReq],
+        ["question.asked", kidAskReq],
+      ];
+      window.__kidPend = (gap = 600) => {
+        kidPendFrames.forEach(([type, properties], i) =>
+          setTimeout(() => emit("kernel-event", { type, properties }), i * gap),
+        );
+        return kidPendFrames.length;
+      };
+
+      /**
+       * 放一遍内核覆盖式推送：window.__advance(900) 会连着发 5 帧 todo.updated，
+       * 看轮末胶囊里的清单进度一路走到全部完成。
+       */
+      window.__advance = (gap = 900) => {
+        const at = (doneThrough) =>
+          todoList.map((t, i) => ({
+            ...t,
+            status: i === 4 ? "cancelled" : i < doneThrough ? "completed" : i === doneThrough ? "in_progress" : "pending",
+          }));
+        const steps = [todoList.map((t) => ({ ...t, status: "pending" })), at(0), at(2), at(3), at(6)];
+        steps.forEach((todos, i) =>
+          setTimeout(() => emit("kernel-event", { type: "todo.updated", properties: { sessionID: PARENT, todos } }), i * gap),
+        );
+        return steps.length;
+      };
+
+      /**
+       * stream 场景的连播：busy→retry、压缩、新版本、危险命令、文件脉冲、回 idle。
+       * 每一帧都对应壳里一个刚落地的处理分支，跑一遍就等于把新接入的事件过一遍。
+       */
+      const liveFrames = [
+        ["session.status", { sessionID: PARENT, status: { type: "busy" } }],
+        [
+          "session.status",
+          { sessionID: PARENT, status: { type: "retry", attempt: 2, message: "上游返回 429，2 秒后重试" } },
+        ],
+        ["session.compacted", { sessionID: PARENT }],
+        ["installation.update-available", { version: "26.10.1" }],
+        [
+          "bash.dangerous.command.detected",
+          { command: "rm -rf ~/Documents", message: "内核检测到可能造成不可恢复删除的命令，已拦下等授权" },
+        ],
+        // 跑着的胶囊小点跟着改动脉冲，idle 后落回「✓ 步骤 N / N」
+        ["file.edited", {}],
+        ["file.edited", {}],
+        ["session.status", { sessionID: PARENT, status: { type: "idle" } }],
+      ];
+      window.__live = (gap = 900) => {
+        liveFrames.forEach(([type, properties], i) =>
+          setTimeout(() => emit("kernel-event", { type, properties }), i * gap),
+        );
+        return liveFrames.length;
+      };
+
+      window.__rename = () => {
+        parentTitle = "改动汇总与自动重试（已改名）";
+        emit("kernel-event", {
+          type: "session.updated",
+          properties: {
+            sessionID: PARENT,
+            info: { id: PARENT, title: parentTitle, directory: projectDir, time: { created: now - 600000, updated: Date.now() } },
+          },
+        });
+        return parentTitle;
+      };
+
+      /** 撤掉最后一条 assistant 消息；只是界面即时效果，resync 后 mock 会照旧发回来 */
+      window.__removeMsg = () => {
+        emit("kernel-event", { type: "message.removed", properties: { sessionID: PARENT, messageID: "msg_s3" } });
+      };
+
+      /** Rust 侧 SSE 桥的链路状态：down 出横幅，再 open 会触发一次 resync 补齐 */
+      window.__bridge = (state) =>
+        emit("kernel-bridge", { state, message: state === "down" ? "event stream closed" : undefined });
 
       mockWindows("main");
       mockIPC((cmd, payload) => {
         if (cmd === "api_request") {
-          if (payload?.method === "GET" && payload?.path === "/session")
+          const path = payload?.path ?? "";
+          if (payload?.method === "GET" && path === "/session")
             return [
               {
-                id: "ses_a1",
-                title: "示例会话 A",
+                id: PARENT,
+                title: parentTitle,
                 directory: projectDir,
-                time: { created: Date.now(), updated: Date.now() },
+                time: { created: now - 90000, updated: now },
               },
               {
                 id: "ses_b1",
                 title: "另一个区的会话",
                 directory: otherDir,
-                time: { created: Date.now(), updated: Date.now() },
+                time: { created: now, updated: now },
               },
+              ...(state === "task"
+                ? [
+                    {
+                      id: KID,
+                      title: "探索商户管理身份逻辑 (@explore subagent)",
+                      parentID: PARENT,
+                      directory: projectDir,
+                      time: { created: now - 40000, updated: now - 40000 },
+                    },
+                  ]
+                : []),
+            ].filter((s) => !deleted.has(s.id));
+          if (payload?.method === "GET" && /^\/session\/[^/]+\/children$/.test(path))
+            return state === "task" && path === `/session/${PARENT}/children`
+              ? [
+                  {
+                    id: KID,
+                    title: "探索商户管理身份逻辑 (@explore subagent)",
+                    parentID: PARENT,
+                    directory: projectDir,
+                    time: { created: now - 40000, updated: now - 40000 },
+                  },
+                ]
+              : [];
+          if (payload?.method === "GET" && path === `/session/${KID}/message`)
+            return state === "task" ? kidMsgs : [];
+          if (payload?.method === "GET" && path === `/session/${PARENT}/message`)
+            return state === "task"
+              ? parentMsgs
+              : state === "ask"
+                ? askMsgs
+                : state === "todo"
+                  ? todoMsgs
+                  : state === "stream"
+                    ? richMsgs
+                    : [];
+          if (payload?.method === "DELETE" && /^\/session\/[^/]+$/.test(path)) {
+            const id = path.split("/")[2];
+            deleted.add(id);
+            // 真内核删完会广播 session.deleted，壳的列表/忙状态清理全靠这一帧
+            window.__emit("session.deleted", { sessionID: id });
+            return { id, title: parentTitle, directory: projectDir, time: { created: now, updated: now } };
+          }
+          if (payload?.method === "GET" && /^\/session\/[^/]+\/todo$/.test(path))
+            return state === "todo" && path === `/session/${PARENT}/todo` ? todoList : [];
+          if (payload?.method === "GET" && /^\/session\/[^/]+\/diff$/.test(path))
+            return state === "stream" && path === `/session/${PARENT}/diff` ? streamDiffFull : [];
+          if (payload?.method === "GET" && path === "/question")
+            return [
+              ...(state === "ask" ? [askReq] : []),
+              ...(state === "task" ? [kidAskReq] : []),
             ];
+          if (payload?.method === "POST" && /^\/question\/[^/]+\/reply$/.test(path)) {
+            // 提交后把 answers 留在控制台里，方便核对协议格式
+            window.__lastAnswer = payload?.body;
+            const qid = path.split("/")[2];
+            window.__emit("question.replied", {
+              sessionID: qid === kidAskReq.id ? KID : PARENT,
+              requestID: qid,
+              answers: payload?.body?.answers,
+            });
+            return true;
+          }
+          if (payload?.method === "POST" && /^\/question\/[^/]+\/reject$/.test(path)) {
+            const qid = path.split("/")[2];
+            window.__emit("question.rejected", {
+              sessionID: qid === kidAskReq.id ? KID : PARENT,
+              requestID: qid,
+            });
+            return true;
+          }
+          if (payload?.method === "GET" && path === "/provider")
+            return {
+              all: [
+                {
+                  id: "huawei",
+                  name: "华为云码道",
+                  models: {
+                    "deepseek-v3": { id: "deepseek-v3", name: "DeepSeek V3", limit: { context: 65536 } },
+                  },
+                },
+              ],
+              default: { huawei: "deepseek-v3" },
+            };
+          if (payload?.method === "GET" && path === "/agent")
+            return [
+              { name: "build", mode: "primary" },
+              { name: "plan", mode: "primary" },
+            ];
+          if (payload?.method === "GET" && path === "/command") return [];
+          if (payload?.method === "GET" && path === "/permission")
+            return state === "task" ? [kidPermReq] : [];
+          if (payload?.method === "GET" && path === "/permission/global") return [];
+          if (payload?.method === "GET" && path === "/permission/bash/mode")
+            return { mode: "always_allow" };
+          if (payload?.method === "GET" && path === "/skill") return [];
+          if (payload?.method === "GET" && path === "/v1/skills") return { count: 0, skills: [] };
+          if (payload?.method === "GET" && path === "/mcp") return {};
           return null;
         }
         if (cmd === "env_check")
@@ -60,21 +903,53 @@
             kernelHome: "/Users/you",
           };
         if (cmd === "kernel_upgrade") return "codearts upgrade\n当前已是最新版本 26.9.26";
+        if (cmd === "plugin:app|version") return "0.1.1";
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;
+        if (cmd === "settings_save") return null;
+        if (cmd === "files_list") {
+          if (!hasDir) return { entries: [], truncated: false };
+          const rel = payload?.rel ?? "";
+          return { entries: demoTree[rel] ?? [], truncated: false };
+        }
+        if (cmd === "file_read") {
+          const rel = payload?.rel ?? "";
+          if (!(rel in demoFiles)) throw new Error(`路径不存在：${rel}`);
+          const content = demoFiles[rel];
+          return {
+            content,
+            binary: false,
+            truncated: false,
+            size: content.length,
+            mtime: now,
+          };
+        }
+        if (cmd === "plans_list") return hasDir ? demoPlans : [];
+        if (cmd === "plan_read") {
+          const path = payload?.path ?? "";
+          const content = demoPlanFiles[path];
+          if (typeof content !== "string") throw new Error(`计划不存在：${path}`);
+          return {
+            content,
+            binary: false,
+            truncated: false,
+            size: content.length,
+            mtime: now,
+          };
+        }
         if (cmd === "kernel_status")
           return {
-            running: false,
-            healthy: false,
-            port: null,
+            running: healthy,
+            healthy,
+            port: healthy ? 59001 : null,
             projectDir: hasDir ? projectDir : null,
-            version: null,
+            version: healthy ? "26.9.26" : null,
             detail: null,
           };
         if (cmd === "credentials_status")
           return { saved: hasCredentials, inCliEnv: false, akMask: null };
         return null;
-      });
+      }, { shouldMockEvents: true });
 
       await import("/src/main.tsx");
     </script>

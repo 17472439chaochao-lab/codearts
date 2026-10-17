@@ -13,6 +13,15 @@ use crate::{secrets, trust};
 
 const HEALTH_PATH: &str = "/global/health";
 const LOG_TAIL: usize = 4000;
+const PROBE_FRESH: Duration = Duration::from_secs(2);
+
+struct Begun {
+    endpoint: Endpoint,
+    boot: u64,
+    ak: String,
+    sk: String,
+    project: String,
+}
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Endpoint {
@@ -55,6 +64,8 @@ struct Inner {
     log_tail: Arc<Mutex<String>>,
     detail: Option<String>,
     version: Option<String>,
+    /// 每次拉起或停掉进程都加一，健康等待结束时对不上就丢弃这次启动
+    boot: u64,
 }
 
 pub struct Kernel {
@@ -62,6 +73,10 @@ pub struct Kernel {
     /// 启动/停止必须串行：并发 `start()` 会让后一个的 shutdown 杀掉前一个刚交出去的实例
     gate: tokio::sync::Mutex<()>,
     pub client: reqwest::Client,
+    /// SSE 专用：总超时会在 120s 掐断长连接（实测断线周期 ~122s），这里只限单次读
+    pub sse: reqwest::Client,
+    /// 最近一次成功的健康探测，避免每个 API 请求都再打一轮
+    probed: Mutex<Option<(Endpoint, std::time::Instant)>>,
 }
 
 impl Default for Kernel {
@@ -77,9 +92,17 @@ impl Kernel {
             .timeout(Duration::from_secs(120))
             .build()
             .expect("reqwest client");
+        // /event 有心跳但间隔不定，65s 收不到任何字节视为链路已死，让 pump 重连
+        let sse = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(3))
+            .read_timeout(Duration::from_secs(65))
+            .build()
+            .expect("reqwest sse client");
         Self {
             client,
+            sse,
             gate: tokio::sync::Mutex::new(()),
+            probed: Mutex::new(None),
             inner: Mutex::new(Inner {
                 child: None,
                 endpoint: None,
@@ -87,6 +110,7 @@ impl Kernel {
                 log_tail: Arc::new(Mutex::new(String::new())),
                 detail: None,
                 version: None,
+                boot: 0,
             }),
         }
     }
@@ -134,19 +158,16 @@ impl Kernel {
 
     /// 前端所有请求的入口：确保内核在线并拿到可寻址端点。
     pub async fn ensure_running(&self, app: &tauri::AppHandle) -> Result<Endpoint> {
-        let (endpoint, _, _) = self.snapshot();
-        if let Some(ep) = endpoint {
+        if let Some(ep) = self.current_endpoint() {
+            if self.probe_fresh(&ep) {
+                return Ok(ep);
+            }
             if self.probe(&ep).await.is_some() {
+                self.remember_probe(&ep);
                 return Ok(ep);
             }
         }
-        // 等锁期间别的请求可能已经拉起来了，拿到锁后复查再决定要不要真启动
-        let _gate = self.gate.lock().await;
-        let (endpoint, _, _) = self.snapshot();
-        match endpoint {
-            Some(ep) if self.probe(&ep).await.is_some() => Ok(ep),
-            _ => self.start_locked(app).await,
-        }
+        self.start(app).await
     }
 
     /// App 启动时接管上一次异常退出遗留的实例，避免在同一数据目录上叠第二个 serve。
@@ -157,6 +178,20 @@ impl Kernel {
             .and_then(|raw| serde_json::from_str::<Endpoint>(&raw).ok());
         let Some(ep) = stored else { return };
         let version = self.probe(&ep).await;
+        // 探测与写回之间可能有 start：持 gate，并确认 secrets / inner 仍是探测过的那份
+        let _gate = self.gate.lock().await;
+        let still = secrets::get(secrets::ENDPOINT)
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Endpoint>(&raw).ok());
+        if still.as_ref() != Some(&ep) {
+            return;
+        }
+        if let Some(live) = self.current_endpoint() {
+            if live != ep {
+                return;
+            }
+        }
         if version.is_some() {
             let project = Settings::load(app)
                 .ok()
@@ -181,12 +216,17 @@ impl Kernel {
     }
 
     pub async fn start(&self, app: &tauri::AppHandle) -> Result<Endpoint> {
+        let begun = {
+            let _gate = self.gate.lock().await;
+            self.begin_start(app).await?
+        };
+        let version = self.await_healthy_gen(&begun.endpoint, begun.boot).await;
         let _gate = self.gate.lock().await;
-        self.start_locked(app).await
+        self.finish_start(app, begun, version).await
     }
 
-    /// 调用方必须持有 `gate`
-    async fn start_locked(&self, app: &tauri::AppHandle) -> Result<Endpoint> {
+    /// 调用方必须持有 `gate`。拉起进程后立刻返回，健康等待不占锁。
+    async fn begin_start(&self, app: &tauri::AppHandle) -> Result<Begun> {
         let settings = Settings::load(app)?;
         let project = settings.project_dir()?;
         let bin = settings.kernel_bin()?;
@@ -209,32 +249,23 @@ impl Kernel {
             "--hostname",
             "127.0.0.1",
         ])
-        .current_dir(&project)
-        .env("HOME", &home)
-        .env("KERNEL_DATA_DIR", data_dir.display().to_string())
-        .env("KERNEL_CONFIG_DIR", home.join(".codeartsdoer").display().to_string())
-        .env(
-            "OPENCODE_CONFIG",
-            home.join(".codeartsdoer/codearts_cli.json").display().to_string(),
-        )
-        .env("OPENCODE_CONFIG_FILE", "codearts_cli.json,codearts_cli.jsonc")
-        .env("OPENCODE_CHANNEL", "latest")
-        .env("OPENCODE_MODE", "tui")
-        .env("SCENARIO", "codeartsdoer")
-        .env("PLUGIN_ENV", "hc")
-        .env("CODEAGENT_USE_MESSAGE_FEEDBACK", "false")
-        .env("OMO_SEND_ANONYMOUS_TELEMETRY", "0")
-        .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
-        .env("OPENCODE_ALWAYS_NOTIFY_UPDATE", "false")
-        .env("CODEARTS_CLI_AK", ak)
-        .env("CODEARTS_CLI_SK", sk)
-        .env("CODEARTS_SERVER_PASSWORD", &endpoint.password)
-        // 官方包装脚本会导出 NODE_TLS_REJECT_UNAUTHORIZED=0，这里刻意不继承
-        .env_remove("NODE_TLS_REJECT_UNAUTHORIZED")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .current_dir(&project);
+        kernel_env(&mut cmd, &home, &data_dir, &ak, &sk);
+        cmd.env("OPENCODE_CONFIG", home.join(".codeartsdoer/codearts_cli.json").display().to_string())
+            .env("OPENCODE_CONFIG_FILE", "codearts_cli.json,codearts_cli.jsonc")
+            .env("OPENCODE_CHANNEL", "latest")
+            .env("OPENCODE_MODE", "tui")
+            .env("SCENARIO", "codeartsdoer")
+            .env("PLUGIN_ENV", "hc")
+            .env("CODEAGENT_USE_MESSAGE_FEEDBACK", "false")
+            .env("OMO_SEND_ANONYMOUS_TELEMETRY", "0")
+            .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
+            .env("OPENCODE_DISABLE_AUTOUPDATE", "true")
+            .env("OPENCODE_ALWAYS_NOTIFY_UPDATE", "false")
+            .env("CODEARTS_SERVER_PASSWORD", &endpoint.password)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
 
         let mut child = cmd
             .spawn()
@@ -242,31 +273,67 @@ impl Kernel {
         endpoint.pid = child.id();
 
         let tail = self.snapshot().2;
+        if let Ok(mut buf) = tail.lock() {
+            buf.clear();
+        }
         if let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) {
             tauri::async_runtime::spawn(pump(out, tail.clone()));
-            tauri::async_runtime::spawn(pump(err, tail.clone()));
+            tauri::async_runtime::spawn(pump(err, tail));
         }
 
-        let ready = self.await_healthy(&endpoint, &mut child).await;
-        let version = ready.ok_or_else(|| {
-            Error::Msg(format!(
-                "内核未能就绪：\n{}",
-                tail_summary(&tail.lock().unwrap())
-            ))
-        })?;
+        let boot = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.boot = inner.boot.wrapping_add(1);
+            inner.child = Some(child);
+            inner.endpoint = None;
+            inner.version = None;
+            inner.project_dir = Some(project.display().to_string());
+            inner.boot
+        };
+        *self.probed.lock().unwrap() = None;
+        Ok(Begun {
+            endpoint,
+            boot,
+            ak,
+            sk,
+            project: project.display().to_string(),
+        })
+    }
 
+    /// 调用方必须持有 `gate`
+    async fn finish_start(
+        &self,
+        app: &tauri::AppHandle,
+        begun: Begun,
+        version: Option<String>,
+    ) -> Result<Endpoint> {
+        let current = self.inner.lock().unwrap().boot;
+        if current != begun.boot {
+            return Err(Error::Msg("内核启动被取消".into()));
+        }
+        let Some(version) = version else {
+            let tail = self.snapshot().2.lock().unwrap().clone();
+            self.shutdown_inner().await;
+            return Err(Error::Msg(format!(
+                "内核未能就绪：\n{}",
+                mask_secrets(&tail_summary(&tail), &[begun.ak, begun.sk])
+            )));
+        };
+        if self.inner.lock().unwrap().boot != begun.boot {
+            return Err(Error::Msg("内核启动被取消".into()));
+        }
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.child = Some(child);
-            inner.endpoint = Some(endpoint.clone());
-            inner.project_dir = Some(project.display().to_string());
+            inner.endpoint = Some(begun.endpoint.clone());
+            inner.project_dir = Some(begun.project.clone());
             inner.detail = None;
             inner.version = Some(version);
         }
-        persist_endpoint(&endpoint)?;
+        self.remember_probe(&begun.endpoint);
+        persist_endpoint(&begun.endpoint)?;
         let _ = app.emit("kernel-status", self.status_obj());
-        crate::api::spawn_pump(app.clone(), endpoint.clone(), Some(project.display().to_string()));
-        Ok(endpoint)
+        crate::api::spawn_pump(app.clone(), begun.endpoint.clone(), Some(begun.project));
+        Ok(begun.endpoint)
     }
 
     pub async fn stop(&self, app: &tauri::AppHandle) -> Result<()> {
@@ -279,32 +346,26 @@ impl Kernel {
     /// `codearts upgrade` 是内核唯一的自更新入口（serve 里 autoupdate 被我们关了）。
     /// 它会覆盖 installers/bin/codearts，所以先停掉在跑的实例，跑完再按原样拉回来。
     pub async fn upgrade(&self, app: &tauri::AppHandle) -> Result<String> {
-        let _gate = self.gate.lock().await;
-        let settings = Settings::load(app)?;
-        let bin = settings.kernel_bin()?;
-        let home = settings.kernel_home();
-        // upgrade 也要鉴权：先取凭据，缺了就直接报错，别把在跑的内核白白停掉
-        let (ak, sk) = self.credentials(&home)?;
-        let restart = self.status_obj().running;
-        if restart {
-            self.shutdown_inner().await;
-            let _ = app.emit("kernel-status", self.status_obj());
-        }
+        let (bin, home, data_dir, ak, sk, restart) = {
+            let _gate = self.gate.lock().await;
+            let settings = Settings::load(app)?;
+            let bin = settings.kernel_bin()?;
+            let home = settings.kernel_home();
+            let data_dir = settings.kernel_data_dir();
+            // upgrade 也要鉴权：先取凭据，缺了就直接报错，别把在跑的内核白白停掉
+            let (ak, sk) = self.credentials(&home)?;
+            let restart = self.status_obj().running;
+            if restart {
+                self.shutdown_inner().await;
+                let _ = app.emit("kernel-status", self.status_obj());
+            }
+            (bin, home, data_dir, ak, sk, restart)
+        };
 
-        let out = Command::new(&bin)
-            .arg("upgrade")
-            .env("HOME", &home)
-            .env(
-                "KERNEL_DATA_DIR",
-                settings.kernel_data_dir().display().to_string(),
-            )
-            .env(
-                "KERNEL_CONFIG_DIR",
-                home.join(".codeartsdoer").display().to_string(),
-            )
-            .env("CODEARTS_CLI_AK", &ak)
-            .env("CODEARTS_CLI_SK", &sk)
-            .env_remove("NODE_TLS_REJECT_UNAUTHORIZED")
+        let mut cmd = Command::new(&bin);
+        cmd.arg("upgrade");
+        kernel_env(&mut cmd, &home, &data_dir, &ak, &sk);
+        let out = cmd
             .output()
             .await
             .msg(format!("无法执行 {} upgrade", bin.display()))?;
@@ -319,17 +380,20 @@ impl Kernel {
         );
 
         if !out.status.success() {
-            if restart {
-                let _ = self.start_locked(app).await;
-            }
-            return Err(Error::Msg(format!(
+            let mut msg = format!(
                 "内核更新失败（退出码 {:?}）：\n{}",
                 out.status.code(),
                 tail_summary(&text)
-            )));
+            );
+            if restart {
+                if let Err(e) = self.start(app).await {
+                    msg.push_str(&format!("\n重启内核失败：{e}"));
+                }
+            }
+            return Err(Error::Msg(msg));
         }
         if restart {
-            self.start_locked(app).await?;
+            self.start(app).await?;
         }
         Ok(text)
     }
@@ -354,11 +418,13 @@ impl Kernel {
         }
         let child = {
             let mut inner = self.inner.lock().unwrap();
+            inner.boot = inner.boot.wrapping_add(1);
             inner.endpoint = None;
             inner.project_dir = None;
             inner.version = None;
             inner.child.take()
         };
+        *self.probed.lock().unwrap() = None;
         match child {
             Some(mut child) => {
                 if tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -376,8 +442,13 @@ impl Kernel {
     }
 
     fn credentials(&self, home: &std::path::Path) -> Result<(String, String)> {
+        // secrets::get 已把空文件当缺失；这里再 trim 一道，避免半截空白挡住 cli.env
         if let (Some(ak), Some(sk)) = (secrets::get(secrets::AK)?, secrets::get(secrets::SK)?) {
-            return Ok((ak, sk));
+            let ak = ak.trim().to_string();
+            let sk = sk.trim().to_string();
+            if !ak.is_empty() && !sk.is_empty() {
+                return Ok((ak, sk));
+            }
         }
         trust::read_cli_env(home).ok_or_else(|| {
             Error::Msg("缺少华为云凭据：在设置里填写 AK/SK，或写入 ~/.codeartsdoer/cli.env".into())
@@ -402,17 +473,43 @@ impl Kernel {
             .map(str::to_string)
     }
 
-    async fn await_healthy(&self, ep: &Endpoint, child: &mut Child) -> Option<String> {
+    async fn await_healthy_gen(&self, ep: &Endpoint, boot: u64) -> Option<String> {
         for _ in 0..180 {
+            if self.inner.lock().unwrap().boot != boot {
+                return None;
+            }
             if let Some(v) = self.probe(ep).await {
                 return Some(v);
             }
-            if matches!(child.try_wait(), Ok(Some(_))) {
+            let exited = {
+                let mut inner = self.inner.lock().unwrap();
+                if inner.boot != boot {
+                    return None;
+                }
+                inner
+                    .child
+                    .as_mut()
+                    .map(|c| matches!(c.try_wait(), Ok(Some(_))))
+                    .unwrap_or(true)
+            };
+            if exited {
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         None
+    }
+
+    fn probe_fresh(&self, ep: &Endpoint) -> bool {
+        self.probed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(cached, at)| cached == ep && at.elapsed() < PROBE_FRESH)
+    }
+
+    fn remember_probe(&self, ep: &Endpoint) {
+        *self.probed.lock().unwrap() = Some((ep.clone(), std::time::Instant::now()));
     }
 }
 
@@ -443,23 +540,47 @@ async fn watch(app: tauri::AppHandle) {
         if alive || misses < 3 {
             continue;
         }
-        {
-            let mut inner = kernel.inner.lock().unwrap();
-            inner.child = None;
-            inner.endpoint = None;
-            inner.version = None;
-            inner.detail = Some(format!("内核在端口 {} 失联，正在重启", ep.port));
+        // 只在复核端点时占锁；真正重启走 start()，健康等待不再卡住 stop/请求
+        let restart = {
+            let _gate = kernel.gate.lock().await;
+            if kernel.current_endpoint().as_ref() != Some(&ep) {
+                false
+            } else {
+                kernel.inner.lock().unwrap().detail =
+                    Some(format!("内核在端口 {} 失联，正在重启", ep.port));
+                true
+            }
+        };
+        if !restart {
+            tracked = kernel.current_endpoint();
+            misses = 0;
+            continue;
         }
         let _ = app.emit("kernel-status", kernel.status_obj());
-        tracked = None;
         match kernel.start(&app).await {
-            Ok(new) => tracked = Some(new),
+            Ok(new) => {
+                tracked = Some(new);
+                misses = 0;
+            }
             Err(e) => {
                 kernel.inner.lock().unwrap().detail = Some(format!("自动重启失败：{e}"));
                 let _ = app.emit("kernel-status", kernel.status_obj());
+                tracked = None;
+                misses = 0;
             }
         }
     }
+}
+
+/// serve 与 upgrade 共用的内核环境；官方包装脚本会导出
+/// NODE_TLS_REJECT_UNAUTHORIZED=0，这里刻意不继承
+fn kernel_env(cmd: &mut Command, home: &std::path::Path, data_dir: &std::path::Path, ak: &str, sk: &str) {
+    cmd.env("HOME", home)
+        .env("KERNEL_DATA_DIR", data_dir.display().to_string())
+        .env("KERNEL_CONFIG_DIR", home.join(".codeartsdoer").display().to_string())
+        .env("CODEARTS_CLI_AK", ak)
+        .env("CODEARTS_CLI_SK", sk)
+        .env_remove("NODE_TLS_REJECT_UNAUTHORIZED");
 }
 
 fn reap_stored_pid() {
@@ -470,10 +591,58 @@ fn reap_stored_pid() {
         return;
     };
     let Some(pid) = stored.pid else { return };
+    // pid 会被系统复用：要求命令行里既有名为 codearts 的可执行文件，又有 serve 参数
+    let cmdline = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let Some(cmdline) = cmdline else { return };
+    if !is_codearts_serve(&cmdline) {
+        return;
+    }
     eprintln!("[kernel] 回收上次遗留的内核 pid={pid}");
     let _ = std::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status();
+    // 等进程退出，避免立刻再起一个 serve 叠在同一数据目录上
+    for _ in 0..50 {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+    for _ in 0..20 {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 命令行是否像 `…/codearts serve …`（按可执行文件 basename，不做子串误伤）
+fn is_codearts_serve(cmdline: &str) -> bool {
+    let parts: Vec<&str> = cmdline.split_whitespace().collect();
+    let has_bin = parts.iter().any(|p| {
+        std::path::Path::new(p)
+            .file_name()
+            .and_then(|n| n.to_str())
+            == Some("codearts")
+    });
+    let has_serve = parts.iter().any(|p| *p == "serve");
+    has_bin && has_serve
+}
+
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 async fn pump<R>(reader: R, tail: Arc<Mutex<String>>)
@@ -487,7 +656,14 @@ where
         buf.push('\n');
         let overflow = buf.len().saturating_sub(LOG_TAIL);
         if overflow > 0 {
-            buf.drain(..overflow);
+            // drain 必须落在 char 边界，否则多字节日志（中文）会 panic abort
+            let mut cut = overflow.min(buf.len());
+            while cut > 0 && !buf.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if cut > 0 {
+                buf.drain(..cut);
+            }
         }
     }
 }
@@ -528,4 +704,30 @@ fn persist_endpoint(ep: &Endpoint) -> Result<()> {
         secrets::ENDPOINT,
         &serde_json::to_string(ep).msg("端点序列化失败")?,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codearts_serve_matches_basename_and_serve() {
+        assert!(is_codearts_serve("/Users/me/.codeartsdoer/installers/bin/codearts serve --port 1"));
+        assert!(!is_codearts_serve("vim /tmp/codearts-notes.txt"));
+        assert!(!is_codearts_serve("/usr/bin/codearts upgrade"));
+        assert!(!is_codearts_serve(""));
+    }
+
+    #[test]
+    fn drain_cut_stays_on_char_boundary() {
+        let mut buf = String::from("abc你好def");
+        let overflow = 4; // 落在「你」的中间字节附近
+        let mut cut = overflow.min(buf.len());
+        while cut > 0 && !buf.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        buf.drain(..cut);
+        assert!(buf.is_char_boundary(0));
+        assert!(!buf.is_empty() || cut == buf.len());
+    }
 }

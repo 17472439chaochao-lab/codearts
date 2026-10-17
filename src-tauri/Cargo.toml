@@ -1,6 +1,6 @@
 [package]
 name = "codearts-desktop"
-version = "0.1.0"
+version = "0.1.1"
 description = "CodeArts Desktop shell"
 authors = ["wuchengchao"]
 edition = "2021"
@@ -27,6 +27,8 @@ rand = "0.8"
 futures-util = "0.3"
 tokio = { version = "1", features = ["process", "time", "io-util", "sync", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset"] }
+# $HOME 可能被 FlyEnv 等改掉；getpwuid 才是进程所属用户的真实家目录
+libc = "0.2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

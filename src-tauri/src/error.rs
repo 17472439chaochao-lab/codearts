@@ -4,8 +4,6 @@ use serde::Serialize;
 pub enum Error {
     #[error("{0}")]
     Msg(String),
-    #[error("内核未运行")]
-    NotRunning,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

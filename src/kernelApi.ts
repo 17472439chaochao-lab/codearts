@@ -64,6 +64,13 @@ export type Part = {
 
 export type Message = { info: MessageInfo; parts: Part[] };
 
+/** `todowrite` 的一项：内核按 (sessionID, position) 存整份清单，改一次就整体覆盖 */
+export type Todo = {
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+  priority: "high" | "medium" | "low";
+};
+
 export type Session = {
   id: string;
   title: string;
@@ -72,6 +79,21 @@ export type Session = {
   /** 子任务会话才有；顶层会话的 payload 里不带这个键 */
   parentID?: string;
   time: { created: number; updated: number };
+  /** session.updated / 列表接口会带上当前改动汇总，diffs 是逐文件明细 */
+  summary?: { additions: number; deletions: number; files: number; diffs?: FileDiff[] };
+};
+
+/**
+ * session.diff 事件的每一行；file 是绝对路径。
+ * `/session/:id/diff` 还会给出改动前后全文（before/after），壳子用它算逐行 diff。
+ */
+export type FileDiff = {
+  file: string;
+  before?: string;
+  after?: string;
+  additions?: number;
+  deletions?: number;
+  status?: "added" | "deleted" | "modified";
 };
 
 export type KernelEvent = { type: string; properties: Record<string, any> };
@@ -135,6 +157,38 @@ export const permissions = {
 };
 
 /**
+ * 内核让模型反问用户的通道：`GET /question` 是待答队列，`question.asked` 的 properties
+ * 就是下面这个对象原样。回答按 questions 的顺序回一组 label 数组。
+ */
+export type QuestionOption = { label: string; description?: string };
+
+export type QuestionInfo = {
+  question: string;
+  /** 一句话短标题，卡片上摊开的是它 */
+  header?: string;
+  options: QuestionOption[];
+  /** 允许多选，缺省单选 */
+  multiple?: boolean;
+  /** 允许自己写答案，内核默认开 */
+  custom?: boolean;
+};
+
+export type QuestionRequest = {
+  id: string;
+  sessionID: string;
+  questions: QuestionInfo[];
+  tool?: { messageID: string; callID: string };
+};
+
+export const questions = {
+  list: (dir?: string | null) => api<QuestionRequest[]>("GET", "/question", undefined, dir),
+  reply: (id: string, answers: string[][], dir?: string | null) =>
+    api<unknown>("POST", `/question/${id}/reply`, { answers }, dir),
+  reject: (id: string, dir?: string | null) =>
+    api<unknown>("POST", `/question/${id}/reject`, undefined, dir),
+};
+
+/**
  * 事前策略（实测 26.9.26）：`/permission/global` 是除 bash 外全部工具的规则，
  * bash 单独走 `/permission/bash/mode`；两者都落盘到 cli-data/storage/permission/，
  * 重启内核不丢，所以壳子只需要读一次、改的时候写一次。
@@ -175,6 +229,20 @@ export const sessions = {
   /** task 工具派出去的子会话 */
   children: (id: string, dir?: string | null) =>
     api<Session[]>("GET", `/session/${id}/children`, undefined, dir),
+  /** spec 里没写但内核确实提供：当前整份待办清单，顺序即内核的 position */
+  todos: (id: string, dir?: string | null) =>
+    api<Todo[]>("GET", `/session/${id}/todo`, undefined, dir),
+  /** 会话累计改动；每项带 before/after 全文，可直接算 diff */
+  diff: (id: string, dir?: string | null) =>
+    api<FileDiff[]>("GET", `/session/${id}/diff`, undefined, dir),
+  /** 所有非 idle 会话的运行态；断线重连后用来对齐 busy / Stop */
+  status: (dir?: string | null) =>
+    api<Record<string, { type?: string; attempt?: number; message?: string }>>(
+      "GET",
+      "/session/status",
+      undefined,
+      dir,
+    ),
 };
 
 export type AgentInfo = {

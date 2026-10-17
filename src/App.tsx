@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
@@ -20,6 +20,17 @@ export type KernelStatus = {
 /** 系统标题栏已经沉浸掉了，标题由壳自己画在左上角 */
 export const APP_TITLE = "CodeArts Desktop";
 
+/** 标题栏和关于页都要版本号，进程内取一次缓存住 */
+let appVersion: Promise<string | null> | null = null;
+
+export function useAppVersion(): string | null {
+  const [ver, setVer] = useState<string | null>(null);
+  useEffect(() => {
+    (appVersion ??= getVersion().catch(() => null)).then(setVer);
+  }, []);
+  return ver;
+}
+
 type Runner = <T>(fn: () => Promise<T>) => Promise<T | null>;
 
 /** 官方安装命令照抄文档，别自己编；复制按钮只给这一句 */
@@ -35,6 +46,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  // 换目录要重启内核，几秒内界面不能操作；留个进度卡告诉用户在干什么
+  const [switching, setSwitching] = useState<{ dir: string; stage: string } | null>(null);
   // 检测页每次启动都要看一眼，全绿了才由用户点"进入"；不持久化，重启回到这里
   const [entered, setEntered] = useState(false);
 
@@ -78,12 +91,23 @@ export default function App() {
     });
 
   /** serve 的 cwd 与目录信任白名单都在启动时定死，换工作区必须重启内核 */
-  const applyDir = (dir: string, list: string[]) =>
+  const applyDir = (dir: string, list: string[]) => {
+    const restart = !!status?.running;
+    setSwitching({ dir, stage: restart ? "正在重启内核…" : "正在保存工作区…" });
     void run(async () => {
       await invoke("settings_save", { next: { projectDir: dir, projects: list } });
-      await refresh();
-      if (status?.running) setStatus(await invoke<KernelStatus>("kernel_start"));
-    });
+      // 先把内核换到新端口，再把新目录交给界面：反过来的话新目录会对着
+      // 正在停止的旧内核发 /provider，连接失败会弹一条没意义的红字
+      try {
+        if (restart) {
+          setStatus(await invoke<KernelStatus>("kernel_start"));
+          setSwitching({ dir, stage: "正在刷新工作区…" });
+        }
+      } finally {
+        await refresh();
+      }
+    }).finally(() => setSwitching(null));
+  };
 
   const switchDir = (dir: string) =>
     applyDir(
@@ -165,6 +189,21 @@ export default function App() {
         />
       )}
 
+      {switching && (
+        <div className="switchmask">
+          <div className="switchcard" role="status" aria-live="polite">
+            <b>正在切换工作区…</b>
+            <span className="swdir" title={switching.dir}>
+              {switching.dir}
+            </span>
+            <div className="switchtrack" aria-hidden="true">
+              <i />
+            </div>
+            <p className="hint">{switching.stage}</p>
+          </div>
+        </div>
+      )}
+
       {error && <pre className="error floater">{error}</pre>}
     </div>
   );
@@ -189,6 +228,7 @@ function Setup({
   const [ak, setAk] = useState("");
   const [sk, setSk] = useState("");
   const [note, setNote] = useState<string | null>(null);
+  const ver = useAppVersion();
   const allOk = !!(
     check?.kernelInstalled &&
     check?.hasCredentials &&
@@ -200,7 +240,12 @@ function Setup({
       onError("AK / SK 都不能为空");
       return;
     }
-    if (await run(() => invoke("credentials_save", { ak: ak.trim(), sk: sk.trim() }))) {
+    // credentials_save 返回 ()，invoke 解析为 null，不能当 boolean
+    const ok = await run(async () => {
+      await invoke("credentials_save", { ak: ak.trim(), sk: sk.trim() });
+      return true;
+    });
+    if (ok) {
       setNote("已保存");
       await onDone();
     }
@@ -218,6 +263,7 @@ function Setup({
         {/* 标题栏沉浸后的拖拽把手，红绿灯压在这条带子上 */}
         <div className="drag" data-tauri-drag-region="deep">
           <span className="wtitle">{APP_TITLE}</span>
+          {ver ? <span className="wver">{ver}</span> : null}
         </div>
         <h1>欢迎使用 CodeArts Desktop</h1>
         <p className="hint">
@@ -284,7 +330,7 @@ function Setup({
               重新检测
             </button>
             {allOk && (
-              <button className="primary big" onClick={onEnter} disabled={busy}>
+              <button className="primary" onClick={onEnter} disabled={busy}>
                 进入工作区
               </button>
             )}
@@ -335,12 +381,20 @@ function Step({
 /** 一行命令 + 复制按钮，让用户不用手抄长 URL */
 function CopyLine({ text, onError }: { text: string; onError: (e: string) => void }) {
   const [copied, setCopied] = useState(false);
+  const timer = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timer.current != null) window.clearTimeout(timer.current);
+    };
+  }, []);
 
   async function copy() {
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
-      setTimeout(setCopied, 2000);
+      if (timer.current != null) window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => setCopied(false), 2000);
     } catch (e) {
       onError(`复制失败，请手动选中命令：${e}`);
     }
@@ -459,7 +513,12 @@ function Settings({
       setNote("AK / SK 都不能为空");
       return;
     }
-    if (await run(() => invoke("credentials_save", { ak: ak.trim(), sk: sk.trim() }))) {
+    // credentials_save 返回 ()，invoke 解析为 null，不能当 boolean
+    const ok = await run(async () => {
+      await invoke("credentials_save", { ak: ak.trim(), sk: sk.trim() });
+      return true;
+    });
+    if (ok) {
       setNote("已保存");
       setAk("");
       setSk("");
@@ -470,8 +529,14 @@ function Settings({
 
   return (
     <div className="modal" onClick={onClose}>
+      {/* 遮罩盖住主界面顶栏后，靠这条带子继续拖窗口；点它不要误关设置 */}
+      <div
+        className="drag modal-drag"
+        data-tauri-drag-region="deep"
+        onClick={(e) => e.stopPropagation()}
+      />
       <div className="panel settings" onClick={(e) => e.stopPropagation()}>
-        <nav className="tabs">
+        <nav className="tabs" data-tauri-drag-region="deep">
           {TABS.map((t) => (
             <button key={t.id} className={tab === t.id ? "on" : ""} onClick={() => setTab(t.id)}>
               {t.label}
@@ -480,7 +545,7 @@ function Settings({
         </nav>
 
         <div className="pane">
-          <header>
+          <header data-tauri-drag-region="deep">
             <h2>{TABS.find((t) => t.id === tab)?.label}</h2>
             <button className="ico-btn" onClick={onClose} title="关闭" aria-label="关闭设置">
               <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -665,13 +730,7 @@ function Url({ text, label }: { text: string; label: string }) {
 }
 
 function About({ check, status }: { check: EnvCheck | null; status: KernelStatus | null }) {
-  const [ver, setVer] = useState<string | null>(null);
-
-  useEffect(() => {
-    getVersion()
-      .then(setVer)
-      .catch(() => setVer(null));
-  }, []);
+  const ver = useAppVersion();
 
   return (
     <>
@@ -712,22 +771,22 @@ function About({ check, status }: { check: EnvCheck | null; status: KernelStatus
       <h3>技术栈</h3>
       <ul className="stack">
         <li>
-          <code>Tauri</code> 2.12.4 —— 桌面壳：Rust 监管内核进程，WebView 只跑界面
+          <code>Tauri</code> —— 桌面壳：Rust 监管内核进程，WebView 只跑界面
         </li>
         <li>
-          <code>React</code> 19.3.1 —— 聊天、侧栏与设置面板
+          <code>React</code> —— 聊天、侧栏与设置面板
         </li>
         <li>
-          <code>Vite</code> 8.3.4 —— 前端开发与打包
+          <code>Vite</code> —— 前端开发与打包
         </li>
         <li>
-          <code>TypeScript</code> 6.0.3 —— 前端类型
+          <code>TypeScript</code> —— 前端类型
         </li>
         <li>
-          <code>tokio</code> 1.53.3 —— 异步运行时：进程起停、日志与 SSE 转发
+          <code>tokio</code> —— 异步运行时：进程起停、日志与 SSE 转发
         </li>
         <li>
-          <code>reqwest</code> 0.12.28 —— 内核 HTTP 客户端（只连 127.0.0.1）
+          <code>reqwest</code> —— 内核 HTTP 客户端（只连 127.0.0.1）
         </li>
         <li>
           <code>serde</code> / <code>serde_json</code>、<code>thiserror</code>、

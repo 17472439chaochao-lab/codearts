@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use crate::error::{MsgExt, Result};
+use crate::error::{Error, MsgExt, Result};
 
 /// 内核启动前必须把 cwd 写进信任白名单，否则 serve 直接 fatal 退出。
 /// 这里只增不删，保留用户手工配置的其他 security 字段。
@@ -10,7 +10,15 @@ pub fn trust_folder(data_dir: &Path, dir: &Path) -> Result<()> {
     let path = data_dir.join("settings.json");
     let mut root: Value = if path.exists() {
         let text = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&text).msg(format!("{} 不是合法 JSON", path.display()))?
+        let parsed: Value =
+            serde_json::from_str(&text).msg(format!("{} 不是合法 JSON", path.display()))?;
+        if !parsed.is_object() {
+            return Err(Error::Msg(format!(
+                "{} 必须是 JSON 对象",
+                path.display()
+            )));
+        }
+        parsed
     } else {
         json!({})
     };
@@ -18,7 +26,11 @@ pub fn trust_folder(data_dir: &Path, dir: &Path) -> Result<()> {
     if !root.get("security").is_some_and(Value::is_object) {
         root["security"] = json!({});
     }
-    let security = root.as_object_mut().unwrap().get_mut("security").unwrap();
+    let security = root
+        .as_object_mut()
+        .ok_or_else(|| Error::Msg(format!("{} 必须是 JSON 对象", path.display())))?
+        .get_mut("security")
+        .unwrap();
     if !security.get("folderTrust").is_some_and(Value::is_object) {
         security["folderTrust"] = json!({});
     }
@@ -34,23 +46,17 @@ pub fn trust_folder(data_dir: &Path, dir: &Path) -> Result<()> {
     }
 
     std::fs::create_dir_all(data_dir)?;
-    std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap())
-        .msg(format!("写入信任白名单失败：{}", path.display()))
-}
-
-pub fn is_trusted(data_dir: &Path, dir: &Path) -> Result<bool> {
-    let path = data_dir.join("settings.json");
-    if !path.exists() {
-        return Ok(false);
-    }
-    let text = std::fs::read_to_string(&path)?;
-    let root: Value = serde_json::from_str(&text).msg("settings.json 损坏")?;
-    let target = dir.display().to_string();
-    Ok(root
-        .pointer("/security/trustedFolders")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().any(|f| f.as_str() == Some(target.as_str())))
-        .unwrap_or(false))
+    let text = serde_json::to_string_pretty(&root).unwrap();
+    let tmp = path.with_file_name(format!(
+        "settings.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::write(&tmp, &text).msg(format!("写入信任白名单失败：{}", path.display()))?;
+    std::fs::rename(&tmp, &path).msg(format!("写入信任白名单失败：{}", path.display()))
 }
 
 /// Keychain 里没有凭据时，回落到 CLI 自己的 `~/.codeartsdoer/cli.env`。

@@ -1,5 +1,6 @@
 mod api;
 mod error;
+mod files;
 mod kernel;
 mod secrets;
 mod settings;
@@ -16,9 +17,9 @@ use tauri::{Manager, State};
 #[tauri::command]
 fn settings_save(app: tauri::AppHandle, mut next: Settings) -> Result<Settings, Error> {
     let current = Settings::load(&app)?;
-    // 空串表示"清空该项"，未传表示保持原值；内核路径不再由界面填写，只认 settings.json 里的覆盖项
-    next.kernel_home = next.kernel_home.or(current.kernel_home);
-    next.kernel_bin = next.kernel_bin.or(current.kernel_bin);
+    // 内核路径不接受 WebView 传入：注入脚本不能把 AK/SK 指到任意可执行文件
+    next.kernel_home = current.kernel_home;
+    next.kernel_bin = current.kernel_bin;
     next.project_dir = next.project_dir.or(current.project_dir);
     next.projects = next.projects.or(current.projects);
     next.save(&app)?;
@@ -27,9 +28,14 @@ fn settings_save(app: tauri::AppHandle, mut next: Settings) -> Result<Settings, 
 
 #[tauri::command]
 fn credentials_save(ak: String, sk: String) -> Result<(), Error> {
+    let ak = ak.trim();
+    let sk = sk.trim();
+    if ak.is_empty() || sk.is_empty() {
+        return Err(Error::Msg("AK / SK 都不能为空".into()));
+    }
     let r = (|| -> Result<(), Error> {
-        secrets::set(secrets::AK, ak.trim())?;
-        secrets::set(secrets::SK, sk.trim())
+        secrets::set(secrets::AK, ak)?;
+        secrets::set(secrets::SK, sk)
     })();
     if let Err(e) = &r {
         eprintln!("[credentials] 保存失败：{e}");
@@ -166,7 +172,11 @@ pub fn run() {
             kernel_stop,
             kernel_status,
             kernel_upgrade,
-            api_request
+            api_request,
+            files::files_list,
+            files::file_read,
+            files::plans_list,
+            files::plan_read
         ])
         .setup(|app| {
             let handle = app.handle().clone();

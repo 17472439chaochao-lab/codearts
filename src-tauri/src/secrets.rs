@@ -29,6 +29,8 @@ pub fn set(account: &str, value: &str) -> Result<()> {
 
 pub fn get(account: &str) -> Result<Option<String>> {
     match fs::read_to_string(store_dir()?.join(account)) {
+        // 空文件不算已配置，否则会挡住 cli.env 兜底
+        Ok(v) if v.trim().is_empty() => Ok(None),
         Ok(v) => Ok(Some(v)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Msg(format!("读取凭据失败：{e}"))),
