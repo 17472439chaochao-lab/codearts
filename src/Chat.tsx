@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   agents,
@@ -59,8 +60,22 @@ type MenuItem = { label: string; danger?: boolean; run: () => void };
 
 type Menu = { x: number; y: number; items: MenuItem[] };
 
-/** 粘贴进输入框的图片：data URL 直接随 prompt 发给内核，不落盘 */
-type Attachment = { id: string; name: string; mime: string; url: string; size: number };
+/** 本机 OCR：模型不能看图时，把截图里的文字带进 prompt */
+type OcrState = {
+  state: "pending" | "done" | "empty" | "error";
+  text?: string;
+  error?: string;
+};
+
+/** 粘贴进输入框的图片：有视觉模型时随 prompt 发 data URL，否则只带本机 OCR 文字 */
+type Attachment = {
+  id: string;
+  name: string;
+  mime: string;
+  url: string;
+  size: number;
+  ocr?: OcrState;
+};
 
 /** 截图通常只有几百 KB；给个上限，别让整段 base64 把输入区撑爆 */
 const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
@@ -77,6 +92,13 @@ function imageTitle(raw: string, images: number): string {
 const imgSize = (n: number) =>
   n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
 
+function ocrLabel(ocr?: OcrState): string {
+  if (!ocr || ocr.state === "pending") return "识别中";
+  if (ocr.state === "done") return `文字 ${ocr.text?.length ?? 0}`;
+  if (ocr.state === "empty") return "无文字";
+  return "OCR 失败";
+}
+
 function readImage(file: File): Promise<Attachment> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -92,6 +114,7 @@ function readImage(file: File): Promise<Attachment> {
         mime: file.type || "image/png",
         url,
         size: file.size,
+        ocr: { state: "pending" },
       });
     };
     reader.onerror = () => reject(new Error("读取图片失败"));
@@ -250,6 +273,8 @@ export default function Chat({
   const [input, setInput] = useState("");
   /** 输入区待发送的截图；只保存在内存里，发送或移除即丢弃 */
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  /** 每张图的本地 OCR 任务：发送时等它们落地，避免刚粘上就回车漏字 */
+  const ocrJobs = useRef(new Map<string, Promise<string>>());
   /**
    * 忙的是"哪条会话"而不是整个界面：从跑着的 A 切到空闲的 B，
    * 单布尔会卡在"处理中"，点停止还会 abort 到 B 头上。
@@ -419,6 +444,10 @@ export default function Chat({
   const isChild = !!activeSess?.parentID || kids.some((k) => k.id === active);
   const readOnly = !!active && (isChild || (!!wsOf && !sameDir(wsOf, dir)));
   const busy = !!active && busySet.has(active);
+  const selectedModel = model
+    ? models.find((m) => m.providerID === model.providerID && m.modelID === model.modelID)
+    : undefined;
+  const visionReady = selectedModel?.image === true;
 
   /** 改动快照按会话存；内核在每轮收尾和文件写入时会更新它 */
   const reloadDiffs = useCallback(() => {
@@ -1100,7 +1129,33 @@ export default function Chat({
     }
   }
 
-  /** 粘贴/拖入的截图先进输入区，发送时转成 file part */
+  /** 粘贴后立刻在 Rust 侧跑 Vision OCR；不阻塞缩略图出现 */
+  function startOcr(a: Attachment) {
+    const job = invoke<string>("ocr_image", { dataUrl: a.url })
+      .then((raw) => {
+        const text = raw.trim();
+        setAttachments((list) =>
+          list.map((x) =>
+            x.id === a.id ? { ...x, ocr: { state: text ? "done" : "empty", text } } : x,
+          ),
+        );
+        return text;
+      })
+      .catch((e) => {
+        setAttachments((list) =>
+          list.map((x) =>
+            x.id === a.id ? { ...x, ocr: { state: "error", error: String(e) } } : x,
+          ),
+        );
+        return "";
+      })
+      .finally(() => {
+        ocrJobs.current.delete(a.id);
+      });
+    ocrJobs.current.set(a.id, job);
+  }
+
+  /** 粘贴/拖入的截图先进输入区，发送时按模型能力选 file part 或 OCR 文字 */
   async function addImages(files: File[]) {
     const room = IMAGE_MAX_COUNT - attachments.length;
     if (room <= 0) {
@@ -1118,6 +1173,7 @@ export default function Chat({
       const loaded = await Promise.all(ok.map(readImage));
       setAttachments((prev) => [...prev, ...loaded].slice(0, IMAGE_MAX_COUNT));
       setErr(null);
+      for (const a of loaded) startOcr(a);
     } catch (e) {
       setErr(String(e));
     }
@@ -1142,22 +1198,44 @@ export default function Chat({
       setErr("输入为空");
       return;
     }
-    // 侧栏标题用原始输入：命令模板展开后是几百字，标题栏放不下
-    const text = expandSlash(raw, cmds);
-    const parts: unknown[] = [];
-    if (text) parts.push({ type: "text", text });
-    for (const a of imgs) {
-      parts.push({ type: "file", mime: a.mime, url: a.url, filename: a.name });
-    }
-    setErr(null);
-    setToast(null);
     // 一次回车只发一条：IME 提交候选词和真正发送会连着派发两个 Enter keydown，
     // 两个处理函数拿到的是同一次渲染的 input 闭包，setInput 挡不住第二次
     sending.current = true;
-    setInput("");
-    setAttachments([]);
-    setDismissed(null);
+    setErr(null);
+    setToast(null);
     try {
+      const vision = visionReady;
+      // 模型不能看图时，等粘贴时启动的本机 OCR 落地；一个字都没读到就不发空图
+      const ocrTexts =
+        imgs.length && !vision
+          ? await Promise.all(
+              imgs.map((a) => ocrJobs.current.get(a.id) ?? Promise.resolve(a.ocr?.text ?? "")),
+            )
+          : [];
+      const ocrBlock = ocrTexts
+        .map((t, i) => (t ? `【图片 ${i + 1} 的本地 OCR 文字】\n${t}` : ""))
+        .filter(Boolean)
+        .join("\n\n");
+      if (imgs.length && !vision && !ocrBlock) {
+        setErr(
+          "当前模型不支持看图，本机 OCR 也没有从截图里识别到文字；换一个支持视觉的模型，或先把文字复制进输入框。",
+        );
+        return;
+      }
+      // 侧栏标题用原始输入：命令模板展开后是几百字，标题栏放不下
+      const text = expandSlash(raw, cmds);
+      const promptText =
+        !vision && ocrBlock ? (text ? `${text}\n\n${ocrBlock}` : ocrBlock) : text;
+      const parts: unknown[] = [];
+      if (promptText) parts.push({ type: "text", text: promptText });
+      if (vision) {
+        for (const a of imgs) {
+          parts.push({ type: "file", mime: a.mime, url: a.url, filename: a.name });
+        }
+      }
+      setInput("");
+      setAttachments([]);
+      setDismissed(null);
       let id = active;
       const title = imageTitle(raw, imgs.length);
       if (!id) {
@@ -1977,6 +2055,18 @@ export default function Chat({
               {attachments.map((a) => (
                 <div className="attach" key={a.id}>
                   <img src={a.url} alt={a.name} title={`${a.name} · ${imgSize(a.size)}`} />
+                  <span
+                    className={`ocrbadge ${a.ocr?.state ?? "pending"}`}
+                    title={
+                      a.ocr?.state === "done"
+                        ? a.ocr.text
+                        : a.ocr?.state === "error"
+                          ? a.ocr.error
+                          : "本机 Vision OCR"
+                    }
+                  >
+                    {ocrLabel(a.ocr)}
+                  </span>
                   <button
                     type="button"
                     onClick={() => setAttachments((list) => list.filter((x) => x.id !== a.id))}
@@ -1987,7 +2077,11 @@ export default function Chat({
                   </button>
                 </div>
               ))}
-              <span className="muted small">粘贴的截图会随消息一起发给内核</span>
+              <span className="muted small">
+                {visionReady
+                  ? "截图会随消息直接发给模型"
+                  : "当前模型不能看图，发送时用本机 OCR 提取文字"}
+              </span>
             </div>
           )}
           <textarea

@@ -106,6 +106,8 @@ export type ModelInfo = {
   name: string;
   context?: number;
   reasoning?: boolean;
+  /** 模型能不能直接看图；不能时壳用本机 OCR 兜底 */
+  image?: boolean;
 };
 
 export type EnvCheck = {
@@ -128,6 +130,7 @@ export function normalizeProviders(root: any): { models: ModelInfo[]; default: M
         name: m.name || m.id,
         context: m.limit?.context,
         reasoning: m.capabilities?.reasoning,
+        image: m.capabilities?.input?.image === true,
       });
     }
   }

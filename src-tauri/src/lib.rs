@@ -2,6 +2,7 @@ mod api;
 mod error;
 mod files;
 mod kernel;
+mod ocr;
 mod secrets;
 mod settings;
 mod trust;
@@ -173,6 +174,7 @@ pub fn run() {
             kernel_status,
             kernel_upgrade,
             api_request,
+            ocr::ocr_image,
             files::files_list,
             files::file_read,
             files::plans_list,

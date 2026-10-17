@@ -37,6 +37,8 @@
       import { emit } from "@tauri-apps/api/event";
 
       const state = new URLSearchParams(location.search).get("state") ?? "fresh";
+      // vision=1 把 mock 模型标成能看图，验证「直接发图」分支
+      window.__vision = new URLSearchParams(location.search).get("vision") === "1";
       // 用假路径，别把开发机的工作目录写进预览台
       const kernelBin = "/Users/you/.codeartsdoer/installers/bin/codearts";
       const projectDir = "/Users/you/work/demo";
@@ -886,7 +888,12 @@ class OldExportController
                   id: "huawei",
                   name: "华为云码道",
                   models: {
-                    "deepseek-v3": { id: "deepseek-v3", name: "DeepSeek V3", limit: { context: 65536 } },
+                    "deepseek-v3": {
+                      id: "deepseek-v3",
+                      name: "DeepSeek V3",
+                      limit: { context: 65536 },
+                      capabilities: { input: { image: window.__vision === true } },
+                    },
                   },
                 },
               ],
@@ -918,6 +925,12 @@ class OldExportController
             kernelHome: "/Users/you",
           };
         if (cmd === "kernel_upgrade") return "codearts upgrade\n当前已是最新版本 26.9.26";
+        if (cmd === "ocr_image") {
+          const mode = window.__ocrMode || "text";
+          if (mode === "empty") return "";
+          if (mode === "error") throw new Error("模拟 OCR 失败");
+          return window.__ocrText ?? "预览台 OCR：这是从截图里识别出的文字";
+        }
         if (cmd === "plugin:app|version") return "0.1.1";
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;

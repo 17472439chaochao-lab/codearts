@@ -1657,6 +1657,34 @@ textarea:disabled {
   object-fit: cover;
 }
 
+.attach .ocrbadge {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  padding: 1px 3px;
+  overflow: hidden;
+  color: #fff;
+  font-size: 9px;
+  line-height: 12px;
+  text-align: center;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  background: rgba(28, 28, 30, 0.66);
+}
+
+.attach .ocrbadge.done {
+  background: rgba(22, 110, 70, 0.72);
+}
+
+.attach .ocrbadge.empty {
+  background: rgba(95, 95, 100, 0.6);
+}
+
+.attach .ocrbadge.error {
+  background: rgba(180, 40, 40, 0.78);
+}
+
 .attach button {
   position: absolute;
   top: 2px;
