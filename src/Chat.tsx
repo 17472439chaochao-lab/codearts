@@ -381,7 +381,11 @@ export default function Chat({
   const reloadListRef = useRef(reloadList);
   reloadListRef.current = reloadList;
 
-  useEffect(reloadList, [reloadList, live]);
+  // 内核不在线时不发：api_request 的 ensure_running 会顺手再 start()，
+  // 两个启动互相顶掉 boot 代数，结果报"内核启动被取消"
+  useEffect(() => {
+    if (live) reloadList();
+  }, [reloadList, live]);
 
   useEffect(() => {
     if (!live) return;

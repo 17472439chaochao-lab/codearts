@@ -58,8 +58,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  // 换目录要重启内核，几秒内界面不能操作；留个进度卡告诉用户在干什么
-  const [switching, setSwitching] = useState<{ dir: string; stage: string } | null>(null);
+  // 换目录要重启内核、进工作区要拉起内核，这几秒界面不能操作；进度卡告诉用户在干什么
+  const [switching, setSwitching] = useState<{
+    dir: string;
+    title: string;
+    stage: string;
+  } | null>(null);
   // 检测页每次启动都要看一眼，全绿了才由用户点"进入"；不持久化，重启回到这里
   const [entered, setEntered] = useState(false);
 
@@ -105,7 +109,11 @@ export default function App() {
   /** serve 的 cwd 与目录信任白名单都在启动时定死，换工作区必须重启内核 */
   const applyDir = (dir: string, list: string[]) => {
     const restart = !!status?.running;
-    setSwitching({ dir, stage: restart ? "正在重启内核…" : "正在保存工作区…" });
+    setSwitching({
+      dir,
+      title: "正在切换工作区…",
+      stage: restart ? "正在重启内核…" : "正在保存工作区…",
+    });
     void run(async () => {
       await invoke("settings_save", { next: { projectDir: dir, projects: list } });
       // 先把内核换到新端口，再把新目录交给界面：反过来的话新目录会对着
@@ -113,7 +121,7 @@ export default function App() {
       try {
         if (restart) {
           setStatus(await invoke<KernelStatus>("kernel_start"));
-          setSwitching({ dir, stage: "正在刷新工作区…" });
+          setSwitching({ dir, title: "正在切换工作区…", stage: "正在刷新工作区…" });
         }
       } finally {
         await refresh();
@@ -162,6 +170,22 @@ export default function App() {
     if (!ready) setEntered(false);
   }, [ready]);
 
+  /** 进入工作区时内核还不在就顺手拉起，沿用换目录那张进度卡 */
+  const enterWorkspace = () => {
+    setEntered(true);
+    if (status?.healthy) return;
+    setSwitching({
+      dir: check?.projectDir ?? "",
+      title: "正在启动内核…",
+      stage: "首次启动需要几秒，就绪后自动接入",
+    });
+    void run(() => invoke<KernelStatus>("kernel_start"))
+      .then((s) => {
+        if (s) setStatus(s);
+      })
+      .finally(() => setSwitching(null));
+  };
+
   return (
     <div className="shell">
       {ready && entered ? (
@@ -184,7 +208,7 @@ export default function App() {
           run={run}
           onDone={refresh}
           onError={setError}
-          onEnter={() => setEntered(true)}
+          onEnter={enterWorkspace}
         />
       )}
 
@@ -204,7 +228,7 @@ export default function App() {
       {switching && (
         <div className="switchmask">
           <div className="switchcard" role="status" aria-live="polite">
-            <b>正在切换工作区…</b>
+            <b>{switching.title}</b>
             <span className="swdir" title={switching.dir}>
               {switching.dir}
             </span>

@@ -17,7 +17,6 @@ const PROBE_FRESH: Duration = Duration::from_secs(2);
 
 struct Begun {
     endpoint: Endpoint,
-    boot: u64,
     ak: String,
     sk: String,
     project: String,
@@ -64,13 +63,12 @@ struct Inner {
     log_tail: Arc<Mutex<String>>,
     detail: Option<String>,
     version: Option<String>,
-    /// 每次拉起或停掉进程都加一，健康等待结束时对不上就丢弃这次启动
-    boot: u64,
 }
 
 pub struct Kernel {
     inner: Mutex<Inner>,
-    /// 启动/停止必须串行：并发 `start()` 会让后一个的 shutdown 杀掉前一个刚交出去的实例
+    /// 启动/停止必须串行且全程持锁：`start_locked` 的健康等待也不例外，
+    /// 否则并发启动会互相把对方刚拉起的实例杀掉
     gate: tokio::sync::Mutex<()>,
     pub client: reqwest::Client,
     /// SSE 专用：总超时会在 120s 掐断长连接（实测断线周期 ~122s），这里只限单次读
@@ -110,7 +108,6 @@ impl Kernel {
                 log_tail: Arc::new(Mutex::new(String::new())),
                 detail: None,
                 version: None,
-                boot: 0,
             }),
         }
     }
@@ -157,6 +154,7 @@ impl Kernel {
     }
 
     /// 前端所有请求的入口：确保内核在线并拿到可寻址端点。
+    /// 排队进 gate 后要复查一次：等锁期间可能已有请求把内核带起来了。
     pub async fn ensure_running(&self, app: &tauri::AppHandle) -> Result<Endpoint> {
         if let Some(ep) = self.current_endpoint() {
             if self.probe_fresh(&ep) {
@@ -167,7 +165,14 @@ impl Kernel {
                 return Ok(ep);
             }
         }
-        self.start(app).await
+        let _gate = self.gate.lock().await;
+        if let Some(ep) = self.current_endpoint() {
+            if self.probe(&ep).await.is_some() {
+                self.remember_probe(&ep);
+                return Ok(ep);
+            }
+        }
+        self.start_locked(app).await
     }
 
     /// App 启动时接管上一次异常退出遗留的实例，避免在同一数据目录上叠第二个 serve。
@@ -215,17 +220,21 @@ impl Kernel {
         tauri::async_runtime::spawn(watch(app));
     }
 
+    /// 强制重启一个实例（换工作区、手动启动、升级、自愈都走这里）。
+    /// 全程持 gate：并发方只能排队，不会在健康等待窗口里把刚拉起的实例杀掉。
     pub async fn start(&self, app: &tauri::AppHandle) -> Result<Endpoint> {
-        let begun = {
-            let _gate = self.gate.lock().await;
-            self.begin_start(app).await?
-        };
-        let version = self.await_healthy_gen(&begun.endpoint, begun.boot).await;
         let _gate = self.gate.lock().await;
+        self.start_locked(app).await
+    }
+
+    /// 调用方必须持有 `gate`
+    async fn start_locked(&self, app: &tauri::AppHandle) -> Result<Endpoint> {
+        let begun = self.begin_start(app).await?;
+        let version = self.await_healthy(&begun.endpoint).await;
         self.finish_start(app, begun, version).await
     }
 
-    /// 调用方必须持有 `gate`。拉起进程后立刻返回，健康等待不占锁。
+    /// 调用方必须持有 `gate`。拉起进程后立刻返回，健康等待由 `start_locked` 完成。
     async fn begin_start(&self, app: &tauri::AppHandle) -> Result<Begun> {
         let settings = Settings::load(app)?;
         let project = settings.project_dir()?;
@@ -271,19 +280,16 @@ impl Kernel {
             tauri::async_runtime::spawn(pump(err, tail));
         }
 
-        let boot = {
+        {
             let mut inner = self.inner.lock().unwrap();
-            inner.boot = inner.boot.wrapping_add(1);
             inner.child = Some(child);
             inner.endpoint = None;
             inner.version = None;
             inner.project_dir = Some(project.display().to_string());
-            inner.boot
-        };
+        }
         *self.probed.lock().unwrap() = None;
         Ok(Begun {
             endpoint,
-            boot,
             ak,
             sk,
             project: project.display().to_string(),
@@ -297,10 +303,6 @@ impl Kernel {
         begun: Begun,
         version: Option<String>,
     ) -> Result<Endpoint> {
-        let current = self.inner.lock().unwrap().boot;
-        if current != begun.boot {
-            return Err(Error::Msg("内核启动被取消".into()));
-        }
         let Some(version) = version else {
             let tail = self.snapshot().2.lock().unwrap().clone();
             self.shutdown_inner().await;
@@ -309,9 +311,6 @@ impl Kernel {
                 mask_secrets(&tail_summary(&tail), &[begun.ak, begun.sk])
             )));
         };
-        if self.inner.lock().unwrap().boot != begun.boot {
-            return Err(Error::Msg("内核启动被取消".into()));
-        }
         {
             let mut inner = self.inner.lock().unwrap();
             inner.endpoint = Some(begun.endpoint.clone());
@@ -413,7 +412,6 @@ impl Kernel {
         }
         let child = {
             let mut inner = self.inner.lock().unwrap();
-            inner.boot = inner.boot.wrapping_add(1);
             inner.endpoint = None;
             inner.project_dir = None;
             inner.version = None;
@@ -468,19 +466,13 @@ impl Kernel {
             .map(str::to_string)
     }
 
-    async fn await_healthy_gen(&self, ep: &Endpoint, boot: u64) -> Option<String> {
+    async fn await_healthy(&self, ep: &Endpoint) -> Option<String> {
         for _ in 0..180 {
-            if self.inner.lock().unwrap().boot != boot {
-                return None;
-            }
             if let Some(v) = self.probe(ep).await {
                 return Some(v);
             }
             let exited = {
                 let mut inner = self.inner.lock().unwrap();
-                if inner.boot != boot {
-                    return None;
-                }
                 inner
                     .child
                     .as_mut()
@@ -535,7 +527,7 @@ async fn watch(app: tauri::AppHandle) {
         if alive || misses < 3 {
             continue;
         }
-        // 只在复核端点时占锁；真正重启走 start()，健康等待不再卡住 stop/请求
+        // 复核端点仍在线才接管重启；真正重启走 start()，与手动启动在 gate 上排队
         let restart = {
             let _gate = kernel.gate.lock().await;
             if kernel.current_endpoint().as_ref() != Some(&ep) {

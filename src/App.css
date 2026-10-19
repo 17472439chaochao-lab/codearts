@@ -2808,8 +2808,20 @@ button.primary {
 
 .tfchev {
   flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  margin: -4px -6px -4px 0;
+  border-radius: 6px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.tfhead:hover .tfchev {
+  background: rgba(20, 20, 30, 0.06);
+  color: var(--fg);
 }
 
 .todofly .todoRows {
