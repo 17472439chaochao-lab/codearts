@@ -3,8 +3,10 @@ mod error;
 mod files;
 mod kernel;
 mod ocr;
+mod providers;
 mod secrets;
 mod settings;
+mod skills;
 mod trust;
 
 use error::Error;
@@ -112,6 +114,34 @@ fn mask_ak(ak: &str) -> String {
     format!("****{}", chars[chars.len() - 4..].iter().collect::<String>())
 }
 
+/// 第三方模型提供商：写进内核的全局配置，密钥只回显脱敏形态
+#[tauri::command]
+fn providers_list(app: tauri::AppHandle) -> Result<Vec<providers::ProviderView>, Error> {
+    providers::list(&app)
+}
+
+#[tauri::command]
+fn providers_save(
+    app: tauri::AppHandle,
+    draft: providers::ProviderDraft,
+) -> Result<Vec<providers::ProviderView>, Error> {
+    providers::save(&app, draft)
+}
+
+#[tauri::command]
+fn providers_remove(app: tauri::AppHandle, id: String) -> Result<Vec<providers::ProviderView>, Error> {
+    providers::remove(&app, &id)
+}
+
+/// 用提供商自己的 `/models` 列一把模型，省得手抄 ID
+#[tauri::command]
+async fn providers_fetch_models(
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<providers::PulledModel>, Error> {
+    providers::fetch_models(&base_url, &api_key).await
+}
+
 #[tauri::command]
 async fn kernel_start(app: tauri::AppHandle, kernel: State<'_, Arc<Kernel>>) -> Result<Status, Error> {
     let r = kernel.start(&app).await;
@@ -169,6 +199,10 @@ pub fn run() {
             env_check,
             credentials_save,
             credentials_status,
+            providers_list,
+            providers_save,
+            providers_remove,
+            providers_fetch_models,
             kernel_start,
             kernel_stop,
             kernel_status,
@@ -178,7 +212,11 @@ pub fn run() {
             files::files_list,
             files::file_read,
             files::plans_list,
-            files::plan_read
+            files::plan_read,
+            skills::skills_managed,
+            skills::skill_install_github,
+            skills::skill_update_github,
+            skills::skill_uninstall
         ])
         .setup(|app| {
             let handle = app.handle().clone();

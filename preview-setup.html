@@ -9,6 +9,8 @@
     /preview-setup.html?state=cred 装了 CLI、缺凭据
     /preview-setup.html?state=dir  只差项目目录
     /preview-setup.html?state=ready 三项齐了（进主界面，作对照）
+      设置 → 「模型」页签能验第三方接入：内存里预置一家 openai，/provider 会按这份配置拼出模型，
+      新增/编辑/删除后回会话界面重开模型下拉即可看到多出来的条目；「重启内核」按钮走 kernel_stop→kernel_start
     /preview-setup.html?state=task 内核在线，会话正在跑 task 子任务
       进主界面后点侧栏「示例会话 A」，再用 window.__replay(400) 放子会话的事件帧；
       待决区还会带一张子会话的授权卡和反问卡，window.__kidPend(600) 看它们实时弹出来
@@ -47,8 +49,74 @@
       const hasCredentials = state !== "fresh" && state !== "dir";
       const hasDir = state === "ready" || state === "task" || state === "ask" || state === "todo" || state === "stream";
       // task / ask / todo / stream 场景要的是内核在线：Chat 只在 healthy 时才发请求、才接事件流
-      const healthy = state === "task" || state === "ask" || state === "todo" || state === "stream";
+      const healthy = state !== "fresh" && state !== "cli" && state !== "dir";
       const now = Date.now();
+      /** 技能安装：装/更/卸只改这份内存清单，界面重拉 skills_managed 才看得到变化 */
+      const managed = {
+        project: [
+          { name: "pdf-forms", source: "acme/skills/skills/pdf-forms@v1.2.0", installedAt: now - 86400e3, updatedAt: now - 3600e3 },
+        ],
+        user: [
+          { name: "changelog-writer", source: "you/own-skills", installedAt: now - 7 * 86400e3, updatedAt: 0 },
+        ],
+      };
+      const skillRoot = (s) =>
+        s === "user" ? "/Users/you/.codeartsdoer/skills" : `${projectDir}/.codeartsdoer/skills`;
+      /**
+       * 第三方提供商：mock 成内核全局配置里 provider 段落的样子（key → entry），
+       * providers_save 改这份、/provider 也按这份拼模型，所以设置页接完第三方，
+       * 会话界面的模型下拉能立刻多出那几条。
+       */
+      const customs = {
+        openai: {
+          name: "OpenAI",
+          npm: "@ai-sdk/openai-compatible",
+          options: { baseURL: "https://api.openai.com/v1", apiKey: "enc:v3:P4BfhY4J8kz" },
+          models: {
+            "gpt-4o-mini": { id: "GPT-4o mini", limit: { context: 128000, output: 16384 } },
+          },
+        },
+        "agnes-ai": {
+          name: "Agnes AI",
+          npm: "@ai-sdk/openai-compatible",
+          options: { baseURL: "https://api.agnes-ai.com/v1", apiKey: "sk-demo-key-9876" },
+          models: {
+            "agnes-3.0-flash": { id: "agnes-3.0-flash", limit: { context: 128000, output: 8192 } },
+          },
+        },
+      };
+      const maskOf = (raw) =>
+        !raw ? null : raw.startsWith("enc:") ? "已加密" : "****" + String(raw).slice(-4);
+      const viewOf = (id, e) => ({
+        id,
+        name: e?.name || id,
+        npm: e?.npm || "@ai-sdk/openai-compatible",
+        baseUrl: e?.options?.baseURL ?? "",
+        keyMask: maskOf(e?.options?.apiKey ?? ""),
+        models: Object.entries(e?.models ?? {}).map(([mid, m]) => ({
+          id: mid,
+          name: m?.id || mid,
+          context: m?.limit?.context ?? 0,
+          output: m?.limit?.output ?? 0,
+          reasoning: m?.reasoning === true,
+        })),
+      });
+      const providersView = () =>
+        Object.entries(customs)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([id, e]) => viewOf(id, e));
+      // 内核会把明文密钥就地加密回写，预览台跟着演一遍
+      let kernelUp = healthy;
+      // 真内核每次 start 都换新端口，壳侧全靠这个变化触发 /provider 重拉
+      let kernelPort = 59001;
+      const statusOf = () => ({
+        running: kernelUp,
+        healthy: kernelUp,
+        port: kernelUp ? kernelPort : null,
+        projectDir: hasDir ? projectDir : null,
+        version: kernelUp ? "26.9.26" : null,
+        detail: null,
+      });
 
       const PARENT = "ses_a1";
       const KID = "ses_k1";
@@ -393,7 +461,7 @@ class OldExportController
         "app/Http/Controllers/OldExportController.php": oldController,
         "CHANGELOG.md": changelog,
       };
-      /** 文件栏「计划」页签：工作区与内核数据目录各来一份 */
+      /** 文件栏「计划」页签：内核规划模式、内核数据目录、技能自建目录各来一份 */
       const demoPlanWorkspace = {
         name: "1760700000000-merchant-role-migration.md",
         path: "/Users/you/work/demo/.opencode/plans/1760700000000-merchant-role-migration.md",
@@ -408,20 +476,47 @@ class OldExportController
         size: 880,
         mtime: now - 86_400_000,
       };
-      const demoPlans = [demoPlanWorkspace, demoPlanKernel];
+      const demoPlanProject = {
+        name: "2026-10-19-php-role-mutex.md",
+        path: "/Users/you/work/demo/docs/superpowers/plans/2026-10-19-php-role-mutex.md",
+        source: "project",
+        size: 1024,
+        mtime: now - 3_600_000,
+      };
+      const demoPlans = [demoPlanWorkspace, demoPlanProject, demoPlanKernel];
       const demoPlanFiles = {
         [demoPlanWorkspace.path]: `# 商户角色互斥迁移计划
 
 ## 目标
-同一账号只能持有一个管理角色。
+同一账号只能持有一个管理角色。角色写入走 \`MerchantManagerService\`，**不再**散落在控制器里。
 
 ## 改动
 - app/Services/Merchants/MerchantManagerService.php：角色写入前先清理旧角色
 - database/migrations/2026_10_16_role_exclusive.php：新增唯一约束
 
+## 步骤
+- [x] 服务层加 \`syncManagerRole()\`
+- [ ] 迁移补唯一约束
+- [ ] 回归覆盖并发写入
+
+## 约束
+| 范围 | 角色 |
+| --- | --- |
+| 单商户 | admin、operator 二选一 |
+| 跨商户 | 不受限 |
+
+> 迁移上线前先导一遍现有角色数据。
+
+\`\`\`php
+$service->syncManagerRole($merchantId, $userId, 'admin');
+\`\`\`
+
+---
+
 ## 验证
 1. 给同一账号写两个角色，确认第二个被拒绝
 2. 跑迁移与现有角色用例
+3. 需求原文见 [角色互斥工单](https://example.com/issues/role-mutex)
 `,
         [demoPlanKernel.path]: `# 登录页重构计划
 
@@ -435,6 +530,19 @@ class OldExportController
 
 ## 验证
 - 空密码、错误密码、成功登录三条路径
+`,
+        [demoPlanProject.path]: `# PHP 角色互斥计划（技能自建目录）
+
+## 目标
+同一账号在同一时刻只能持有一个管理角色。
+
+## 步骤
+- 服务层写入角色前先清理既有角色
+- 迁移补唯一约束
+- 回归覆盖并发写入
+
+## 验证
+- 连续写入两个角色，只保留最后一个
 `,
       };
       /** `/session/:id/diff` 的返回：before/after 全文，文件面板据此算逐行 diff */
@@ -777,6 +885,10 @@ class OldExportController
       window.__bridge = (state) =>
         emit("kernel-bridge", { state, message: state === "down" ? "event stream closed" : undefined });
 
+      // 界面「新建会话」会 POST /session，mock 也得当场造一条进列表
+      const created = [];
+      let made = 0;
+
       mockWindows("main");
       mockIPC((cmd, payload) => {
         if (cmd === "api_request") {
@@ -806,7 +918,19 @@ class OldExportController
                     },
                   ]
                 : []),
+              ...created,
             ].filter((s) => !deleted.has(s.id));
+          if (payload?.method === "POST" && path === "/session") {
+            made += 1;
+            const s = {
+              id: `ses_new${made}`,
+              title: String(payload?.body?.title ?? "新建会话"),
+              directory: payload?.directory ?? projectDir,
+              time: { created: Date.now(), updated: Date.now() },
+            };
+            created.push(s);
+            return s;
+          }
           if (payload?.method === "GET" && /^\/session\/[^/]+\/children$/.test(path))
             return state === "task" && path === `/session/${PARENT}/children`
               ? [
@@ -831,6 +955,7 @@ class OldExportController
                   : state === "stream"
                     ? richMsgs
                     : [];
+          if (payload?.method === "GET" && /^\/session\/[^/]+\/message$/.test(path)) return [];
           if (payload?.method === "DELETE" && /^\/session\/[^/]+$/.test(path)) {
             const id = path.split("/")[2];
             deleted.add(id);
@@ -838,6 +963,8 @@ class OldExportController
             window.__emit("session.deleted", { sessionID: id });
             return { id, title: parentTitle, directory: projectDir, time: { created: now, updated: now } };
           }
+          // /session/status 长得和 /session/:id 一样，必须排在通用正则前面
+          if (payload?.method === "GET" && path === "/session/status") return window.__busy ?? {};
           if (payload?.method === "GET" && /^\/session\/[^/]+$/.test(path)) {
             const id = path.split("/")[2];
             return { id, title: parentTitle, directory: projectDir, time: { created: now, updated: now } };
@@ -885,7 +1012,7 @@ class OldExportController
             return {
               all: [
                 {
-                  id: "huawei",
+                  id: "huaweicloud-maas",
                   name: "华为云码道",
                   models: {
                     "deepseek-v3": {
@@ -894,10 +1021,34 @@ class OldExportController
                       limit: { context: 65536 },
                       capabilities: { input: { image: window.__vision === true } },
                     },
+                    "glm-5.2": { id: "glm-5.2", name: "GLM-5.2", limit: { context: 202752 } },
+                    "openpangu-2.0-pro": {
+                      id: "openpangu-2.0-pro",
+                      name: "OpenPangu-2.0-Pro",
+                      limit: { context: 524288 },
+                      capabilities: { input: { image: true } },
+                    },
                   },
                 },
+                // 第三方那份按盘上配置拼出来：模型 id 用键名，显示名走 id 字段，图片一律算不支持
+                ...providersView().map((p) => ({
+                  id: p.id,
+                  name: p.name,
+                  source: "config",
+                  models: Object.fromEntries(
+                    p.models.map((m) => [
+                      m.id,
+                      {
+                        id: m.id,
+                        name: m.name,
+                        limit: { context: m.context, output: m.output },
+                        capabilities: { reasoning: m.reasoning, input: { image: false } },
+                      },
+                    ]),
+                  ),
+                })),
               ],
-              default: { huawei: "deepseek-v3" },
+              default: { "huaweicloud-maas": "deepseek-v3" },
             };
           if (payload?.method === "GET" && path === "/agent")
             return [
@@ -935,6 +1086,84 @@ class OldExportController
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;
         if (cmd === "settings_save") return null;
+        if (cmd === "providers_list") return providersView();
+        if (cmd === "providers_save") {
+          const d = payload?.draft ?? {};
+          if (!d.id) throw new Error("提供商标识不能为空且不超过 64 个字符");
+          if (d.id === "huaweicloud-maas" || d.id === "benefit-model")
+            throw new Error(`「${d.id}」是内核自带的提供商，换一个标识`);
+          if (!/^https?:\/\//.test(String(d.baseUrl ?? "")))
+            throw new Error("服务地址只支持 http/https");
+          if (!(d.models ?? []).length) throw new Error("至少填一个模型");
+          const kept = customs[d.id]?.options?.apiKey ?? "";
+          customs[d.id] = {
+            name: d.name || d.id,
+            npm: d.npm || "@ai-sdk/openai-compatible",
+            options: {
+              baseURL: String(d.baseUrl).trim(),
+              // 留空 = 沿用盘上原值；新填的明文当作已被内核加密过
+              ...(String(d.apiKey ?? "").trim() || kept
+                ? { apiKey: String(d.apiKey ?? "").trim() ? `enc:v3:mock${String(d.apiKey).slice(-6)}` : kept }
+                : {}),
+            },
+            models: Object.fromEntries(
+              d.models.map((m) => [
+                m.id,
+                {
+                  id: m.name || m.id,
+                  ...(m.reasoning ? { reasoning: true } : {}),
+                  limit: { context: m.context, output: m.output },
+                },
+              ]),
+            ),
+          };
+          return providersView();
+        }
+        if (cmd === "providers_remove") {
+          if (!customs[payload?.id]) throw new Error(`配置里没有名为「${payload?.id}」的第三方提供商`);
+          delete customs[payload.id];
+          return providersView();
+        }
+        if (cmd === "providers_fetch_models") {
+          if (!/^https?:\/\//.test(String(payload?.baseUrl ?? ""))) throw new Error("服务地址无法解析");
+          return [
+            { id: "pulled-one", context: 200000 },
+            { id: "pulled-two", context: null },
+          ];
+        }
+        if (cmd === "skills_managed")
+          return {
+            project: managed.project,
+            user: managed.user,
+            projectRoot: skillRoot("project"),
+            userRoot: skillRoot("user"),
+          };
+        if (cmd === "skill_install_github") {
+          // 安装一律用户级（全局），界面不再传作用域
+          const sc = "user";
+          const source = String(payload?.source ?? "");
+          const name = (source.split("/").filter(Boolean).pop() ?? "").split("@")[0] || "demo-skill";
+          const list = managed[sc];
+          const empty = { installed: [], conflicts: [], invalid: [], removed: [], root: skillRoot(sc), message: "" };
+          if (list.some((s) => s.name === name))
+            return { ...empty, conflicts: [name], message: `${name} 已存在，同名不覆盖` };
+          list.push({ name, source, installedAt: Date.now(), updatedAt: 0 });
+          return { ...empty, installed: [name], message: `已装入 ${name}` };
+        }
+        if (cmd === "skill_update_github") {
+          const sc = payload?.scope === "user" ? "user" : "project";
+          const hit = managed[sc].find((s) => s.name === payload?.name);
+          if (!hit) throw new Error(`${payload?.name} 不在本应用的技能清单里`);
+          hit.updatedAt = Date.now();
+          return { installed: [hit.name], conflicts: [], invalid: [], removed: [], root: skillRoot(sc), message: `已按 ${hit.source} 更新 ${hit.name}` };
+        }
+        if (cmd === "skill_uninstall") {
+          const sc = payload?.scope === "user" ? "user" : "project";
+          const i = managed[sc].findIndex((s) => s.name === payload?.name);
+          if (i < 0) throw new Error(`${payload?.name} 不在本应用的技能清单里；确实要删就手动清理 ${skillRoot(sc)}`);
+          managed[sc].splice(i, 1);
+          return { installed: [], conflicts: [], invalid: [], removed: [payload?.name], root: skillRoot(sc), message: `已移除 ${payload?.name}` };
+        }
         if (cmd === "files_list") {
           if (!hasDir) return { entries: [], truncated: false };
           const rel = payload?.rel ?? "";
@@ -965,15 +1194,16 @@ class OldExportController
             mtime: now,
           };
         }
-        if (cmd === "kernel_status")
-          return {
-            running: healthy,
-            healthy,
-            port: healthy ? 59001 : null,
-            projectDir: hasDir ? projectDir : null,
-            version: healthy ? "26.9.26" : null,
-            detail: null,
-          };
+        if (cmd === "kernel_start") {
+          kernelUp = healthy;
+          kernelPort += 1;
+          return statusOf();
+        }
+        if (cmd === "kernel_stop") {
+          kernelUp = false;
+          return statusOf();
+        }
+        if (cmd === "kernel_status") return statusOf();
         if (cmd === "credentials_status")
           return { saved: hasCredentials, inCliEnv: false, akMask: null };
         return null;

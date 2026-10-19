@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { structuredPatch, type StructuredPatchHunk } from "diff";
 import type { FileDiff, Session } from "./kernelApi";
 import type { ThemedToken } from "./highlight";
+import { renderMarkdown } from "./markdown";
 
 /** 打开文件的坐标：rel 相对当前工作区，abs 用来和内核返回的改动路径对上 */
 export type OpenFile = {
@@ -32,18 +33,25 @@ type FileContent = {
 type PlanEntry = {
   name: string;
   path: string;
-  source: "workspace" | "kernel";
+  source: "workspace" | "kernel" | "project";
   size: number;
   mtime: number;
 };
 
 const FSTATUS_CN: Record<string, string> = { added: "A", deleted: "D", modified: "M" };
-const PLAN_SOURCE_CN: Record<string, string> = { workspace: "工作区", kernel: "内核数据" };
+const PLAN_SOURCE_CN: Record<string, string> = {
+  workspace: "工作区",
+  kernel: "内核数据",
+  project: "项目目录",
+};
 const MAX_LINES = 5000;
 /** 改动前后加起来超过这个量就不在 WebView 里算逐行 diff，避免整窗卡死 */
 const MAX_DIFF_CHARS = 800_000;
 /** 高亮是纯前端增强：再大的文本就保持纯文本，别为了配色卡住主线程 */
 const MAX_HIGHLIGHT_CHARS = 300_000;
+/** Markdown 渲染整棵 DOM，没有虚拟滚动；超过这个长度直接给原文 */
+const MAX_MD_CHARS = 300_000;
+const isMd = (rel: string) => /\.md$/i.test(rel);
 
 const trimSlash = (p: string) => p.replace(/\/+$/, "");
 const samePath = (a: string, b: string) => trimSlash(a) === trimSlash(b);
@@ -176,6 +184,13 @@ export function FilePanel({
     return m;
   }, [wsDiffs]);
 
+  /** 技能写的计划就在工作区里，展示相对目录比"项目目录"四个字有用 */
+  const planWhere = (p: PlanEntry) => {
+    const rel = p.source === "project" ? relInRoot(root, p.path) : null;
+    if (rel) return rel.replace(/\/[^/]*$/, "");
+    return PLAN_SOURCE_CN[p.source] ?? p.source;
+  };
+
   const loadRoot = useCallback(() => {
     let alive = true;
     setErr(null);
@@ -216,7 +231,6 @@ export function FilePanel({
     setTruncated(false);
     setPlans(null);
   }, [root]);
-
   useEffect(() => loadRoot(), [loadRoot, version]);
 
   // 计划文件由 agent 增量写入，跟 file.edited 的 version 一起刷新；只看当前页签，别空转
@@ -324,15 +338,6 @@ export function FilePanel({
         </div>
       ) : tab === "changes" ? (
         <div className="ftree changes">
-          <p className="fnote">
-            {session ? (
-              <>
-                当前会话 · <b>{session.title || session.id}</b>
-              </>
-            ) : (
-              "打开一个会话后显示它改过的文件"
-            )}
-          </p>
           {crossWs && <p className="fhint">该会话属于其他工作区，切过去才能查看这些文件</p>}
           {crossWs ? null : !wsDiffs.length ? (
             <p className="fhint">
@@ -367,18 +372,16 @@ export function FilePanel({
               })}
             </ul>
           )}
-          <p className="fnote dim">改动由内核按会话记录，每轮结束后更新</p>
         </div>
       ) : (
         <div className="ftree changes">
-          <p className="fnote">规划模式写下的计划，点开即可预览</p>
           {planErr ? (
             <p className="fhint err">{planErr}</p>
           ) : plans === null ? (
             <p className="fhint">读取中…</p>
           ) : !plans.length ? (
             <p className="fhint">
-              还没有计划。把输入区右侧的 agent 切到「规划 · plan」，或让 agent 自行进入规划模式
+              还没有计划。点输入区左下的「规划」开关，让 agent 先出计划再动手
             </p>
           ) : (
             <ul className="chlist">
@@ -396,7 +399,7 @@ export function FilePanel({
                     <span className="cinfo">
                       <b>{planLabel(p)}</b>
                       <span>
-                        {PLAN_SOURCE_CN[p.source] ?? p.source}
+                        {planWhere(p)}
                         {p.mtime ? ` · ${fmtWhen(p.mtime)}` : ""}
                       </span>
                     </span>
@@ -405,9 +408,6 @@ export function FilePanel({
               ))}
             </ul>
           )}
-          <p className="fnote dim">
-            计划由内核写在 &lt;工作区&gt;/.codeartsdoer/plans/&lt;功能名&gt;/plan.md
-          </p>
         </div>
       )}
     </aside>
@@ -567,6 +567,7 @@ function cleanCopyText(root: HTMLElement): string | null {
 
 export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: ViewerProps) {
   const [tab, setTab] = useState<"preview" | "diff">(startTab);
+  const [mdRaw, setMdRaw] = useState(false);
   const [data, setData] = useState<FileContent | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -613,6 +614,7 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
 
   useEffect(() => {
     setTab(startTab);
+    setMdRaw(false);
   }, [file.abs, startTab]);
 
   useEffect(() => {
@@ -663,6 +665,9 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
     }
   }
 
+  const markdown =
+    tab === "preview" && isMd(file.rel) && !!data && !data.binary && data.content !== null;
+
   return (
     <div
       className="modal"
@@ -691,6 +696,45 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
           </div>
           <div className="row fvacts">
             {note && <span className="muted small">{note}</span>}
+            {markdown && (
+              <button
+                className={`ico-btn ${mdRaw ? "on" : ""}`}
+                onClick={() => setMdRaw((v) => !v)}
+                aria-pressed={mdRaw}
+                title={mdRaw ? "显示渲染效果" : "显示 Markdown 原文"}
+                aria-label={mdRaw ? "显示渲染效果" : "显示 Markdown 原文"}
+              >
+                {mdRaw ? (
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path
+                      d="M4 2.6h5.4L12.4 5v8.4H4z"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.3"
+                      strokeLinejoin="round"
+                    />
+                    <path
+                      d="M6 7.4h4M6 9.6h4"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.3"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path
+                      d="M6 4.5L2.8 8 6 11.5M10 4.5L13.2 8 10 11.5"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.4"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                )}
+              </button>
+            )}
             <button className="ico-btn" onClick={copyPath} title="复制完整路径" aria-label="复制完整路径">
               <svg viewBox="0 0 24 24" aria-hidden="true">
                 <rect x="9" y="9" width="13" height="13" rx="2" fill="none" stroke="currentColor" strokeWidth="2" />
@@ -773,6 +817,8 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
               <p className="fhint">这是二进制文件（{fmtSize(data.size)}），不做文本预览。</p>
             ) : data.content === null ? (
               <p className="fhint">没有可显示的内容</p>
+            ) : markdown && !mdRaw ? (
+              <MdView text={data.content} rel={file.rel} truncated={data.truncated} />
             ) : (
               <CodeView text={data.content} rel={file.rel} truncated={data.truncated} />
             )
@@ -901,6 +947,57 @@ function CodeView({ text, rel, truncated }: { text: string; rel: string; truncat
             : "文件超过 2 MB，内容已截断"}
         </p>
       )}
+    </>
+  );
+}
+
+/** Markdown 预览：外链交给系统浏览器，相对链接只挡住默认跳转 */
+function openMarkdownLinks(e: React.MouseEvent<HTMLDivElement>) {
+  const a = (e.target as HTMLElement).closest("a");
+  if (!a) return;
+  e.preventDefault();
+  const href = a.getAttribute("href") ?? "";
+  if (/^https?:\/\//i.test(href)) {
+    void openUrl(href).catch((err) => console.warn("打开链接失败", err));
+  }
+}
+
+/** Markdown 渲染整棵 DOM，没有虚拟滚动 */
+function MdView({ text, rel, truncated }: { text: string; rel: string; truncated: boolean }) {
+  const [html, setHtml] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (text.length > MAX_MD_CHARS) {
+      setFailed(true);
+      return;
+    }
+    let alive = true;
+    setFailed(false);
+    renderMarkdown(text)
+      .then((h) => {
+        if (alive) setHtml(h);
+      })
+      .catch((e) => {
+        console.warn("Markdown 渲染失败，退回原文", e);
+        if (alive) setHtml(null);
+        if (alive) setFailed(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [text, renderMarkdown]);
+
+  if (failed) return <CodeView text={text} rel={rel} truncated={truncated} />;
+  if (!html) return <p className="fhint">渲染中…</p>;
+  return (
+    <>
+      <div
+        className="md"
+        onClick={openMarkdownLinks}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+      {truncated && <p className="fhint pad">文件超过 2 MB，内容已截断</p>}
     </>
   );
 }

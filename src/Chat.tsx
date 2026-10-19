@@ -123,7 +123,7 @@ function readImage(file: File): Promise<Attachment> {
 }
 
 /** 上次用的模型：内核 /provider 的 default 每次重启都可能变，用户的选择要自己记住 */
-const MODEL_KEY = "codearts.model";
+export const MODEL_KEY = "codearts.model";
 const AGENT_KEY = "codearts.agent";
 /** 文件栏默认展开；用户收起一次之后记住 */
 const FILES_KEY = "codearts.filesPanel";
@@ -317,6 +317,14 @@ export default function Chat({
   const [agent, setAgent] = useState<string | null>(null);
   /** 自动换 agent 时记下已经处理过的工具 part，避免同一帧重复到达把用户手动选择改回去 */
   const planSwitch = useRef<string | null>(null);
+  /** 退出规划模式要回到规划之前那个 agent，而不是写死 build */
+  const prevAgent = useRef("build");
+  /** 选 agent 的单一入口：下拉、规划开关、内核 plan_exit 自动切都走这里 */
+  const chooseAgent = useCallback((name: string) => {
+    if (name !== "plan") prevAgent.current = name;
+    setAgent(name);
+    localStorage.setItem(AGENT_KEY, name);
+  }, []);
   const [hi, setHi] = useState(0);
   /** Esc 关掉的候选项所属的 /token，继续打字（token 变了）会重新弹。必须是 state，用 ref 的话按 Esc 不重渲染，面板会赖着不走 */
   const [dismissed, setDismissed] = useState<string | null>(null);
@@ -448,6 +456,50 @@ export default function Chat({
     ? models.find((m) => m.providerID === model.providerID && m.modelID === model.modelID)
     : undefined;
   const visionReady = selectedModel?.image === true;
+  /** 内置模型排前面不带副标；接进来的第三方收到「自定义」一段，段内再按提供商分组 */
+  const modelOptions = (() => {
+    const ref = (m: ModelInfo) => `${m.providerID}/${m.modelID}`;
+    const label = (m: ModelInfo) => `${m.name}${m.context ? ` · ${Math.round(m.context / 1024)}K` : ""}`;
+    const out: ChipOption[] = models
+      .filter((m) => !m.custom)
+      .map((m) => ({ value: ref(m), label: label(m) }));
+    const custom = models.filter((m) => m.custom);
+    const ids: string[] = [];
+    for (const m of custom) if (!ids.includes(m.providerID)) ids.push(m.providerID);
+    ids.forEach((id, pi) => {
+      const list = custom.filter((m) => m.providerID === id);
+      list.forEach((m, mi) => {
+        out.push({
+          value: ref(m),
+          label: label(m),
+          group: pi === 0 && mi === 0 ? "自定义" : undefined,
+          prov: mi === 0 ? m.providerName : undefined,
+        });
+      });
+    });
+    return out;
+  })();
+
+  /** 时间线最后一条已经带错误时，输入框那一行的重复提示就不再显示 */
+  const lastErr = (() => {
+    const e = msgs[msgs.length - 1]?.info.error;
+    return e ? e.data?.message ?? e.name ?? null : null;
+  })();
+  /** 可重发的内容 = 最后一条用户消息的文字和图片；没有它就没有重试入口 */
+  const retryParts = (() => {
+    const src = [...msgs].reverse().find((m) => m.info.role === "user");
+    if (!src) return null;
+    const parts = src.parts.flatMap(
+      (p): { type: string; text?: string; mime?: string; url?: string; filename?: string }[] => {
+        if (p.type === "text" && p.text) return [{ type: "text", text: p.text }];
+        if (p.type === "file" && p.url)
+          return [{ type: "file", mime: p.mime, url: p.url, filename: p.filename }];
+        return [];
+      },
+    );
+    return parts.length ? parts : null;
+  })();
+  const canRetry = !!retryParts && !!active && !readOnly && !busy;
 
   /** 改动快照按会话存；内核在每轮收尾和文件写入时会更新它 */
   const reloadDiffs = useCallback(() => {
@@ -508,10 +560,10 @@ export default function Chat({
           visible.find((a) => a.name === saved) ??
           visible.find((a) => a.name === "build") ??
           visible[0];
-        setAgent(chosen.name);
+        chooseAgent(chosen.name);
       })
       .catch(() => setAgentList([]));
-  }, [live, dir]);
+  }, [live, dir, chooseAgent]);
 
   /**
    * 换会话就重建子会话表。children 接口给的是历史，所以每条都要回灌一次消息；
@@ -803,19 +855,19 @@ export default function Chat({
             const kid = p.part.state?.metadata?.sessionId;
             if (typeof kid === "string") kidIds.current.add(kid);
           }
-          // 与 TUI 同一套规则：规划入口/出口完成后，输入区的 agent 跟着切换。
-          // plan_exit 选 No 时工具是 error 状态，不会走到这里。
+          // 内核 26.9.26 两个方向都指望不上：plan_enter 只剩权限键、没有工具注册，
+          // plan_exit 真跑一轮回 "Tool plan_exit not found"（官方 TUI 同款监听同样收不到）。
+          // 进出规划都靠输入区的「规划」开关，这段只在内核修好 plan_exit 后才可能生效。
+          // plan_exit 走不通时是 error 状态，也不会误切。
           if (
             sid === cur &&
             p.part.type === "tool" &&
             p.part.state?.status === "completed" &&
-            (p.part.tool === "plan_enter" || p.part.tool === "plan_exit") &&
+            p.part.tool === "plan_exit" &&
             planSwitch.current !== p.part.id
           ) {
             planSwitch.current = p.part.id;
-            const next = p.part.tool === "plan_enter" ? "plan" : "build";
-            setAgent(next);
-            localStorage.setItem(AGENT_KEY, next);
+            chooseAgent("build");
           }
           if (mine) merge(sid, (m) => upsertPart(m, p.part));
           break;
@@ -1268,6 +1320,51 @@ export default function Chat({
       sending.current = false;
     }
   }
+
+  /** 重试 = 把最后一条用户消息原样再发一次，不用重新打字 */
+  async function retryTurn() {
+    const id = active;
+    if (!retryParts || !id || sending.current || busy || perms.length > 0 || asks.length > 0) return;
+    sending.current = true;
+    setErr(null);
+    setToast(null);
+    // 先标 busy：prompt 返回前 SSE 可能已 idle，事后再 add 会卡在 Stop
+    setBusySet((s) => new Set(s).add(id));
+    try {
+      await sessions.prompt(id, retryParts, dir, model, agent);
+      stick.current = true;
+    } catch (e) {
+      setBusySet((s) => {
+        if (!s.has(id)) return s;
+        const next = new Set(s);
+        next.delete(id);
+        return next;
+      });
+      setErr(String(e));
+    } finally {
+      sending.current = false;
+    }
+  }
+
+  const retryBtn = canRetry ? (
+    <button
+      className="retry"
+      onClick={() => void retryTurn()}
+      title="把这一轮的输入原样再发一次"
+    >
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <path
+          d="M13 8a5 5 0 1 1-1.5-3.6M13 2.6V6h-3.4"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.3"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+      重试
+    </button>
+  ) : null;
 
   async function createSession() {
     try {
@@ -1881,6 +1978,7 @@ export default function Chat({
                     {m.info.error && (
                       <p className="error inline">
                         {m.info.error.data?.message ?? m.info.error.name}
+                        {isLast && retryBtn}
                       </p>
                     )}
                     {m.parts.map((p) => (
@@ -2102,6 +2200,36 @@ export default function Chat({
           />
           <div className="row">
             <div className="ctrls">
+              <button
+                type="button"
+                className={`modebtn ${agent === "plan" ? "on" : ""}`}
+                aria-pressed={agent === "plan"}
+                disabled={agent === null || !agentList.some((a) => a.name === "plan")}
+                title={
+                  agent === "plan"
+                    ? "规划模式已开启：只能读代码、写计划文件，改不了业务代码。点这里退出规划。"
+                    : "规划模式：先出计划、你确认后再动手。内核不会自己进规划模式，要在这里点。"
+                }
+                onClick={() => chooseAgent(agent === "plan" ? prevAgent.current : "plan")}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M3 2.6h6.4L13 6.1v7.3H3z"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.2"
+                    strokeLinejoin="round"
+                  />
+                  <path
+                    d="M5.3 6.6h5.4M5.3 9h3.6"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.2"
+                    strokeLinecap="round"
+                  />
+                </svg>
+                规划
+              </button>
               <ChipSelect
                 className="agent"
                 value={agent ?? ""}
@@ -2116,10 +2244,7 @@ export default function Chat({
                   (agent ? AGENT_DESC_CN[agent] : undefined) ??
                   "本轮由哪个 agent 执行；规划（plan）禁用改文件工具"
                 }
-                onChange={(v) => {
-                  setAgent(v);
-                  localStorage.setItem(AGENT_KEY, v);
-                }}
+                onChange={chooseAgent}
               />
               <ChipSelect
                 className="policy"
@@ -2139,10 +2264,7 @@ export default function Chat({
                 className="model"
                 align="right"
                 value={model ? `${model.providerID}/${model.modelID}` : ""}
-                options={models.map((m) => ({
-                  value: `${m.providerID}/${m.modelID}`,
-                  label: `${m.name}${m.context ? ` · ${Math.round(m.context / 1024)}K` : ""}`,
-                }))}
+                options={modelOptions}
                 placeholder="无可用模型"
                 disabled={!models.length}
                 title="选择模型"
@@ -2155,7 +2277,12 @@ export default function Chat({
                   localStorage.setItem(MODEL_KEY, v);
                 }}
               />
-              {err && <span className="error inline">{err}</span>}
+              {err && !lastErr && (
+                <span className="error inline">
+                  {err}
+                  {retryBtn}
+                </span>
+              )}
             </div>
             <span className="grow" />
             {busy ? (
@@ -2244,13 +2371,13 @@ export default function Chat({
   );
 }
 
-type ChipOption = { value: string; label: string; hint?: string };
+type ChipOption = { value: string; label: string; hint?: string; group?: string; prov?: string };
 
 /**
  * 原生 select 的展开层归系统画，改不了样式；换成自绘 listbox。
  * 支持点击外部/Esc 收起、上下键移动、Enter 选中，菜单向上弹。
  */
-function ChipSelect({
+export function ChipSelect({
   value,
   options,
   placeholder,
@@ -2344,9 +2471,14 @@ function ChipSelect({
       {open && (
         <div className="chipmenu" role="listbox" aria-label={title}>
           {options.map((o, i) => (
-            <button
-              type="button"
-              role="option"
+            <Fragment key={o.value}>
+              {o.group && o.group !== options[i - 1]?.group && (
+                <div className="chipgroup">{o.group}</div>
+              )}
+              {o.prov && <div className="chipgroup sub">{o.prov}</div>}
+              <button
+                type="button"
+                role="option"
               aria-selected={o.value === value}
               key={o.value}
               className={`${o.value === value ? "on" : ""} ${i === hi ? "hi" : ""}`}
@@ -2370,6 +2502,7 @@ function ChipSelect({
                 </svg>
               )}
             </button>
+            </Fragment>
           ))}
         </div>
       )}

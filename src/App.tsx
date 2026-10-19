@@ -4,8 +4,20 @@ import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import Chat from "./Chat";
-import { mcp, skills, type EnvCheck, type SkillInfo, type V1Skill } from "./kernelApi";
+import Chat, { ChipSelect, MODEL_KEY } from "./Chat";
+import {
+  api,
+  customProviders,
+  kernelBusy,
+  mcp,
+  normalizeProviders,
+  reloadInstance,
+  skills,
+  type CustomProvider,
+  type EnvCheck,
+  type SkillInfo,
+  type V1Skill,
+} from "./kernelApi";
 import "./App.css";
 
 export type KernelStatus = {
@@ -470,6 +482,7 @@ function Settings({
   const [sk, setSk] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const [caps, setCaps] = useState<Caps | null>(null);
+  const [capsTick, setCapsTick] = useState(0);
   const [cred, setCred] = useState<CredStatus | null>(null);
   const [editing, setEditing] = useState(false);
   const [upgrading, setUpgrading] = useState(false);
@@ -497,7 +510,7 @@ function Settings({
   }, [check]);
 
   const dir = status?.projectDir ?? null;
-  // 技能与 MCP 由内核按目录装载，壳子只读不写：增减要在 CLI 侧配置
+  // 清单本身只读；装完技能靠内核的目录监视热加载，这里重新拉一次就能看见
   useEffect(() => {
     if (!status?.healthy) {
       setCaps(null);
@@ -506,7 +519,7 @@ function Settings({
     Promise.all([skills.list(dir), skills.system(dir), mcp.list(dir)])
       .then(([local, sys, servers]) => setCaps({ local, sys: sys.skills, servers }))
       .catch(() => setCaps(null));
-  }, [status?.healthy, dir]);
+  }, [status?.healthy, dir, capsTick]);
 
   async function saveCreds() {
     if (!ak.trim() || !sk.trim()) {
@@ -580,18 +593,21 @@ function Settings({
                   {upgrading ? "更新中…" : "更新内核"}
                 </button>
               </div>
-              <p className="hint">
-                更新走内核自带的 <code>codearts upgrade</code>，会先停掉当前实例、覆盖
-                installers/bin/codearts，成功后再自动拉起。
-              </p>
               {updLog && <pre className="detail">{updLog}</pre>}
-              <p className="path small">{check?.kernelBin ?? "未检测到"}</p>
-              <p className="hint">
-                当前工作区：<span className="path small">{check?.projectDir ?? "未选择"}</span>
-              </p>
-              <p className="hint">工作区在左侧栏添加和切换；切换会重启内核。</p>
               {status?.detail && <pre className="detail">{status.detail}</pre>}
             </>
+          )}
+
+          {tab === "model" && (
+            <ModelSettings
+              dir={dir}
+              healthy={!!status?.healthy}
+              port={status?.port ?? null}
+              onRestart={async () => {
+                await onStop();
+                await onStart();
+              }}
+            />
           )}
 
           {tab === "cred" && (
@@ -601,13 +617,6 @@ function Settings({
                   <p className="hint">
                     已配置 · AK <span className="mask">{cred.akMask}</span> · SK{" "}
                     <span className="mask">••••••••••••</span>
-                  </p>
-                  <p className="hint">
-                    {cred.saved
-                      ? "本应用内保存，启动内核时注入"
-                      : "取自 CLI 的 ~/.codeartsdoer/cli.env"}
-                    {cred.saved && cred.inCliEnv ? "（CLI 侧也有一份，本应用这份优先）" : ""}
-                    ；SK 不回显，只在保存时进 Rust 侧。
                   </p>
                   <div className="row">
                     <button onClick={() => setEditing(true)}>更换</button>
@@ -689,11 +698,13 @@ function Settings({
                       <li>内核未报告任何技能或 MCP 服务器</li>
                     )}
                   </ul>
-                  <p className="hint">
-                    输入 / 可以直接调用这些命令；技能由内核按工作区装载，这里只展示。
-                  </p>
                 </>
               )}
+              <SkillManager
+                dir={dir}
+                healthy={!!status?.healthy}
+                onChanged={() => setCapsTick((t) => t + 1)}
+              />
             </>
           )}
 
@@ -704,8 +715,649 @@ function Settings({
   );
 }
 
+type ManagedSkill = {
+  name: string;
+  /** 原样回显的来源，如 foo/bar/skills/x@v1 */
+  source: string;
+  installedAt: number;
+  updatedAt: number;
+};
+
+type ManagedView = {
+  project: ManagedSkill[];
+  user: ManagedSkill[];
+  projectRoot: string;
+  userRoot: string;
+};
+
+type SkillReport = {
+  installed: string[];
+  conflicts: string[];
+  invalid: string[];
+  removed: string[];
+  root: string;
+  message: string;
+};
+
+/**
+ * 技能安装：Rust 侧抓 GitHub 压缩包、校验 SKILL.md、写进内核的技能目录。
+ * 作用域只有"当前工作区 / 用户级"，目录一律由 Settings 推导，前端传不进来。
+ * 写完文件内核还不认，得让实例重载一次（见 kernelApi.reloadInstance）。
+ */
+function SkillManager({
+  dir,
+  healthy,
+  onChanged,
+}: {
+  dir: string | null;
+  healthy: boolean;
+  onChanged: () => void;
+}) {
+  const [src, setSrc] = useState("");
+  const [view, setView] = useState<ManagedView | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
+  const [working, setWorking] = useState(false);
+
+  const reload = useCallback(
+    () =>
+      invoke<ManagedView>("skills_managed")
+        .then(setView)
+        .catch(() => setView(null)),
+    [],
+  );
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  /** 空闲才自动重载：实例重载会清掉实例状态，正在出活时点会把这轮消息弄丢 */
+  async function syncKernel(quiet: boolean, done?: string) {
+    if (!healthy || !dir) {
+      setStale(false);
+      if (!quiet) setNote(done ?? "内核没在跑；技能文件已经落盘，下次启动内核就会装载");
+      return;
+    }
+    try {
+      if (!quiet && (await kernelBusy(dir))) {
+        setStale(true);
+        setNote(`${done ? done + "；" : ""}有会话正在出活，先等它空闲再点「重载内核」`);
+        return;
+      }
+      await reloadInstance(dir);
+      setStale(false);
+      await new Promise((r) => setTimeout(r, 600));
+      onChanged();
+    } catch (e) {
+      setStale(true);
+      setNote(`${done ? done + "；" : ""}内核重载失败：${String(e)}`);
+    }
+  }
+
+  async function call(cmd: string, args: Record<string, string>) {
+    setWorking(true);
+    setNote(null);
+    let done = "";
+    let ok = false;
+    try {
+      const r = await invoke<SkillReport>(cmd, args);
+      setNote(r.message);
+      done = r.message;
+      ok = true;
+    } catch (e) {
+      setNote(String(e));
+    }
+    await reload();
+    setWorking(false);
+    if (ok) await syncKernel(false, done);
+  }
+
+  const rows: { skill: ManagedSkill; scope: "project" | "user" }[] = [
+    ...(view?.project ?? []).map((skill) => ({ skill, scope: "project" as const })),
+    ...(view?.user ?? []).map((skill) => ({ skill, scope: "user" as const })),
+  ];
+
+  return (
+    <>
+      <h3>从 GitHub 装技能</h3>
+      <div className="row">
+        <input
+          value={src}
+          onChange={(e) => setSrc(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && src.trim() && !working) {
+              void call("skill_install_github", { source: src.trim() });
+            }
+          }}
+          placeholder="owner/repo、owner/repo/skills/名称@tag，也可以直接粘仓库链接"
+          spellCheck={false}
+        />
+        <button
+          className="primary"
+          disabled={working || !src.trim()}
+          onClick={() => void call("skill_install_github", { source: src.trim() })}
+        >
+          {working ? "处理中…" : "安装"}
+        </button>
+        {stale && (
+          <button onClick={() => void syncKernel(false)} disabled={working}>
+            重载内核
+          </button>
+        )}
+      </div>
+      {note && <p className="hint">{note}</p>}
+      {rows.length > 0 && (
+        <ul className="cap managed">
+          {rows.map(({ skill, scope: s }) => (
+            <li key={`${s}:${skill.name}`}>
+              <b>{skill.name}</b>
+              <span title={skill.source}>
+                {s === "project" ? "当前工作区 · " : ""}
+                {skill.source}
+              </span>
+              <button
+                className="ico-btn"
+                disabled={working}
+                title="按安装时记录的来源重新拉一次"
+                aria-label={`更新 ${skill.name}`}
+                onClick={() => void call("skill_update_github", { name: skill.name, scope: s })}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M13 8a5 5 0 1 1-1.5-3.6M13 2.6V6h-3.4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.3"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              <button
+                className="ico-btn"
+                disabled={working}
+                title="卸载：只删这份清单里记着的那一个目录"
+                aria-label={`卸载 ${skill.name}`}
+                onClick={() => void call("skill_uninstall", { name: skill.name, scope: s })}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M3.4 4.8h9.2M6.3 4.8V3.3h3.4v1.5M4.9 4.8l.5 7.9h5.2l.5-7.9M6.7 6.9v3.7M9.3 6.9v3.7"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.3"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+/** 内核配置里第三方模型的窗口缺省值：/models 大多不返回，先给个能跑的先填上，用户可改 */
+const DEFAULT_CONTEXT = 128000;
+
+type ModelRow = { id: string; name: string; context: string; output: string; reasoning: boolean };
+
+type ModelForm = {
+  preset: string;
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  models: ModelRow[];
+};
+
+/** 常见的 OpenAI 兼容端点，只带地址，模型一律靠拉取或手填，不替用户猜模型 ID */
+const PRESETS: { id: string; label: string; baseUrl: string }[] = [
+  { id: "custom", label: "自定义", baseUrl: "" },
+  { id: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1" },
+  { id: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1" },
+  { id: "zhipu", label: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4" },
+  { id: "moonshot", label: "Moonshot Kimi", baseUrl: "https://api.moonshot.cn/v1" },
+  { id: "dashscope", label: "阿里云百炼", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1" },
+  { id: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1" },
+];
+
+const blankRow = (): ModelRow => ({ id: "", name: "", context: "", output: "", reasoning: false });
+
+const blankForm = (): ModelForm => ({
+  preset: "custom",
+  id: "",
+  name: "",
+  baseUrl: "",
+  apiKey: "",
+  models: [blankRow()],
+});
+
+/** 编辑已有提供商：密钥不回传，留空即沿用配置里的原值 */
+function formOf(p: CustomProvider): ModelForm {
+  return {
+    preset: PRESETS.find((x) => x.baseUrl === p.baseUrl)?.id ?? "custom",
+    id: p.id,
+    name: p.name === p.id ? "" : p.name,
+    baseUrl: p.baseUrl,
+    apiKey: "",
+    models: p.models.map((m) => ({
+      id: m.id,
+      name: m.name === m.id ? "" : m.name,
+      context: m.context ? String(m.context) : "",
+      output: m.output ? String(m.output) : "",
+      reasoning: m.reasoning,
+    })),
+  };
+}
+
+/**
+ * 模型页：上半是内核此刻真正可用的模型，下半是接第三方提供商。
+ * 写的是内核自己的全局配置文件，改完必须重启 serve 才会进 /provider。
+ */
+function ModelSettings({
+  dir,
+  healthy,
+  port,
+  onRestart,
+}: {
+  dir: string | null;
+  healthy: boolean;
+  port: number | null;
+  onRestart: () => Promise<void>;
+}) {
+  const [custom, setCustom] = useState<CustomProvider[] | null>(null);
+  const [live, setLive] = useState<ReturnType<typeof normalizeProviders>>({ models: [], default: null });
+  const [form, setForm] = useState<ModelForm | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
+  const [working, setWorking] = useState(false);
+
+  const reload = useCallback(
+    () =>
+      customProviders
+        .list()
+        .then(setCustom)
+        .catch((e) => {
+          setCustom([]);
+          setErr(String(e));
+        }),
+    [],
+  );
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  useEffect(() => {
+    if (!healthy || !dir) {
+      setLive({ models: [], default: null });
+      return;
+    }
+    api<any>("GET", "/provider", undefined, dir)
+      .then((r) => setLive(normalizeProviders(r)))
+      .catch(() => setLive({ models: [], default: null }));
+  }, [healthy, dir, port]);
+
+  function applyPreset(id: string) {
+    const p = PRESETS.find((x) => x.id === id);
+    if (!p) return;
+    setForm((f) => (f ? { ...f, preset: id, baseUrl: f.baseUrl || p.baseUrl } : f));
+  }
+
+  function setRow(i: number, patch: Partial<ModelRow>) {
+    setForm((f) =>
+      f ? { ...f, models: f.models.map((r, j) => (j === i ? { ...r, ...patch } : r)) } : f,
+    );
+  }
+
+  async function submit() {
+    if (!form) return;
+    setErr(null);
+    setNote(null);
+    const draft = {
+      id: form.id.trim(),
+      name: form.name.trim() || undefined,
+      baseUrl: form.baseUrl.trim(),
+      apiKey: form.apiKey.trim() || undefined,
+      models: form.models
+        .filter((m) => m.id.trim())
+        .map((m) => ({
+          id: m.id.trim(),
+          name: m.name.trim() || undefined,
+          context: Number(m.context) || 0,
+          output: Number(m.output) || 0,
+          reasoning: m.reasoning,
+        })),
+    };
+    setWorking(true);
+    try {
+      setCustom(await customProviders.save(draft));
+      setForm(null);
+      setStale(true);
+      setNote(healthy ? "已写入内核配置，重启内核后才会进模型下拉框" : "已写入内核配置，下次启动内核生效");
+    } catch (e) {
+      setErr(String(e));
+    }
+    setWorking(false);
+  }
+
+  async function drop(id: string) {
+    setErr(null);
+    setWorking(true);
+    try {
+      setCustom(await customProviders.remove(id));
+      setStale(true);
+      setNote(`已移除「${id}」，重启内核后模型下拉框里就不再出现`);
+      if (form?.id === id) setForm(null);
+    } catch (e) {
+      setErr(String(e));
+    }
+    setWorking(false);
+  }
+
+  /** 用提供商自己的 /models 列一把，省得手抄 ID */
+  async function pull() {
+    if (!form) return;
+    setErr(null);
+    setNote(null);
+    if (!form.baseUrl.trim()) {
+      setErr("先填服务地址");
+      return;
+    }
+    setWorking(true);
+    try {
+      const ids = await customProviders.fetchModels(form.baseUrl.trim(), form.apiKey.trim());
+      if (!ids.length) {
+        setErr("对方没有返回模型，改成手动填");
+      } else {
+        setForm((f) =>
+          f
+            ? {
+                ...f,
+                models: ids.map((m) => {
+                  const ctx = m.context ?? DEFAULT_CONTEXT;
+                  return {
+                    id: m.id,
+                    name: "",
+                    context: String(ctx),
+                    output: String(Math.min(8192, Math.floor(ctx / 4))),
+                    reasoning: false,
+                  };
+                }),
+              }
+            : f,
+        );
+        setNote(`拉到 ${ids.length} 个模型，窗口大小按 ${DEFAULT_CONTEXT} 兜底，按实际改一下`);
+      }
+    } catch (e) {
+      // 已存的密钥内核是加密放的，这一趟没法替你解密，只能让用户重填
+      setErr(`拉取失败：${e}${form.apiKey.trim() ? "" : "（编辑已有提供商时要重填一次 API Key）"}`);
+    }
+    setWorking(false);
+  }
+
+  const keyOf = (m: { providerID: string; modelID: string }) => `${m.providerID}/${m.modelID}`;
+  /** 与界面选模型同一套兜底：记住的那条 → 内核默认 → 列表第一条 */
+  const current = keyOf(
+    live.models.find((m) => keyOf(m) === localStorage.getItem(MODEL_KEY)) ??
+      live.default ??
+      live.models[0] ?? { providerID: "", modelID: "" },
+  );
+
+  return (
+    <>
+      <h3>当前可用模型</h3>
+      {!healthy ? (
+        <p className="hint">内核未运行，读不到实际列表。</p>
+      ) : !live.models.length ? (
+        <p className="hint">内核没有返回模型。</p>
+      ) : (
+        <ul className="cap models">
+          {(() => {
+            const rowOf = (m: (typeof live.models)[number]) => {
+              const key = keyOf(m);
+              return (
+                <li key={key} className={key === current ? "on" : ""}>
+                  <b>{m.name}</b>
+                  <span>
+                    {m.context ? `${Math.round(m.context / 1024)}K` : ""}
+                    {m.image ? " · 可看图" : ""}
+                  </span>
+                  {key === current && <em className="tag">当前</em>}
+                </li>
+              );
+            };
+            const out: ReturnType<typeof rowOf>[] = [];
+            live.models.filter((m) => !m.custom).forEach((m) => out.push(rowOf(m)));
+            const custom = live.models.filter((m) => m.custom);
+            const ids: string[] = [];
+            for (const m of custom) if (!ids.includes(m.providerID)) ids.push(m.providerID);
+            const groups = ids.map((id) => custom.filter((m) => m.providerID === id));
+            groups.forEach((list, pi) => {
+              if (pi === 0) out.push(<li className="grp" key="grp-custom">自定义</li>);
+              out.push(<li className="grp sub" key={`grp-${list[0].providerID}`}>{list[0].providerName}</li>);
+              list.forEach((m) => out.push(rowOf(m)));
+            });
+            return out;
+          })()}
+        </ul>
+      )}
+
+      <h3>接入第三方模型</h3>
+      {custom && custom.length > 0 && (
+        <ul className="cap managed">
+          {custom.map((p) => (
+            <li key={p.id}>
+              <b>{p.name}</b>
+              <span title={p.baseUrl}>
+                {p.id} · {p.models.length} 个模型 ·{" "}
+                {p.keyMask ?? "未填密钥"} · {p.baseUrl}
+              </span>
+              <button
+                className="ico-btn"
+                disabled={working}
+                title="编辑"
+                aria-label={`编辑 ${p.id}`}
+                onClick={() => {
+                  setErr(null);
+                  setForm(formOf(p));
+                }}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M11.2 2.6l2.2 2.2L5.6 12.6 2.8 13.2l.6-2.8z"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.3"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              <button
+                className="ico-btn"
+                disabled={working}
+                title="移除：会从配置文件里删掉这一项，密钥也一起没了"
+                aria-label={`移除 ${p.id}`}
+                onClick={() => void drop(p.id)}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M3.4 4.8h9.2M6.3 4.8V3.3h3.4v1.5M4.9 4.8l.5 7.9h5.2l.5-7.9M6.7 6.9v3.7M9.3 6.9v3.7"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.3"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {!form && (
+        <div className="row">
+          <button
+            onClick={() => {
+              setErr(null);
+              setForm(blankForm());
+            }}
+          >
+            添加提供商
+          </button>
+        </div>
+      )}
+
+      {form && (
+        <div className="mform">
+          <div className="row">
+            <ChipSelect
+              value={form.preset}
+              options={PRESETS.map((p) => ({ value: p.id, label: p.label }))}
+              placeholder="预设"
+              title="常见服务商的地址"
+              onChange={applyPreset}
+            />
+            <input
+              value={form.id}
+              onChange={(e) => setForm({ ...form, id: e.target.value })}
+              placeholder="标识，如 openai"
+              spellCheck={false}
+            />
+            <input
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              placeholder="显示名，如 OpenAI"
+              spellCheck={false}
+            />
+          </div>
+          <div className="row">
+            <input
+              value={form.baseUrl}
+              onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
+              placeholder="服务地址，如 https://api.openai.com/v1"
+              spellCheck={false}
+            />
+            <button onClick={pull} disabled={working}>
+              {working ? "处理中…" : "拉取模型"}
+            </button>
+          </div>
+          <div className="row">
+            <input
+              type="password"
+              value={form.apiKey}
+              onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
+              placeholder="API Key（编辑时留空表示不改）"
+              spellCheck={false}
+              autoComplete="off"
+            />
+          </div>
+          <div className="mhead">
+            <span>模型 ID</span>
+            <span>显示名</span>
+            <span title="上下文窗口 token 数">上下文</span>
+            <span title="最大输出 token 数">最大输出</span>
+            <span title="是否支持思考模式">思考</span>
+            <span />
+          </div>
+          {form.models.map((row, i) => (
+            <div className="mrow" key={i}>
+              <input
+                value={row.id}
+                onChange={(e) => setRow(i, { id: e.target.value })}
+                placeholder="gpt-4o-mini"
+                spellCheck={false}
+              />
+              <input
+                value={row.name}
+                onChange={(e) => setRow(i, { name: e.target.value })}
+                placeholder="可选"
+                spellCheck={false}
+              />
+              <input
+                value={row.context}
+                onChange={(e) => setRow(i, { context: e.target.value })}
+                placeholder="128000"
+                inputMode="numeric"
+              />
+              <input
+                value={row.output}
+                onChange={(e) => setRow(i, { output: e.target.value })}
+                placeholder="8192"
+                inputMode="numeric"
+              />
+              <input
+                className="chk"
+                type="checkbox"
+                checked={row.reasoning}
+                onChange={(e) => setRow(i, { reasoning: e.target.checked })}
+              />
+              <button
+                className="ico-btn"
+                disabled={form.models.length === 1}
+                title="删掉这一行"
+                aria-label="删掉这一行"
+                onClick={() => setForm({ ...form, models: form.models.filter((_, j) => j !== i) })}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.4"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </button>
+            </div>
+          ))}
+          <div className="row">
+            <button onClick={() => setForm({ ...form, models: [...form.models, blankRow()] })}>
+              加一个模型
+            </button>
+            <button className="primary" onClick={submit} disabled={working}>
+              保存
+            </button>
+            <button
+              onClick={() => {
+                setForm(null);
+                setErr(null);
+              }}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+
+      {stale && (
+        <div className="row">
+          <button
+            onClick={() =>
+              void onRestart().then(() => {
+                setStale(false);
+                setNote(null);
+              })
+            }
+          >
+            重启内核
+          </button>
+        </div>
+      )}
+      {note && <p className="hint">{note}</p>}
+      {err && <pre className="error inline">{err}</pre>}
+    </>
+  );
+}
+
 const TABS: { id: Tab; label: string }[] = [
   { id: "kernel", label: "内核" },
+  { id: "model", label: "模型" },
   { id: "cred", label: "华为云凭据" },
   { id: "caps", label: "技能与 MCP" },
   { id: "about", label: "关于" },
@@ -716,6 +1368,22 @@ const REPO = "https://github.com/17472439chaochao-lab/codearts";
 
 /** 码道产品官网，内核与凭据都归它，这里只做个入口 */
 const OFFICIAL = "https://codearts.huaweicloud.com/";
+
+/** 版本按 lock 的解析结果写死，升级依赖时一起改 */
+const STACK: [string, string][] = [
+  ["Tauri", "2.12.4"],
+  ["React", "19.3.1"],
+  ["Vite", "8.3.4"],
+  ["TypeScript", "6.0.3"],
+  ["tokio", "1.53.3"],
+  ["reqwest", "0.12.28"],
+  ["serde", "1.0.229"],
+  ["serde_json", "1.0.154"],
+  ["thiserror", "2.0.21"],
+  ["base64", "0.22.1"],
+  ["rand", "0.8.8"],
+  ["futures-util", "0.3.34"],
+];
 
 function Url({ text, label }: { text: string; label: string }) {
   return (
@@ -760,38 +1428,13 @@ function About({ check, status }: { check: EnvCheck | null; status: KernelStatus
         不逆向私有协议，也不另接一套模型服务。
       </p>
 
-      <h3>数据与边界</h3>
-      <p className="hint">
-        凭据只写本机（0600 文件，与 CLI 存 cli.env 的做法一致），SK 不进前端；serve 固定监听
-        127.0.0.1，会话与消息落在内核自己的 cli-data 里，不经过任何第三方。
-        这不是官方客户端：不做自动更新，也不复刻官网的建应用 / 一键发布 / 连接器市场，
-        技能与 MCP 目前只读展示，写入仍在 CLI 侧配置。
-      </p>
-
       <h3>技术栈</h3>
       <ul className="stack">
-        <li>
-          <code>Tauri</code> —— 桌面壳：Rust 监管内核进程，WebView 只跑界面
-        </li>
-        <li>
-          <code>React</code> —— 聊天、侧栏与设置面板
-        </li>
-        <li>
-          <code>Vite</code> —— 前端开发与打包
-        </li>
-        <li>
-          <code>TypeScript</code> —— 前端类型
-        </li>
-        <li>
-          <code>tokio</code> —— 异步运行时：进程起停、日志与 SSE 转发
-        </li>
-        <li>
-          <code>reqwest</code> —— 内核 HTTP 客户端（只连 127.0.0.1）
-        </li>
-        <li>
-          <code>serde</code> / <code>serde_json</code>、<code>thiserror</code>、
-          <code>base64</code>、<code>rand</code>、<code>futures-util</code>
-        </li>
+        {STACK.map(([name, version]) => (
+          <li key={name}>
+            <code>{name}</code> {version}
+          </li>
+        ))}
       </ul>
     </>
   );
@@ -807,6 +1450,6 @@ type Caps = {
 /** credentials_status 的返回：只有有无与 AK 尾号，SK 明文不出 Rust */
 type CredStatus = { saved: boolean; inCliEnv: boolean; akMask: string | null };
 
-/** 设置面板左侧菜单的四页 */
-type Tab = "kernel" | "cred" | "caps" | "about";
+/** 设置面板左侧菜单的五页 */
+type Tab = "kernel" | "model" | "cred" | "caps" | "about";
 

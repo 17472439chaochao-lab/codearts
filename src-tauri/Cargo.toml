@@ -26,9 +26,13 @@ base64 = "0.22"
 rand = "0.8"
 futures-util = "0.3"
 tokio = { version = "1", features = ["process", "time", "io-util", "sync", "macros"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset"] }
+# native-tls 只用系统 Security.framework：给 GitHub tarball 下载用，内核侧仍走 127.0.0.1 明文
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "native-tls"] }
 # $HOME 可能被 FlyEnv 等改掉；getpwuid 才是进程所属用户的真实家目录
 libc = "0.2"
+# 技能安装：解压 GitHub tarball 后按目录落盘，全程不调用外部 tar
+flate2 = "1"
+tar = "0.4"
 
 # 本地 Vision OCR：截图没有视觉模型时，用 macOS 自带框架把文字读出来
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -104,10 +104,14 @@ export type ModelInfo = {
   providerID: string;
   modelID: string;
   name: string;
+  /** 下拉框第二行用的提供商显示名 */
+  providerName: string;
   context?: number;
   reasoning?: boolean;
   /** 模型能不能直接看图；不能时壳用本机 OCR 兜底 */
   image?: boolean;
+  /** 是不是接进来的第三方提供商；内核自带的那两家不算 */
+  custom: boolean;
 };
 
 export type EnvCheck = {
@@ -128,9 +132,11 @@ export function normalizeProviders(root: any): { models: ModelInfo[]; default: M
         providerID: p.id,
         modelID: m.id,
         name: m.name || m.id,
+        providerName: providerLabel(p.id, p.name),
         context: m.limit?.context,
         reasoning: m.capabilities?.reasoning,
         image: m.capabilities?.input?.image === true,
+        custom: isCustomProvider(p.id),
       });
     }
   }
@@ -140,6 +146,59 @@ export function normalizeProviders(root: any): { models: ModelInfo[]; default: M
     default: entry ? { providerID: entry[0], modelID: entry[1] as string } : null,
   };
 }
+
+/** 内核自带的提供商；它们的显示名是英文 id，界面里换个说法 */
+const PROVIDER_NAMES: Record<string, string> = {
+  "huaweicloud-maas": "华为云 MaaS",
+  "benefit-model": "码道权益",
+};
+
+export function providerLabel(id: string, name?: string) {
+  return PROVIDER_NAMES[id] ?? name ?? id;
+}
+
+/** 除内核自带那两家，其余提供商都是设置页接进来的第三方 */
+export function isCustomProvider(id: string) {
+  return !(id in PROVIDER_NAMES);
+}
+
+export type CustomModel = {
+  id: string;
+  name: string;
+  context: number;
+  output: number;
+  reasoning: boolean;
+};
+
+/** 写进内核全局配置的第三方提供商；keyMask 是 Rust 脱敏后的形态，真实密钥不来这趟 */
+export type CustomProvider = {
+  id: string;
+  name: string;
+  npm: string;
+  baseUrl: string;
+  keyMask: string | null;
+  models: CustomModel[];
+};
+
+export type PulledModel = { id: string; context: number | null };
+
+export type CustomProviderDraft = {
+  id: string;
+  name?: string;
+  npm?: string;
+  baseUrl: string;
+  /** 留空 = 沿用配置里已有的密钥 */
+  apiKey?: string;
+  models: { id: string; name?: string; context: number; output: number; reasoning?: boolean }[];
+};
+
+export const customProviders = {
+  list: () => invoke<CustomProvider[]>("providers_list"),
+  save: (draft: CustomProviderDraft) => invoke<CustomProvider[]>("providers_save", { draft }),
+  remove: (id: string) => invoke<CustomProvider[]>("providers_remove", { id }),
+  fetchModels: (baseUrl: string, apiKey: string) =>
+    invoke<PulledModel[]>("providers_fetch_models", { baseUrl, apiKey }),
+};
 
 /** 真凭据实测：permission.asked 的 properties 就是这个形状 */
 export type PermissionRequest = {
@@ -298,6 +357,23 @@ export const skills = {
   system: (dir?: string | null) =>
     api<{ count: number; skills: V1Skill[] }>("GET", "/v1/skills", undefined, dir),
 };
+
+/**
+ * 让内核重载当前目录的实例，重新扫一遍技能目录。
+ * 实测 26.9.26：serve 运行中新建 `<root>/skills/<name>/SKILL.md`，等 60s 也不会自己进 `/skill`，
+ * 只有这个接口能立刻同步（新增和删除都一样）。directory 走查询参数，`x-opencode-directory` 头它不认。
+ * `GET /v1/skills?reload=true` 只刷 `/v1/skills` 自己那份目录，`/skill` 照旧看不到，替代不了实例重载。
+ * 注意：重载会把实例状态清掉，跑到一半的会话消息可能丢，所以只能在空闲时用。
+ */
+export function reloadInstance(dir: string) {
+  return api<unknown>("POST", `/cag/instance/reload?directory=${encodeURIComponent(dir)}`, undefined, dir);
+}
+
+/** 有非 idle 会话就说明正在出活，别去重载实例 */
+export async function kernelBusy(dir?: string | null) {
+  const st = await sessions.status(dir);
+  return Object.keys(st).length > 0;
+}
 
 /** GET /mcp 当前是空对象；有注册时键是 server 名，值是状态。先按宽松类型接 */
 export const mcp = {

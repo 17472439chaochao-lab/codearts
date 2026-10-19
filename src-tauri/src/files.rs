@@ -15,6 +15,8 @@ const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const BINARY_PROBE: usize = 8192;
 /// VCS 元数据和系统垃圾文件不进树；其余一律照常展示
 const SKIP_NAMES: &[&str] = &[".git", ".DS_Store"];
+/// 「计划」页签一次最多列这么多份，防止某个大目录里的 plans 把列表刷爆
+const MAX_PLANS: usize = 200;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,7 +53,8 @@ pub struct PlanEntry {
     name: String,
     path: String,
     /// workspace = 工作区内的 .codeartsdoer/plans（兼容 .opencode/plans）；
-    /// kernel = 内核数据目录或家目录下的 plans
+    /// kernel = 内核数据目录或家目录下的 plans；
+    /// project = 工作区里技能自己建的 plans 目录（如 docs/superpowers/plans）
     source: String,
     size: u64,
     mtime: u64,
@@ -83,8 +86,9 @@ pub fn plan_read(app: tauri::AppHandle, path: String) -> Result<FileContent> {
     read_plan(&roots, &path)
 }
 
-/// 内核实际把计划写在 `<工作区>/.codeartsdoer/plans/<功能名>/plan.md`（实测模板），
-/// `.opencode/plans` 只作为旧版兼容；非 Git 工作区再把数据目录的 `plans` 兜上。
+/// 内核规划模式的落盘路径（`Session.plan()`）：有 git 时 `<worktree>/.opencode/plans/<创建时间>-<slug>.md`，
+/// 没有 git 时 `<内核数据目录>/plans/…`。`.codeartsdoer/plans` 是 team-planner 子代理的模板路径，一并兜上；
+/// 工作区里技能自建的 plans 目录再按目录名收进来。
 /// 符号链接解析后必须仍落在仓库或数据目录内，否则丢掉这个根。
 fn plan_roots(settings: &Settings) -> Vec<PlanRoot> {
     let mut roots = Vec::new();
@@ -101,6 +105,10 @@ fn plan_roots(settings: &Settings) -> Vec<PlanRoot> {
                 roots.push(("workspace", root));
             }
         }
+        // 技能（如 writing-plans）把计划写在工作区自己的 plans 目录，内核不知道这些路径
+        let mut dirs = Vec::new();
+        project_plan_dirs(&project, &project, 0, &mut dirs);
+        roots.extend(dirs.into_iter().map(|dir| ("project", dir)));
     }
     // `{{.codeartsdoer}}` 也可能落到用户目录；CLI 在非仓库目录会用它
     let home = settings.kernel_home();
@@ -114,6 +122,33 @@ fn plan_roots(settings: &Settings) -> Vec<PlanRoot> {
         roots.push(("kernel", root));
     }
     roots
+}
+
+/// 工作区里名叫 `plans` 的目录（技能写的计划）。不跟符号链接，只在工程根内找。
+fn project_plan_dirs(jail: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    const MAX_DEPTH: usize = 4;
+    const MAX_DIRS: usize = 20;
+    if depth > MAX_DEPTH || out.len() >= MAX_DIRS {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        if name == "plans" {
+            if let Some(root) = contained_plan_root(&entry.path(), jail) {
+                out.push(root);
+            }
+            continue;
+        }
+        if name.starts_with('.') || name == "node_modules" {
+            continue;
+        }
+        project_plan_dirs(jail, &entry.path(), depth + 1, out);
+    }
 }
 
 /// 目录还不存在时，只要已存在的祖先没有链出 jail，就保留逻辑路径。
@@ -151,6 +186,7 @@ fn collect_plans(roots: &[PlanRoot]) -> Vec<PlanEntry> {
         walk_plans(&root, &root, 0, source, &mut plans, &mut seen);
     }
     plans.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.name.cmp(&b.name)));
+    plans.truncate(MAX_PLANS);
     plans
 }
 
@@ -441,6 +477,36 @@ mod tests {
         std::fs::write(&outside, "no").unwrap();
         assert!(read_plan(&roots, &outside.display().to_string()).is_err());
         assert!(read_plan(&roots, &plans.join("notes.txt").display().to_string()).is_err());
+    }
+
+    #[test]
+    fn picks_up_skill_plan_dirs_inside_the_workspace() {
+        let root = TempRoot::new();
+        let project = root.0.join("proj");
+        std::fs::create_dir_all(project.join("docs/superpowers/plans")).unwrap();
+        std::fs::write(
+            project.join("docs/superpowers/plans/2026-10-19-role-mutex.md"),
+            "# 互斥\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.join("node_modules/pkg/plans")).unwrap();
+        std::fs::write(project.join("node_modules/pkg/plans/dep.md"), "# no\n").unwrap();
+
+        let mut settings = Settings::default();
+        settings.project_dir = Some(project.display().to_string());
+        settings.kernel_home = Some(root.0.display().to_string());
+
+        let roots = plan_roots(&settings);
+        let listed = collect_plans(&roots);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, "project");
+        assert_eq!(
+            read_plan(&roots, &listed[0].path)
+                .unwrap()
+                .content
+                .as_deref(),
+            Some("# 互斥\n")
+        );
     }
 
     #[cfg(unix)]
