@@ -16,6 +16,9 @@ pub struct Settings {
     pub project_dir: Option<String>,
     /// 工作区列表，最近使用的排最前；`project_dir` 一定是其中的某一项
     pub projects: Option<Vec<String>>,
+    /// 有会话在跑时阻止电脑休眠。Option 是故意的：界面多处 `settings_save` 只带自己要改的字段，
+    /// 缺省必须解释成"这次没说"，否则切个工作区就把用户开的断言关掉了。
+    pub keep_awake: Option<bool>,
 }
 
 impl Settings {

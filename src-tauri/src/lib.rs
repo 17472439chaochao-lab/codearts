@@ -7,10 +7,12 @@ mod providers;
 mod secrets;
 mod settings;
 mod skills;
+mod sleep;
 mod trust;
 
 use error::Error;
 use kernel::{Kernel, Status};
+use sleep::WakeLock;
 use std::sync::Arc;
 use serde::Serialize;
 use serde_json::Value;
@@ -25,7 +27,13 @@ fn settings_save(app: tauri::AppHandle, mut next: Settings) -> Result<Settings, 
     next.kernel_bin = current.kernel_bin;
     next.project_dir = next.project_dir.or(current.project_dir);
     next.projects = next.projects.or(current.projects);
+    next.keep_awake = next.keep_awake.or(current.keep_awake);
     next.save(&app)?;
+    // 切区不再重启内核，serve 的 cwd 白名单这一趟没人写；下次冷启动要能直接认这个目录，
+    // 所以在这里补登记。trust_folder 只增不删，重复调用无副作用。
+    if let Ok(project) = next.project_dir() {
+        trust::trust_folder(&next.kernel_data_dir(), &project)?;
+    }
     Ok(next)
 }
 
@@ -56,6 +64,7 @@ struct EnvCheck {
     project_dir: Option<String>,
     projects: Vec<String>,
     kernel_home: String,
+    keep_awake: bool,
 }
 
 #[tauri::command]
@@ -86,7 +95,19 @@ fn env_check(app: tauri::AppHandle) -> Result<EnvCheck, Error> {
         project_dir,
         projects,
         kernel_home: home.display().to_string(),
+        keep_awake: settings.keep_awake.unwrap_or(false),
     })
+}
+
+/// 会话跑动期间握着、空闲即松，所以调用点在 Chat 的 busy 集合上。
+/// 关掉设置时前端会带 hold=false 来松手，这里不重复读配置。
+#[tauri::command]
+fn no_sleep_set(wake: State<'_, WakeLock>, hold: bool) -> Result<bool, Error> {
+    if hold {
+        wake.hold()
+    } else {
+        Ok(wake.release())
+    }
 }
 
 /// 凭据只回传"有没有 + AK 尾号"，SK 一个真实字符都不出 Rust 侧
@@ -194,9 +215,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(Kernel::new()))
+        .manage(WakeLock::default())
         .invoke_handler(tauri::generate_handler![
             settings_save,
             env_check,
+            no_sleep_set,
             credentials_save,
             credentials_status,
             providers_list,
@@ -231,6 +254,8 @@ pub fn run() {
         .expect("构建应用失败")
         .run(|app_handle, event| {
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                // 电源断言是同步子进程，先松手再走异步收尾，别留孤儿 caffeinate
+                app_handle.state::<WakeLock>().release();
                 // 退出前 dispose + 杀进程，不留孤儿内核
                 let (tx, rx) = std::sync::mpsc::channel();
                 let handle = app_handle.clone();

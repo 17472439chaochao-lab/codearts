@@ -47,6 +47,7 @@ type Props = {
   projects: string[];
   status: KernelStatus | null;
   busy: boolean;
+  keepAwake: boolean;
   onStart: () => Promise<void>;
   onStop: () => Promise<void>;
   onAddDir: () => void;
@@ -244,6 +245,7 @@ export default function Chat({
   projects,
   status,
   busy: kernelBusy,
+  keepAwake,
   onStart,
   onStop,
   onAddDir,
@@ -264,11 +266,9 @@ export default function Chat({
   /** 异步回填对比用：listener / fetch 完成时 active 可能已变 */
   const activeRef = useRef<string | null>(null);
   activeRef.current = active;
-  /** SSE 只订一次，切会话走 ref，避免双订户叠 delta */
+  /** 界面当前工作区；监听器与 resync 都是常驻闭包，取值走 ref */
   const dirRef = useRef(dir);
   dirRef.current = dir;
-  /** 跨工作区点会话：先换目录重启内核，回到工作区后再打开这一条 */
-  const pending = useRef<string | null>(null);
   const [msgs, setMsgs] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   /** 输入区待发送的截图；只保存在内存里，发送或移除即丢弃 */
@@ -280,6 +280,25 @@ export default function Chat({
    * 单布尔会卡在"处理中"，点停止还会 abort 到 B 头上。
    */
   const [busySet, setBusySet] = useState<Set<string>>(new Set());
+  /**
+   * 阻止休眠：设置开着、且确实有会话在跑才握断言，全空闲立刻松。
+   * 只在翻转时发一次 invoke，免得每个 busy 事件都去动子进程。
+   */
+  const wakeHeld = useRef(false);
+  useEffect(() => {
+    const want = keepAwake && busySet.size > 0;
+    if (want === wakeHeld.current) return;
+    wakeHeld.current = want;
+    invoke("no_sleep_set", { hold: want }).catch(() => {});
+  }, [keepAwake, busySet]);
+  useEffect(
+    () => () => {
+      if (!wakeHeld.current) return;
+      wakeHeld.current = false;
+      invoke("no_sleep_set", { hold: false }).catch(() => {});
+    },
+    [],
+  );
   /** 内核自动重试（限流/网络）时的详情；只在它所属的会话上显示 */
   const [retry, setRetry] = useState<{ sid: string; attempt: number; message: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -294,6 +313,11 @@ export default function Chat({
   /** 删除会话的二次确认：先按 × 或菜单进入待确认，再点「删」才真的删 */
   const [delAsk, setDelAsk] = useState<string | null>(null);
   const delTimer = useRef<number | null>(null);
+  /**
+   * 公开发布前的确认弹窗（存待发布的会话 id）。
+   * 这条路由会把整段对话上传到公网，只点一次菜单不该发生，所以强制走弹窗。
+   */
+  const [shareAsk, setShareAsk] = useState<string | null>(null);
   const [perms, setPerms] = useState<PermissionRequest[]>([]);
   /** 内核的 question 工具在等人选项：不接住就只能看着一张 JSON 卡片卡在"执行中" */
   const [asks, setAsks] = useState<QuestionRequest[]>([]);
@@ -413,7 +437,7 @@ export default function Chat({
         });
       })
       // 假凭据/排队时 /provider 会 500，静默失败只会留下一个空的模型下拉框；
-      // 但切工作区会重启内核，旧端口的连接失败是瞬时的——等端口稳定再说
+      // 但内核刚拉起那几秒的连接失败是瞬时的，缓一下再报，免得切个区闪一条红字
       .catch((e) => {
         rejectTimer = window.setTimeout(() => {
           if (alive) setErr(`模型列表获取失败：${e}`);
@@ -444,17 +468,37 @@ export default function Chat({
   }, [live, dir]);
 
   /**
+   * 会话属于哪个工作区，一律以内核的 session.directory 为准。
+   * 切区不再重启内核，后台会话随时可能属于别的区；写路径拿错目录时内核不报错，
+   * reply 之类会对着空队列静默成功（契约文档 §11），所以每处都要显式带上归属区。
+   */
+  const dirOf = useCallback(
+    (sid?: string | null): string => {
+      if (!sid) return dir;
+      const s = list.find((x) => x.id === sid) ?? kids.find((x) => x.id === sid);
+      if (s?.directory) return s.directory;
+      // 子会话的 payload 有时不带 directory，退回父会话的区
+      const parent = s?.parentID ? list.find((x) => x.id === s.parentID) : undefined;
+      return parent?.directory ?? dir;
+    },
+    [list, kids, dir],
+  );
+  const dirOfRef = useRef(dirOf);
+  dirOfRef.current = dirOf;
+  /**
    * 内核每条会话都带真实 directory 和 parentID，归属与子任务标记直接读它。
    * 注意 `GET /session` 也会列出 task 派出去的子会话，所以只读判定靠 parentID，
    * 不靠"是不是从子任务折叠里点进来的"。
    */
   const activeSess = list.find((s) => s.id === active) ?? null;
-  const wsOf = activeSess?.directory ?? null;
+  /** 当前会话归属的区；没打开会话时为 null，读写都退回界面当前区 */
+  const wsOf = active ? dirOf(active) : null;
   const wsOfRef = useRef(wsOf);
   wsOfRef.current = wsOf;
   // 子会话可能还没进 list（noteKid 先到），activeSess 找不到时也要按子会话处理
   const isChild = !!activeSess?.parentID || kids.some((k) => k.id === active);
-  const readOnly = !!active && (isChild || (!!wsOf && !sameDir(wsOf, dir)));
+  /** 跨工作区也能直接对话：只有子会话（只读展示）才禁编辑 */
+  const readOnly = !!active && isChild;
   const busy = !!active && busySet.has(active);
   const selectedModel = model
     ? models.find((m) => m.providerID === model.providerID && m.modelID === model.modelID)
@@ -539,7 +583,7 @@ export default function Chat({
 
   /**
    * agent 与斜杠命令都是工作区相关的：/agent 会带上这个项目 .codearts 里定义的
-   * 角色，/command 也是，所以切区必须重取。
+   * 角色，/command 也是。跨区对话时这一轮跑在会话自己那个实例里，所以取它的区。
    */
   useEffect(() => {
     if (!live) {
@@ -547,12 +591,13 @@ export default function Chat({
       setAgentList([]);
       return;
     }
+    const d = wsOf ?? dir;
     commands
-      .list(dir)
+      .list(d)
       .then(setCmds)
       .catch(() => setCmds([]));
     agents
-      .list(dir)
+      .list(d)
       .then((all) => {
         const visible = all.filter(
           (a) => a.mode === "primary" && !a.hidden && !INTERNAL_AGENTS.has(a.name),
@@ -567,7 +612,7 @@ export default function Chat({
         chooseAgent(chosen.name);
       })
       .catch(() => setAgentList([]));
-  }, [live, dir, chooseAgent]);
+  }, [live, dir, wsOf, chooseAgent]);
 
   /**
    * 换会话就重建子会话表。children 接口给的是历史，所以每条都要回灌一次消息；
@@ -662,10 +707,10 @@ export default function Chat({
     turnKeyRef.current = last ? { sid: last.info.sessionID, id: last.info.id } : null;
   }, [msgs]);
 
-  // 换工作区后旧会话不属于新目录；若有 pending 跨区目标，留给下面的 effect 打开
+  // 换工作区只是换界面在看哪个区：不属于新区的会话先收起，跨区点开的那条继续开着。
+  // 忙状态不能清——后台会话还在它自己的实例里出活。
   useEffect(() => {
-    if (!pending.current) setActive(null);
-    setBusySet(new Set());
+    setActive((cur) => (cur && sameDir(dirOfRef.current(cur), dir) ? cur : null));
     setRetry(null);
     setAlert(null);
     setDelAsk(null);
@@ -683,17 +728,6 @@ export default function Chat({
     setFileView(null);
   }, [active]);
 
-  /** 跨工作区点开：等 projectDir 落到目标会话目录、且列表到手后再选中 */
-  useEffect(() => {
-    const want = pending.current;
-    if (!want) return;
-    const s = list.find((x) => x.id === want);
-    if (!s) return;
-    if (s.directory && !sameDir(s.directory, dir)) return;
-    pending.current = null;
-    setActive(want);
-  }, [list, dir]);
-
   /** 这些待决项算不算"我这边的"：父会话自己的，或者它派出去的子会话的 */
   const mineSid = useCallback(
     (sid: string) => sid === active || kidIds.current.has(sid),
@@ -702,15 +736,17 @@ export default function Chat({
 
   /** 待决的授权与问题都是内核侧的队列，一律只留"我这边的"（父 + 子会话） */
   const reloadPending = useCallback(() => {
+    // 队列按目录分实例，当前会话在别的工作区时要去那个区取，对着本区取到的是空表
+    const d = wsOf ?? dir;
     permissions
-      .list(dir)
+      .list(d)
       .then((q) => setPerms(q.filter((p) => mineSid(p.sessionID))))
       .catch(() => setPerms([]));
     questions
-      .list(dir)
+      .list(d)
       .then((q) => setAsks(q.filter((x) => mineSid(x.sessionID))))
       .catch(() => setAsks([]));
-  }, [dir, mineSid]);
+  }, [dir, wsOf, mineSid]);
 
   /**
    * 两个队列一起重取：切会话、切目录、children 到货都要。子会话是切会话之后才异步取回来的，
@@ -731,20 +767,23 @@ export default function Chat({
     reloadPending();
     const sid = activeRef.current;
     const d = wsOfRef.current ?? dirRef.current;
-    sessions
-      .status(d)
-      .then((map) => {
+    // 运行态也按目录分实例，后台会话在别的区，逐个区取回来才能拼出完整的忙集合
+    const ws = projects.length ? projects : [dirRef.current];
+    Promise.all(ws.map((p) => sessions.status(p).catch(() => ({}))))
+      .then((maps) => {
         const next = new Set<string>();
         let retryInfo: { sid: string; attempt: number; message: string } | null = null;
-        for (const [id, st] of Object.entries(map ?? {})) {
-          const t = st?.type ?? "";
-          if (t && t !== "idle") next.add(id);
-          if (t === "retry") {
-            retryInfo = {
-              sid: id,
-              attempt: Number(st?.attempt ?? 1),
-              message: String(st?.message ?? "内核正在自动重试"),
-            };
+        for (const map of maps) {
+          for (const [id, st] of Object.entries(map ?? {})) {
+            const t = st?.type ?? "";
+            if (t && t !== "idle") next.add(id);
+            if (t === "retry") {
+              retryInfo = {
+                sid: id,
+                attempt: Number(st?.attempt ?? 1),
+                message: String(st?.message ?? "内核正在自动重试"),
+              };
+            }
           }
         }
         setBusySet(next);
@@ -793,7 +832,7 @@ export default function Chat({
         }
       })
       .catch(() => {});
-  }, [reloadList, reloadPending]);
+  }, [reloadList, reloadPending, wsKey]);
 
   const resyncRef = useRef(resync);
   resyncRef.current = resync;
@@ -1259,6 +1298,18 @@ export default function Chat({
     sending.current = true;
     setErr(null);
     setToast(null);
+    // `!` 开头先于模型链路：只跑一条命令把输出带进上下文，别把它当 prompt 发出去
+    if (!imgs.length && !readOnly && raw.startsWith("!")) {
+      const cmd = raw.slice(1).trim();
+      if (cmd) {
+        try {
+          await runShell(cmd);
+        } finally {
+          sending.current = false;
+        }
+        return;
+      }
+    }
     try {
       const vision = visionReady;
       // 模型不能看图时，等粘贴时启动的本机 OCR 落地；一个字都没读到就不发空图
@@ -1294,16 +1345,20 @@ export default function Chat({
       setDismissed(null);
       let id = active;
       const title = imageTitle(raw, imgs.length);
+      let target: string;
       if (!id) {
         const s = await sessions.create(title, dir);
         id = s.id;
+        target = s.directory ?? dir;
         setActive(id);
         reloadList();
+      } else {
+        target = dirOf(id);
       }
       // 先标 busy：prompt 返回前 SSE 可能已 idle，事后再 add 会卡在 Stop
       setBusySet((s) => new Set(s).add(id));
       try {
-        await sessions.prompt(id, parts, dir, model, agent);
+        await sessions.prompt(id, parts, target, model, agent);
         stick.current = true;
       } catch (e) {
         setBusySet((s) => {
@@ -1316,7 +1371,7 @@ export default function Chat({
       }
       // 当前标题还是默认值就补一条；已有好标题（含内核自动生成）的不动
       if (!activeSess || DEFAULT_TITLES.has(activeSess.title.trim())) {
-        scheduleTitleFallback(id, title, dir);
+        scheduleTitleFallback(id, title, target);
       }
     } catch (e) {
       setErr(String(e));
@@ -1335,7 +1390,7 @@ export default function Chat({
     // 先标 busy：prompt 返回前 SSE 可能已 idle，事后再 add 会卡在 Stop
     setBusySet((s) => new Set(s).add(id));
     try {
-      await sessions.prompt(id, retryParts, dir, model, agent);
+      await sessions.prompt(id, retryParts, dirOf(id), model, agent);
       stick.current = true;
     } catch (e) {
       setBusySet((s) => {
@@ -1382,7 +1437,7 @@ export default function Chat({
 
   async function removeSession(id: string) {
     try {
-      await sessions.remove(id, dir);
+      await sessions.remove(id, dirOf(id));
       if (id === active) setActive(null);
       reloadList();
     } catch (e) {
@@ -1403,10 +1458,156 @@ export default function Chat({
     void removeSession(id);
   }
 
+  /** 生命周期接口都返回整条会话，就地并回侧栏列表，不必重拉全部工作区 */
+  function mergeSession(s: Session) {
+    if (!s?.id) return;
+    setList((l) =>
+      l.some((x) => x.id === s.id) ? l.map((x) => (x.id === s.id ? { ...x, ...s } : x)) : [s, ...l],
+    );
+  }
+
+  /** 分叉 = 复制整段历史另开一条，之后的改动不回头影响原会话 */
+  async function forkSession(id: string) {
+    try {
+      const from = dirOf(id);
+      const s = await sessions.fork(id, from);
+      // 分叉出来的会话必然还在原实例里，内核没带 directory 就按原区补齐
+      mergeSession({ ...s, directory: s.directory ?? from });
+      mergeSession(s);
+      // 分叉完直接切到新那条：切会话会清空 toast，所以这里不弹提示，跳转本身就是回执
+      setActive(s.id);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  /**
+   * 撤销 = 原生 TUI 的 /undo：这条用户消息起的历史摘掉，工作区文件按快照一起回滚。
+   * 内核会逐条发 message.removed，时间线自己瘦下去；被打的那句填回输入框，改完能直接重发。
+   */
+  async function revertTo(messageID: string) {
+    const id = active;
+    if (!id || readOnly || busy) return;
+    const src = msgs.find((m) => m.info.id === messageID);
+    try {
+      mergeSession(await sessions.revert(id, messageID, dirOf(id)));
+      const text = src?.parts
+        .filter((p) => p.type === "text" && !p.metadata?.synthetic)
+        .map((p) => p.text ?? "")
+        .join("\n\n")
+        .trim();
+      const noImage = (src?.parts ?? []).some((p) => p.type === "file");
+      // 框里已经另打了字就别覆盖掉，撤销只负责把历史退回去
+      const filled = !!text && !input.trim();
+      if (filled) setInput(text);
+      setToast(
+        filled
+          ? `已撤销这一轮，原话填回输入框${noImage ? "（截图没带回来，要原样重发用重试）" : ""}`
+          : "已撤销这一轮",
+      );
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  /** 恢复撤销 = /redo：把刚摘掉的那段历史和文件快照整个放回来 */
+  async function redoUndo() {
+    const id = active;
+    if (!id || busy) return;
+    try {
+      mergeSession(await sessions.unrevert(id, dirOf(id)));
+      // 恢复是批量写回，内核不一定逐条补发帧，直接重拉一次最稳
+      resync();
+      setToast("已恢复撤销的内容");
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  /** 只摘掉这一条消息，不回滚文件——连文件一起退回去请用撤销 */
+  async function removeMessage(messageID: string) {
+    const id = active;
+    if (!id || readOnly || busy) return;
+    try {
+      await sessions.deleteMessage(id, messageID, dirOf(id));
+      resync();
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  /** 生成/更新项目的 AGENTS.md，等价于原生的 /init；内核要一条消息当锚点 */
+  async function initAgentsMd() {
+    const id = active;
+    const anchor = msgs[msgs.length - 1]?.info.id;
+    if (!id || !model || !anchor) {
+      setErr("生成 AGENTS.md 需要选好模型，并且这条会话里至少已经有一条消息");
+      return;
+    }
+    setErr(null);
+    try {
+      await sessions.init(id, model, anchor, dirOf(id));
+      stick.current = true;
+      resync();
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  /** 公开发布：整段对话（含文件路径、命令输出）上传到 opncd.ai 换一条外链 */
+  async function doShare(id: string) {
+    try {
+      const s = await sessions.share(id, dirOf(id));
+      mergeSession(s);
+      const url = s.share?.url;
+      if (url) await copy(url).catch(() => {});
+      setToast(url ? `已发布，链接已复制：${url}` : "已发布");
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setShareAsk(null);
+    }
+  }
+
+  async function doUnshare(id: string) {
+    try {
+      const s = await sessions.unshare(id, dirOf(id));
+      // 显式抹掉 share：内核这里可能只回摘要，不带空字段
+      mergeSession({ ...s, share: undefined });
+      setToast("已取消发布，公网链接失效（已经转出去的复制件收不回）");
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  /**
+   * `!` 前缀 = 在项目里跑一条命令，输出直接进上下文、不派模型（原生 TUI 的同名行为）。
+   * busy 交给内核的帧驱动，这里不自己标，免得它没发 idle 时永久卡在停止按钮。
+   */
+  async function runShell(command: string) {
+    setInput("");
+    setErr(null);
+    try {
+      let id = active;
+      if (!id) {
+        const s = await sessions.create(command.slice(0, 40), dir);
+        id = s.id;
+        setActive(id);
+        reloadList();
+      }
+      await sessions.shell(id, agent ?? "build", command, dirOf(id));
+      stick.current = true;
+      resync();
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
   async function answer(p: PermissionRequest, reply: "once" | "always" | "reject") {
     setErr(null);
     try {
-      await permissions.reply(p.id, reply, dir);
+      // 队列按目录分实例：拿错区的 reply 内核回 200 却什么都不做，那张卡会永远挂着
+      await permissions.reply(p.id, reply, dirOf(p.sessionID));
       setPerms((q) => q.filter((x) => x.id !== p.id));
     } catch (e) {
       setErr(String(e));
@@ -1417,7 +1618,7 @@ export default function Chat({
   async function answerQuestion(q: QuestionRequest, answers: string[][]) {
     setErr(null);
     try {
-      await questions.reply(q.id, answers, dir);
+      await questions.reply(q.id, answers, dirOf(q.sessionID));
       setAsks((a) => a.filter((x) => x.id !== q.id));
     } catch (e) {
       setErr(String(e));
@@ -1427,7 +1628,7 @@ export default function Chat({
   async function rejectQuestion(q: QuestionRequest) {
     setErr(null);
     try {
-      await questions.reject(q.id, dir);
+      await questions.reject(q.id, dirOf(q.sessionID));
       setAsks((a) => a.filter((x) => x.id !== q.id));
     } catch (e) {
       setErr(String(e));
@@ -1544,47 +1745,33 @@ export default function Chat({
   }
 
   /**
-   * 切工作区 = 重启内核。先把上一个工作区的界面清空再等，
-   * 否则这几秒里看到的是旧对话，很容易当成没生效。
+   * 关掉当前这条会话的视图。忙集合不动：内核按目录分实例，别的区还在跑，
+   * 那些状态是侧栏上后台会话的灯，不属于这里。
    */
   function clearView() {
     setActive(null);
     setMsgs([]);
     setPerms([]);
-    setBusySet(new Set());
+    setAsks([]);
     setRetry(null);
     setTip(null);
   }
 
   /**
-   * opencode.db 全项目共用，读消息不需要切区，所以别的区的会话直接只读预览；
-   * 只有要发新消息才需要 restart 到那个工作区。
-   * 忙不忙由 busySet 按会话判定，切过去自然看到那条会话自己的状态，不用在这里清。
+   * 会话列表、消息、待办、diff 都按 session.directory 直接读，跨区点开不需要切区；
+   * 发送也带会话自己的目录，所以预览和继续对话是同一件事。
    */
-  function openSession(p: string, id: string) {
-    if (sameDir(p, projectDir)) {
-      setActive(id);
-      return;
-    }
-    setPerms([]);
+  function openSession(id: string) {
     setActive(id);
   }
 
   function switchTo(p: string, then: string | null = null) {
-    if (sameDir(p, projectDir)) {
-      setActive(then);
-      return;
-    }
-    pending.current = then;
-    clearView();
-    onSwitchDir(p);
+    setActive(then);
+    if (!sameDir(p, projectDir)) onSwitchDir(p);
   }
 
   function dropWs(p: string) {
-    if (sameDir(p, projectDir)) {
-      pending.current = null;
-      clearView();
-    }
+    if (sameDir(p, projectDir)) clearView();
     onDropDir(p);
   }
 
@@ -1663,9 +1850,36 @@ export default function Chat({
   }
 
   function sessMenu(p: string, id: string, cur: boolean): MenuItem[] {
-    return cur
-      ? [{ label: "删除会话", danger: true, run: () => armDelete(id) }]
-      : [{ label: "切到该工作区并打开", run: () => switchTo(p, id) }];
+    const s = list.find((x) => x.id === id);
+    // 撤销/AGENTS 都要读当前时间线，只有打开着的这条能给出
+    const onActive = id === active && !readOnly;
+    const lastUser = [...msgs].reverse().find((m) => m.info.role === "user")?.info.id;
+    const canWrite = onActive && !busy;
+    return [
+      ...(cur ? [] : [{ label: "切到该工作区", run: () => switchTo(p) }]),
+      ...(onActive && s?.revert
+        ? [{ label: "恢复撤销的内容", run: () => void redoUndo() }]
+        : canWrite && lastUser
+          ? [{ label: "撤销最后一轮", run: () => void revertTo(lastUser) }]
+          : []),
+      ...(canWrite ? [{ label: "生成 / 更新 AGENTS.md", run: () => void initAgentsMd() }] : []),
+      { label: "分叉为新会话", run: () => void forkSession(id) },
+      ...(s?.share
+        ? [{ label: "取消公开发布", run: () => void doUnshare(id) }]
+        : [{ label: "公开发布到公网…", danger: true, run: () => setShareAsk(id) }]),
+      { label: "删除会话", danger: true, run: () => armDelete(id) },
+    ];
+  }
+
+  /** 右键时间线上的消息：撤销以「这一条」为锚点，会话在跑的时候不给点 */
+  function msgMenu(m: Message): MenuItem[] {
+    if (!active || readOnly || busy || !live) return [];
+    const items: MenuItem[] = [];
+    // 已经撤销过一次就不再叠第二次，锚点会互相盖掉，只留「恢复」
+    if (m.info.role === "user" && !activeSess?.revert)
+      items.push({ label: "从这里撤销（含文件回滚）", run: () => void revertTo(m.info.id) });
+    items.push({ label: "只删除这条消息", danger: true, run: () => void removeMessage(m.info.id) });
+    return items;
   }
 
   const wsCap = wsShown ?? SIDE_PAGE;
@@ -1762,45 +1976,38 @@ export default function Chat({
                       >
                         <button
                           className="link"
-                          onClick={() => openSession(p, s.id)}
-                          title={
-                            s.parentID
-                              ? `子任务会话 · ${s.id}`
-                              : cur
-                                ? s.id
-                                : `只读预览 · ${s.id}`
-                          }
+                          onClick={() => openSession(s.id)}
+                          title={s.parentID ? `子任务会话 · ${s.id}` : s.id}
                         >
                           {s.parentID ? `↳ ${s.title || s.id}` : s.title || s.id}
                         </button>
-                        {cur &&
-                          (delAsk === s.id ? (
-                            <>
-                              <button
-                                className="x armed danger"
-                                onClick={() => confirmDelete(s.id)}
-                                title="确认删除这条会话"
-                              >
-                                删
-                              </button>
-                              <button
-                                className="x armed"
-                                onClick={() => setDelAsk(null)}
-                                title="取消"
-                              >
-                                ×
-                              </button>
-                            </>
-                          ) : (
+                        {delAsk === s.id ? (
+                          <>
                             <button
-                              className="x"
-                              onClick={() => armDelete(s.id)}
-                              title="删除会话"
-                              aria-label="删除会话"
+                              className="x armed danger"
+                              onClick={() => confirmDelete(s.id)}
+                              title="确认删除这条会话"
+                            >
+                              删
+                            </button>
+                            <button
+                              className="x armed"
+                              onClick={() => setDelAsk(null)}
+                              title="取消"
                             >
                               ×
                             </button>
-                          ))}
+                          </>
+                        ) : (
+                          <button
+                            className="x"
+                            onClick={() => armDelete(s.id)}
+                            title="删除会话"
+                            aria-label="删除会话"
+                          >
+                            ×
+                          </button>
+                        )}
                       </li>
                     ))}
                     {(rest > 0 || expanded) && (
@@ -1939,6 +2146,17 @@ export default function Chat({
           </p>
         )}
 
+        {activeSess?.revert && (
+          <p className="hint revertbar">
+            <span className="grow">已撤销到这条之前：后面的回复和文件改动都跟着退回了</span>
+            {!busy && (
+              <button onClick={() => void redoUndo()} title="把撤掉的这段历史和文件快照放回来">
+                恢复撤销
+              </button>
+            )}
+          </p>
+        )}
+
         <div className={`body ${turns.length > 1 ? "hasrail" : ""}`} ref={body}>
           <section className="thread" ref={thread} onScroll={onScroll}>
             {!!kids.length && (
@@ -1977,7 +2195,11 @@ export default function Chat({
                   : st?.todos;
               return (
                 <Fragment key={m.info.id}>
-                  <article id={`m-${m.info.id}`} className={`msg ${m.info.role}`}>
+                  <article
+                    id={`m-${m.info.id}`}
+                    className={`msg ${m.info.role}`}
+                    onContextMenu={(e) => openMenu(e, msgMenu(m))}
+                  >
                     <header>{label(m.info)}</header>
                     {m.info.error && (
                       <p className="error inline">
@@ -2119,15 +2341,8 @@ export default function Chat({
           {readOnly && (
             <p className="hint robar">
               <span className="grow">
-                {isChild
-                  ? "子任务会话 · task 派出去的独立会话，只能看不能接着发"
-                  : wsOf
-                    ? `只读预览 · 这条会话属于「${baseName(wsOf)}」`
-                    : "只读预览"}
+                子任务会话 · task 派出去的独立会话，只能看不能接着发
               </span>
-              {!isChild && wsOf && (
-                <button onClick={() => switchTo(wsOf, active)}>切过去继续对话</button>
-              )}
             </p>
           )}
           {!!palette.length && (
@@ -2191,11 +2406,9 @@ export default function Chat({
             disabled={readOnly}
             placeholder={
               readOnly
-                ? isChild
-                  ? "子任务会话只读，回到父会话才能继续"
-                  : "只读预览，切到该工作区后才能继续对话"
+                ? "子任务会话只读，回到父会话才能继续"
                 : live
-                  ? "描述要做的改动，可粘贴截图，/ 唤起命令，Enter 发送"
+                  ? "描述要做的改动，可粘贴截图，/ 唤起命令，! 直接跑命令，Enter 发送"
                   : "先启动内核"
             }
             onChange={(e) => setInput(e.target.value)}
@@ -2292,7 +2505,12 @@ export default function Chat({
             {busy ? (
               <button
                 className="send stop"
-                onClick={() => active && sessions.abort(active, dir).catch((e) => setErr(String(e)))}
+                onClick={() =>
+                  active &&
+                  sessions
+                    .abort(active, dirOf(active))
+                    .catch((e) => setErr(String(e)))
+                }
                 title="停止"
                 aria-label="停止"
               >
@@ -2345,6 +2563,32 @@ export default function Chat({
           pulse={editPulse}
           onClose={() => setFileView(null)}
         />
+      )}
+
+      {shareAsk && (
+        <div className="askmask" onMouseDown={() => setShareAsk(null)}>
+          <div
+            className="askcard"
+            role="dialog"
+            aria-modal="true"
+            aria-label="公开发布确认"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <b>把这段对话公开发布？</b>
+            <p className="hint">
+              内核会把整段会话原文上传到 opncd.ai，换一条任何拿到链接的人都能打开的页面——
+              里面的文件路径、命令和模型输出一起出去。取消发布只能让链接失效，
+              已经被人看走、转走的复制件收不回来。
+            </p>
+            <div className="row">
+              <span className="grow" />
+              <button onClick={() => setShareAsk(null)}>取消</button>
+              <button className="primary" onClick={() => void doShare(shareAsk)}>
+                确认发布
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {menu && (

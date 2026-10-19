@@ -58,7 +58,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  // 换目录要重启内核、进工作区要拉起内核，这几秒界面不能操作；进度卡告诉用户在干什么
+  // 进工作区要拉起内核，这几秒界面不能操作；进度卡告诉用户在干什么（切工作区已经不重启了）
   const [switching, setSwitching] = useState<{
     dir: string;
     title: string;
@@ -106,27 +106,13 @@ export default function App() {
       if (s) setStatus(s);
     });
 
-  /** serve 的 cwd 与目录信任白名单都在启动时定死，换工作区必须重启内核 */
+  /** 内核在一个进程里按目录分实例，实例随第一次请求懒起。
+   *  切区只改界面当前目录，后台会话照旧在原来的实例里跑，不再重启内核。 */
   const applyDir = (dir: string, list: string[]) => {
-    const restart = !!status?.running;
-    setSwitching({
-      dir,
-      title: "正在切换工作区…",
-      stage: restart ? "正在重启内核…" : "正在保存工作区…",
-    });
     void run(async () => {
       await invoke("settings_save", { next: { projectDir: dir, projects: list } });
-      // 先把内核换到新端口，再把新目录交给界面：反过来的话新目录会对着
-      // 正在停止的旧内核发 /provider，连接失败会弹一条没意义的红字
-      try {
-        if (restart) {
-          setStatus(await invoke<KernelStatus>("kernel_start"));
-          setSwitching({ dir, title: "正在切换工作区…", stage: "正在刷新工作区…" });
-        }
-      } finally {
-        await refresh();
-      }
-    }).finally(() => setSwitching(null));
+      await refresh();
+    });
   };
 
   const switchDir = (dir: string) =>
@@ -194,6 +180,7 @@ export default function App() {
           projects={check!.projects}
           status={status}
           busy={busy}
+          keepAwake={check!.keepAwake}
           onStart={start}
           onStop={stop}
           onAddDir={addDir}
@@ -217,6 +204,7 @@ export default function App() {
           check={check}
           status={status}
           busy={busy}
+          keepAwake={!!check?.keepAwake}
           run={run}
           onStart={start}
           onStop={stop}
@@ -356,7 +344,6 @@ function Setup({
               选择目录
             </button>
           )}
-          <p className="hint">serve 的工作目录，启动前会自动写入内核的信任白名单。</p>
         </Step>
 
         <div className="setup-foot">
@@ -487,6 +474,7 @@ function Settings({
   check,
   status,
   busy,
+  keepAwake,
   run,
   onStart,
   onStop,
@@ -496,6 +484,7 @@ function Settings({
   check: EnvCheck | null;
   status: KernelStatus | null;
   busy: boolean;
+  keepAwake: boolean;
   run: Runner;
   onStart: () => Promise<void>;
   onStop: () => Promise<void>;
@@ -533,7 +522,9 @@ function Settings({
       .catch(() => setCred(null));
   }, [check]);
 
-  const dir = status?.projectDir ?? null;
+  // 切区不重启内核，status.projectDir 是 serve 启动时的 cwd，会落后于当前区；
+  // 技能/模型/权限这些按区生效的设置必须跟着当前区走
+  const dir = check?.projectDir ?? null;
   // 清单本身只读；装完技能靠内核的目录监视热加载，这里重新拉一次就能看见
   useEffect(() => {
     if (!status?.healthy) {
@@ -619,6 +610,19 @@ function Settings({
               </div>
               {updLog && <pre className="detail">{updLog}</pre>}
               {status?.detail && <pre className="detail">{status.detail}</pre>}
+              <label className="awake">
+                <input
+                  type="checkbox"
+                  checked={keepAwake}
+                  onChange={async (e) => {
+                    const on = e.target.checked;
+                    if (await run(() => invoke("settings_save", { next: { keepAwake: on } }))) {
+                      await onChanged();
+                    }
+                  }}
+                />
+                任务运行时阻止电脑休眠
+              </label>
             </>
           )}
 

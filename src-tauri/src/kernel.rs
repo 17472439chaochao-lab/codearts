@@ -51,6 +51,8 @@ pub struct Status {
     pub running: bool,
     pub healthy: bool,
     pub port: Option<u16>,
+    /// serve 进程启动时的 cwd。切区不再重启，所以这个值会落后于界面当前工作区，
+    /// 前端要知道当前区得自己拿 settings 里的 projectDir。
     pub project_dir: Option<String>,
     pub version: Option<String>,
     pub detail: Option<String>,
@@ -209,7 +211,7 @@ impl Kernel {
                 inner.version = version;
             }
             let _ = app.emit("kernel-status", self.status_obj());
-            crate::api::spawn_pump(app.clone(), ep, project);
+            crate::api::spawn_pump(app.clone(), ep);
         } else {
             let _ = secrets::remove(secrets::ENDPOINT);
         }
@@ -220,7 +222,7 @@ impl Kernel {
         tauri::async_runtime::spawn(watch(app));
     }
 
-    /// 强制重启一个实例（换工作区、手动启动、升级、自愈都走这里）。
+    /// 强制重启一个实例（手动启动、升级、自愈都走这里；切工作区已经不用了）。
     /// 全程持 gate：并发方只能排队，不会在健康等待窗口里把刚拉起的实例杀掉。
     pub async fn start(&self, app: &tauri::AppHandle) -> Result<Endpoint> {
         let _gate = self.gate.lock().await;
@@ -321,7 +323,7 @@ impl Kernel {
         self.remember_probe(&begun.endpoint);
         persist_endpoint(&begun.endpoint)?;
         let _ = app.emit("kernel-status", self.status_obj());
-        crate::api::spawn_pump(app.clone(), begun.endpoint.clone(), Some(begun.project));
+        crate::api::spawn_pump(app.clone(), begun.endpoint.clone());
         Ok(begun.endpoint)
     }
 

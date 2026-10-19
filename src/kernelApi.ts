@@ -79,6 +79,10 @@ export type Session = {
   /** 子任务会话才有；顶层会话的 payload 里不带这个键 */
   parentID?: string;
   time: { created: number; updated: number };
+  /** 内核的自动发布：非空说明这条会话的全文已经挂到公网 opncd.ai 上了 */
+  share?: { url: string };
+  /** 撤销锚点（= /undo 打的那次），非空表示这个 messageID 起都被撤掉了 */
+  revert?: { messageID: string; partID?: string };
   /** session.updated / 列表接口会带上当前改动汇总，diffs 是逐文件明细 */
   summary?: { additions: number; deletions: number; files: number; diffs?: FileDiff[] };
 };
@@ -96,7 +100,16 @@ export type FileDiff = {
   status?: "added" | "deleted" | "modified";
 };
 
-export type KernelEvent = { type: string; properties: Record<string, any> };
+/**
+ * `kernel-event` 的一帧。/global/event 是所有目录实例的并集流，Rust 侧把信封拆掉后
+ * 把 `directory` 提到顶层；`server.connected` / `server.heartbeat` / `project.updated`
+ * 这三类帧内核本身不带目录，所以是 undefined。
+ */
+export type KernelEvent = {
+  type: string;
+  properties: Record<string, any>;
+  directory?: string;
+};
 
 export type ModelRef = { providerID: string; modelID: string };
 
@@ -121,6 +134,8 @@ export type EnvCheck = {
   projectDir: string | null;
   projects: string[];
   kernelHome: string;
+  /** 会话跑动期间是否握着阻止休眠的断言 */
+  keepAwake: boolean;
 };
 
 /** /provider → { all:[{id,name,models:{...}}], default:{providerID:modelID} } */
@@ -280,6 +295,49 @@ export const sessions = {
     api<Session>("PATCH", `/session/${id}`, { title }, dir),
   remove: (id: string, dir?: string | null) =>
     api<Session>("DELETE", `/session/${id}`, undefined, dir),
+  /** 分叉：空 body 即可，内核复制整段历史，标题自动带「(fork #n)」 */
+  fork: (id: string, dir?: string | null) => api<Session>("POST", `/session/${id}/fork`, {}, dir),
+  /**
+   * 撤销到某条消息（原生 TUI 的 /undo 就是它）：该条起的历史从会话里摘掉，
+   * 并按快照恢复文件。revert.partID 能细到某条消息内部的第几个分片，壳侧不用。
+   */
+  revert: (id: string, messageID: string, dir?: string | null) =>
+    api<Session>("POST", `/session/${id}/revert`, { messageID }, dir),
+  /** 恢复撤销（/redo）：无 body */
+  unrevert: (id: string, dir?: string | null) =>
+    api<Session>("POST", `/session/${id}/unrevert`, {}, dir),
+  /**
+   * 删除单条消息。注意与 revert 不同：不恢复文件，也不留 revert 锚点。
+   * 消息不存在时内核直接 404，不像 revert 那样静默成功。
+   */
+  deleteMessage: (id: string, messageID: string, dir?: string | null) =>
+    api<unknown>("DELETE", `/session/${id}/message/${messageID}`, undefined, dir),
+  /**
+   * 发布到 opncd.ai 拿外链。⚠️ 会话全文会离开本机，界面必须先警告再发。
+   * 回参就是带 share.url 的会话。
+   */
+  share: (id: string, dir?: string | null) => api<Session>("POST", `/session/${id}/share`, {}, dir),
+  unshare: (id: string, dir?: string | null) =>
+    api<Session>("DELETE", `/session/${id}/share`, undefined, dir),
+  /**
+   * 在项目里跑一条命令并把结果带进会话（原生 TUI 的 `!`）：
+   * 输出直接入上下文，不派模型，所以会话忙不忙都能发。
+   */
+  shell: (id: string, agent: string, command: string, dir?: string | null) =>
+    api<Session>("POST", `/session/${id}/shell`, { agent, command }, dir),
+  /** 生成/更新项目说明文件，等价于原生的 /init；需要一条消息做锚点 */
+  init: (
+    id: string,
+    model: ModelRef,
+    messageID: string,
+    dir?: string | null,
+  ) =>
+    api<Session>(
+      "POST",
+      `/session/${id}/init`,
+      { providerID: model.providerID, modelID: model.modelID, messageID },
+      dir,
+    ),
   messages: (id: string, dir?: string | null) =>
     api<Message[]>("GET", `/session/${id}/message`, undefined, dir),
   /** 主链路：204 立即返回，内容全靠 SSE。agent 只认 GET /agent 返回的名字，写错内核不报错 */

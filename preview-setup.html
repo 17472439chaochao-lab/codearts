@@ -51,6 +51,8 @@
       // task / ask / todo / stream 场景要的是内核在线：Chat 只在 healthy 时才发请求、才接事件流
       const healthy = state !== "fresh" && state !== "cli" && state !== "dir";
       const now = Date.now();
+      /** 预览台里的可改设置：阻止休眠开关跟着 settings_save 走，刷新后还能看见 */
+      const preview = { keepAwake: false };
       /** 技能安装：装/更/卸只改这份内存清单，界面重拉 skills_managed 才看得到变化 */
       const managed = {
         project: [
@@ -132,6 +134,10 @@
                 ? "改动汇总与自动重试"
                 : "示例会话 A";
       const deleted = new Set();
+      /** 会话生命周期：撤销锚点、已发布、被单独删掉的消息 id，都留在内存里让列表跟着走 */
+      let revAnchor = null;
+      const shared = new Set();
+      const goneMsgs = new Set();
       /** question 工具的待答队列：options 摊成卡片，答完内核才继续 */
       const askReq = {
         id: "que_demo1",
@@ -888,6 +894,24 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
       // 界面「新建会话」会 POST /session，mock 也得当场造一条进列表
       const created = [];
       let made = 0;
+      const sess = (id, extra) => ({
+        id,
+        title: parentTitle,
+        directory: projectDir,
+        time: { created: now, updated: Date.now() },
+        ...(revAnchor && id === PARENT ? { revert: { messageID: revAnchor } } : {}),
+        ...(shared.has(id) ? { share: { url: `https://opncd.ai/share/preview-${id}` } } : {}),
+        ...extra,
+      });
+      /** 撤销/删消息之后重拉时间线必须跟着变，否则壳的 resync 会把撤掉的又拉回来 */
+      const visible = (ms) => {
+        let out = ms;
+        if (revAnchor) {
+          const cut = out.findIndex((m) => m.info.id === revAnchor);
+          if (cut > -1) out = out.slice(0, cut);
+        }
+        return out.filter((m) => !goneMsgs.has(m.info.id));
+      };
 
       mockWindows("main");
       mockIPC((cmd, payload) => {
@@ -895,12 +919,7 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           const path = payload?.path ?? "";
           if (payload?.method === "GET" && path === "/session")
             return [
-              {
-                id: PARENT,
-                title: parentTitle,
-                directory: projectDir,
-                time: { created: now - 90000, updated: now },
-              },
+              sess(PARENT, { time: { created: now - 90000, updated: now } }),
               {
                 id: "ses_b1",
                 title: "另一个区的会话",
@@ -946,15 +965,17 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           if (payload?.method === "GET" && path === `/session/${KID}/message`)
             return state === "task" ? kidMsgs : [];
           if (payload?.method === "GET" && path === `/session/${PARENT}/message`)
-            return state === "task"
-              ? parentMsgs
-              : state === "ask"
-                ? askMsgs
-                : state === "todo"
-                  ? todoMsgs
-                  : state === "stream"
-                    ? richMsgs
-                    : [];
+            return visible(
+              state === "task"
+                ? parentMsgs
+                : state === "ask"
+                  ? askMsgs
+                  : state === "todo"
+                    ? todoMsgs
+                    : state === "stream"
+                      ? richMsgs
+                      : [],
+            );
           if (payload?.method === "GET" && /^\/session\/[^/]+\/message$/.test(path)) return [];
           if (payload?.method === "DELETE" && /^\/session\/[^/]+$/.test(path)) {
             const id = path.split("/")[2];
@@ -975,9 +996,57 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
             parentTitle = String(payload?.body?.title ?? parentTitle);
             return { id, title: parentTitle, directory: projectDir, time: { created: now, updated: now } };
           }
+          // —— 会话生命周期：fork / 撤销 / 恢复 / 删单条 / 发布 / ! 命令 / AGENTS.md ——
+          if (payload?.method === "POST" && /^\/session\/[^/]+\/fork$/.test(path)) {
+            made += 1;
+            const s = sess(`ses_fork${made}`, {
+              title: `${parentTitle}（分叉 ${made}）`,
+              time: { created: Date.now(), updated: Date.now() },
+            });
+            created.push(s);
+            return s;
+          }
+          if (payload?.method === "POST" && /^\/session\/[^/]+\/revert$/.test(path)) {
+            const id = path.split("/")[2];
+            const mid = String(payload?.body?.messageID ?? "");
+            revAnchor = mid;
+            // 真内核每摘掉一条消息发一帧 message.removed，壳的时间线全靠它瘦
+            const all = state === "stream" ? richMsgs : parentMsgs;
+            const cut = all.findIndex((m) => m.info.id === mid);
+            if (cut > -1)
+              for (const m of all.slice(cut)) window.__emit("message.removed", { sessionID: id, messageID: m.info.id });
+            return sess(id);
+          }
+          if (payload?.method === "POST" && /^\/session\/[^/]+\/unrevert$/.test(path)) {
+            revAnchor = null;
+            return sess(path.split("/")[2]);
+          }
+          if (payload?.method === "DELETE" && /^\/session\/[^/]+\/message\/[^/]+$/.test(path)) {
+            const seg = path.split("/");
+            goneMsgs.add(seg[4]);
+            window.__emit("message.removed", { sessionID: seg[2], messageID: seg[4] });
+            return true;
+          }
+          if (payload?.method === "POST" && /^\/session\/[^/]+\/share$/.test(path)) {
+            const id = path.split("/")[2];
+            shared.add(id);
+            return sess(id);
+          }
+          if (payload?.method === "DELETE" && /^\/session\/[^/]+\/share$/.test(path)) {
+            const id = path.split("/")[2];
+            shared.delete(id);
+            return sess(id, { share: null });
+          }
+          if (payload?.method === "POST" && /^\/session\/[^/]+\/(shell|init)$/.test(path)) {
+            // 核对 body：shell 要 {agent, command}，init 要 {providerID, modelID, messageID}
+            window.__lastLifecycle = { path: payload?.path, body: payload?.body };
+            return sess(path.split("/")[2]);
+          }
           if (payload?.method === "POST" && /^\/session\/[^/]+\/prompt_async$/.test(path)) {
             // 粘贴截图时把 parts 留在控制台里，核对 file part 的 data URL
             window.__lastPrompt = payload?.body;
+            // 跨工作区对话：发送必须带会话自己那个区，用这个核对头有没有跟对
+            window.__lastPromptDir = payload?.directory;
             return null;
           }
           if (payload?.method === "GET" && /^\/session\/[^/]+\/todo$/.test(path))
@@ -1074,6 +1143,7 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
             projectDir: hasDir ? projectDir : null,
             projects: hasDir ? [projectDir, otherDir] : [],
             kernelHome: "/Users/you",
+            keepAwake: preview.keepAwake,
           };
         if (cmd === "kernel_upgrade") return "codearts upgrade\n当前已是最新版本 26.9.26";
         if (cmd === "ocr_image") {
@@ -1082,10 +1152,19 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           if (mode === "error") throw new Error("模拟 OCR 失败");
           return window.__ocrText ?? "预览台 OCR：这是从截图里识别出的文字";
         }
-        if (cmd === "plugin:app|version") return "0.1.1";
+        if (cmd === "plugin:app|version") return "0.1.2";
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;
-        if (cmd === "settings_save") return null;
+        if (cmd === "settings_save") {
+          // 真实命令返回合并后的配置，返回 null 会让界面以为保存失败
+          Object.assign(preview, payload?.next ?? {});
+          return payload?.next ?? null;
+        }
+        if (cmd === "no_sleep_set") {
+          // 预览台不真起 caffeinate，只记最后一次加解锁给自动化断言
+          window.__wake = payload?.hold ? "hold" : "release";
+          return true;
+        }
         if (cmd === "providers_list") return providersView();
         if (cmd === "providers_save") {
           const d = payload?.draft ?? {};

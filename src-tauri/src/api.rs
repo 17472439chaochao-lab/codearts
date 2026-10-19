@@ -140,7 +140,9 @@ pub async fn request(
     };
     req = req.header("authorization", ep.basic());
     if let Some(dir) = directory.filter(|d| !d.is_empty()) {
-        req = req.header("x-opencode-directory", dir);
+        // 内核收到头后会 decodeURIComponent，所以这里必须按同一套规则编码（官方 TUI 就是这么发的）；
+        // 裸路径遇到中文目录名连 header 都构造不出来，含 `%` 的名字更会被解成别的路径
+        req = req.header("x-opencode-directory", encode_dir(&dir));
     }
     if let Some(b) = body {
         req = req.json(&b);
@@ -148,18 +150,18 @@ pub async fn request(
     decode(req.send().await?).await
 }
 
-/// SSE 桥：订阅内核 /event，把每帧原样转成 Tauri event 推给 WebView。
+/// SSE 桥：订阅内核 /global/event，把每帧原样转成 Tauri event 推给 WebView。
 /// 服务密码只留在 Rust 侧，前端拿不到端口和凭据。
 /// `kernel-bridge` 事件告知前端链路状态：{state: "down"|"open", message?}，
 /// 前端据此提示断线并在恢复后补拉数据。
-pub fn spawn_pump(app: tauri::AppHandle, ep: Endpoint, directory: Option<String>) {
+pub fn spawn_pump(app: tauri::AppHandle, ep: Endpoint) {
     tauri::async_runtime::spawn(async move {
         let kernel: std::sync::Arc<Kernel> = app.state::<std::sync::Arc<Kernel>>().inner().clone();
         loop {
             if kernel.current_endpoint() != Some(ep.clone()) {
                 return;
             }
-            if let Err(e) = stream(&app, &kernel, &ep, directory.as_deref()).await {
+            if let Err(e) = stream(&app, &kernel, &ep).await {
                 let _ = app.emit(
                     "kernel-bridge",
                     serde_json::json!({ "state": "down", "message": e.to_string() }),
@@ -170,22 +172,16 @@ pub fn spawn_pump(app: tauri::AppHandle, ep: Endpoint, directory: Option<String>
     });
 }
 
-async fn stream(
-    app: &tauri::AppHandle,
-    kernel: &Kernel,
-    ep: &Endpoint,
-    directory: Option<&str>,
-) -> Result<()> {
-    // 实测：/event 按 x-opencode-directory 分实例广播，不带头的连接收不到该目录的任何事件
-    let mut req = kernel
+async fn stream(app: &tauri::AppHandle, kernel: &Kernel, ep: &Endpoint) -> Result<()> {
+    // 实测 26.9.26：/global/event 不带目录头，是所有实例的并集流，
+    // envelope = {directory, payload}。切工作区不再重启内核，所以不能再订阅单目录 /event。
+    let resp = kernel
         .sse
-        .get(ep.url("/event"))
+        .get(ep.url("/global/event"))
         .header("authorization", ep.basic())
-        .header("accept", "text/event-stream");
-    if let Some(dir) = directory.filter(|d| !d.is_empty()) {
-        req = req.header("x-opencode-directory", dir);
-    }
-    let resp = req.send().await?;
+        .header("accept", "text/event-stream")
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(Error::Msg(format!("事件流状态码 {}", resp.status())));
     }
@@ -203,12 +199,28 @@ async fn stream(
             buf.drain(..end + sep);
             for line in frame.lines().filter(|l| l.starts_with("data:")) {
                 if let Ok(v) = serde_json::from_str::<Value>(line[5..].trim()) {
-                    let _ = app.emit("kernel-event", v);
+                    let _ = app.emit("kernel-event", unwrap_envelope(v));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// 拆并集流的信封，把 `directory` 提到事件顶层；无信封的帧原样转发。
+/// `server.connected` / `server.heartbeat` / `project.updated` 不带 directory，前端按缺省处理。
+fn unwrap_envelope(v: Value) -> Value {
+    let Some(payload) = v.get("payload").cloned() else {
+        return v;
+    };
+    match v.get("directory").and_then(Value::as_str) {
+        Some(dir) => serde_json::json!({
+            "type": payload.get("type").and_then(Value::as_str).unwrap_or(""),
+            "properties": payload.get("properties").cloned().unwrap_or(Value::Null),
+            "directory": dir,
+        }),
+        None => payload,
+    }
 }
 
 /// `x-opencode-directory` 只能是已保存工作区（canonical 后比较），不能让 WebView 把内核指到任意目录。
@@ -247,6 +259,21 @@ fn frame_end(buf: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
+/// JS `encodeURIComponent`：只留 unreserved 加 `!~*'()`，其余按 UTF-8 字节 %XX（大写）。
+/// 目录头的编解码要和内核/官方 TUI 对齐，`/` 也在这套规则里被编码。
+fn encode_dir(dir: &str) -> String {
+    const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
+    let mut out = String::with_capacity(dir.len());
+    for b in dir.as_bytes() {
+        if KEEP.contains(b) {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +292,28 @@ mod tests {
         assert!(check_path("/file%252f..%252f..").is_err());
         assert!(check_path("/%2e%2e/etc").is_err());
         assert!(check_path("/session/%zz").is_err());
+    }
+
+    #[test]
+    fn envelope_moves_directory_up_and_bare_frame_passes() {        let wrapped: Value = serde_json::from_str(
+            r#"{"directory":"/tmp/a","payload":{"type":"session.idle","properties":{"sessionID":"s1"}}}"#,
+        )
+        .unwrap();
+        let out = unwrap_envelope(wrapped);
+        assert_eq!(out["type"], "session.idle");
+        assert_eq!(out["properties"]["sessionID"], "s1");
+        assert_eq!(out["directory"], "/tmp/a");
+
+        let bare: Value =
+            serde_json::from_str(r#"{"type":"server.heartbeat","properties":{}}"#).unwrap();
+        assert_eq!(unwrap_envelope(bare.clone()), bare);
+    }
+
+    #[test]
+    fn directory_header_matches_encode_uri_component() {
+        assert_eq!(encode_dir("/Users/a/b"), "%2FUsers%2Fa%2Fb");
+        // 裸 `%` 必须变成 %25，否则内核 decode 后会解出另一个路径
+        assert_eq!(encode_dir("/tmp/100%-x"), "%2Ftmp%2F100%25-x");
+        assert_eq!(encode_dir("/工作区"), "%2F%E5%B7%A5%E4%BD%9C%E5%8C%BA");
     }
 }
