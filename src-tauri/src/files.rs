@@ -63,36 +63,76 @@ pub struct PlanEntry {
 type PlanRoot = (&'static str, PathBuf);
 
 #[tauri::command]
-pub fn files_list(app: tauri::AppHandle, rel: Option<String>) -> Result<FileList> {
-    let root = Settings::load(&app)?.project_dir()?;
+pub fn files_list(
+    app: tauri::AppHandle,
+    rel: Option<String>,
+    directory: Option<String>,
+) -> Result<FileList> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
     list(&root, rel.as_deref().unwrap_or(""))
 }
 
 #[tauri::command]
-pub fn file_read(app: tauri::AppHandle, rel: String) -> Result<FileContent> {
-    let root = Settings::load(&app)?.project_dir()?;
+pub fn file_read(
+    app: tauri::AppHandle,
+    rel: String,
+    directory: Option<String>,
+) -> Result<FileContent> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
     read(&root, &rel)
 }
 
 #[tauri::command]
-pub fn plans_list(app: tauri::AppHandle) -> Result<Vec<PlanEntry>> {
-    let roots = plan_roots(&Settings::load(&app)?);
-    Ok(collect_plans(&roots))
+pub fn plans_list(app: tauri::AppHandle, directory: Option<String>) -> Result<Vec<PlanEntry>> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
+    Ok(collect_plans(&plan_roots(&settings, Some(&root))))
 }
 
 #[tauri::command]
-pub fn plan_read(app: tauri::AppHandle, path: String) -> Result<FileContent> {
-    let roots = plan_roots(&Settings::load(&app)?);
-    read_plan(&roots, &path)
+pub fn plan_read(
+    app: tauri::AppHandle,
+    path: String,
+    directory: Option<String>,
+) -> Result<FileContent> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
+    read_plan(&plan_roots(&settings, Some(&root)), &path)
+}
+
+/// 资源管理器读哪个工作区：不带 `directory` 时用落盘的当前区；点开别的区的会话时前端显式带上那个区，
+/// 否则会出现"翻着 A 区的会话、树里是 B 区的文件"。这个参数来自 WebView，所以只放行
+/// settings 里登记过的工作区，不能拿它去读任意路径。
+fn workspace_root(settings: &Settings, directory: Option<&str>) -> Result<PathBuf> {
+    let Some(raw) = directory.map(str::trim).filter(|s| !s.is_empty()) else {
+        return settings.project_dir();
+    };
+    let want = Path::new(raw)
+        .canonicalize()
+        .map_err(|_| Error::Msg(format!("目录不存在：{raw}")))?;
+    let mut known: Vec<PathBuf> = settings
+        .projects
+        .iter()
+        .flatten()
+        .filter_map(|p| Path::new(p).canonicalize().ok())
+        .collect();
+    known.extend(settings.project_dir().ok());
+    if !known.iter().any(|p| *p == want) {
+        return Err(Error::Msg("这个目录不在已添加的工作区里".into()));
+    }
+    Ok(want)
 }
 
 /// 内核规划模式的落盘路径（`Session.plan()`）：有 git 时 `<worktree>/.opencode/plans/<创建时间>-<slug>.md`，
 /// 没有 git 时 `<内核数据目录>/plans/…`。`.codeartsdoer/plans` 是 team-planner 子代理的模板路径，一并兜上；
 /// 工作区里技能自建的 plans 目录再按目录名收进来。
 /// 符号链接解析后必须仍落在仓库或数据目录内，否则丢掉这个根。
-fn plan_roots(settings: &Settings) -> Vec<PlanRoot> {
+fn plan_roots(settings: &Settings, workspace: Option<&Path>) -> Vec<PlanRoot> {
     let mut roots = Vec::new();
-    if let Ok(project) = settings.project_dir() {
+    // 跨区会话要看的是那个区自己的计划，不是一律跟着落盘的当前区
+    if let Some(project) = workspace.map(PathBuf::from).or(settings.project_dir().ok()) {
         // 内核把计划写在 git worktree 根上；在工作区子目录里打开时也要能找到
         let base = project
             .ancestors()
@@ -405,8 +445,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_traversal_and_absolute_paths() {
-        let root = TempRoot::new();
+    fn workspace_root_only_accepts_registered_workspaces() {
+        let base = TempRoot::new();
+        let mut dirs = vec![];
+        for name in ["a", "b", "stray"] {
+            let d = base.0.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            dirs.push(d);
+        }
+        let (a, b, stray) = (&dirs[0], &dirs[1], &dirs[2]);
+
+        let mut settings = Settings::default();
+        settings.project_dir = Some(a.display().to_string());
+        settings.projects = Some(vec![a.display().to_string(), b.display().to_string()]);
+
+        assert_eq!(workspace_root(&settings, None).unwrap(), settings.project_dir().unwrap());
+        assert_eq!(
+            workspace_root(&settings, Some(&b.display().to_string())).unwrap(),
+            b.canonicalize().unwrap()
+        );
+        // 空串按"没带参数"处理，仍然回当前区
+        assert_eq!(workspace_root(&settings, Some("  ")).unwrap(), settings.project_dir().unwrap());
+        assert!(workspace_root(&settings, Some(&stray.display().to_string())).is_err());
+        assert!(workspace_root(&settings, Some("/tmp")).is_err());
+        assert!(workspace_root(&settings, Some("/no/such/dir")).is_err());
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_paths() {        let root = TempRoot::new();
         assert!(list(&root.0, "../").is_err());
         assert!(read(&root.0, "/etc/hosts").is_err());
         assert!(list(&root.0, "src/../../").is_err());
@@ -438,7 +504,7 @@ mod tests {
         settings.project_dir = Some(repo.join("sub").display().to_string());
         settings.kernel_home = Some(root.0.display().to_string());
 
-        let roots = plan_roots(&settings);
+        let roots = plan_roots(&settings, None);
         assert_eq!(roots[0].1, repo.join(".codeartsdoer").join("plans"));
         assert_eq!(roots[1].1, repo.join(".opencode").join("plans"));
         assert_eq!(roots[2].1, root.0.join(".codeartsdoer").join("plans"));
@@ -496,7 +562,7 @@ mod tests {
         settings.project_dir = Some(project.display().to_string());
         settings.kernel_home = Some(root.0.display().to_string());
 
-        let roots = plan_roots(&settings);
+        let roots = plan_roots(&settings, None);
         let listed = collect_plans(&roots);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].source, "project");
@@ -535,7 +601,7 @@ mod tests {
 
         let mut settings = Settings::default();
         settings.kernel_home = Some(root.0.display().to_string());
-        let roots = plan_roots(&settings);
+        let roots = plan_roots(&settings, None);
         assert!(roots.iter().all(|(_, p)| p != &data.join("plans") && !p.starts_with(&outside.0)));
         assert!(collect_plans(&roots).is_empty() || collect_plans(&roots).iter().all(|p| !p.path.contains("leak")));
     }

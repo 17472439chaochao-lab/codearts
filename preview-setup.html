@@ -9,8 +9,10 @@
     /preview-setup.html?state=cred 装了 CLI、缺凭据
     /preview-setup.html?state=dir  只差项目目录
     /preview-setup.html?state=ready 三项齐了（进主界面，作对照）
-      设置 → 「模型」页签能验第三方接入：内存里预置一家 openai，/provider 会按这份配置拼出模型，
-      新增/编辑/删除后回会话界面重开模型下拉即可看到多出来的条目；「重启内核」按钮走 kernel_stop→kernel_start
+      设置 → 「模型」页签能验第三方接入：内存里预置 openai（3 个模型）与 agnes-ai，/provider 演的是内核真实装载规则：
+      启动时整份灌进去的模型删不掉、改 limit 也不生效，只有新增模型和删掉整家提供商能靠重载刷出来，新标识只认 kernel_start；
+      保存/移除后会自动重载实例并回读对账，对不上账就出「重启内核」按钮；
+      把 window.__busy 设成非空可以验「有会话正在出活」那条降级路径
     /preview-setup.html?state=task 内核在线，会话正在跑 task 子任务
       进主界面后点侧栏「示例会话 A」，再用 window.__replay(400) 放子会话的事件帧；
       待决区还会带一张子会话的授权卡和反问卡，window.__kidPend(600) 看它们实时弹出来
@@ -76,6 +78,8 @@
           options: { baseURL: "https://api.openai.com/v1", apiKey: "enc:v3:P4BfhY4J8kz" },
           models: {
             "gpt-4o-mini": { id: "GPT-4o mini", limit: { context: 128000, output: 16384 } },
+            "gpt-4o": { id: "GPT-4o", limit: { context: 128000, output: 16384 } },
+            "o4-mini": { id: "o4-mini", limit: { context: 200000, output: 100000 } },
           },
         },
         "agnes-ai": {
@@ -107,6 +111,19 @@
         Object.entries(customs)
           .sort(([a], [b]) => a.localeCompare(b))
           .map(([id, e]) => viewOf(id, e));
+      /**
+       * 26.9.26 实测（隔离内核，逐条对过 /provider 与 /config）：提供商的模型清单在 serve
+       * 启动时整份灌进内核，之后重载工作区实例只做增量——
+       *   新增模型、删掉整家提供商 → 重载立刻生效；
+       *   删掉启动时就存在的模型、改它的 limit、新接一个提供商标识 → 只能重启内核。
+       * 预览台照这个演：运行态 = 启动时那份快照 ∪ 配置里新冒出来的模型（快照里的条目优先），
+       * 提供商不在启动快照里就干脆不出现；kernel_start 时重记快照。
+       */
+      const snapshotModels = () =>
+        Object.fromEntries(
+          Object.entries(customs).map(([id, e]) => [id, JSON.parse(JSON.stringify(e.models ?? {}))]),
+        );
+      let bootFrozen = healthy ? snapshotModels() : {};
       // 内核会把明文密钥就地加密回写，预览台跟着演一遍
       let kernelUp = healthy;
       // 真内核每次 start 都换新端口，壳侧全靠这个变化触发 /provider 重拉
@@ -466,6 +483,71 @@ class OldExportController
         "database/migrations/2026_10_16_role_exclusive.php": migrationCode,
         "app/Http/Controllers/OldExportController.php": oldController,
         "CHANGELOG.md": changelog,
+      };
+      /** 第二个区：用来验「点开别的区的会话，资源管理器要跟着换根」 */
+      const otherReadme = "# other\n\n另一个工作区，跟 demo 那套商户角色互斥没有关系。\n";
+      const otherNote = "# 待办\n\n- 把导出脚本的旧入口拆掉\n";
+      const otherTree = {
+        "": [
+          { name: "notes", path: "notes", dir: true, size: 0, mtime: now },
+          { name: "README.md", path: "README.md", dir: false, size: otherReadme.length, mtime: now },
+        ],
+        notes: [{ name: "todo.md", path: "notes/todo.md", dir: false, size: otherNote.length, mtime: now }],
+      };
+      const otherFiles = {
+        "README.md": otherReadme,
+        "notes/todo.md": otherNote,
+      };
+      /**
+       * /find/file 的模糊匹配按子序列走（内核那侧是 ripgrep/fuzzy 索引），
+       * /find 的 submatch 偏移是 UTF-8 字节下标，mock 也照这个口径造，才能验到中文行的切片。
+       */
+      const demoUtf8 = new TextEncoder();
+      const demoPaths = Object.keys(demoFiles);
+      const demoIsSub = (s, k) => {
+        let i = 0;
+        for (const c of s) {
+          if (c === k[i]) i += 1;
+          if (i === k.length) return true;
+        }
+        return !k.length;
+      };
+      const demoFindFiles = (query, limit) => {
+        const k = (query ?? "").toLowerCase();
+        return demoPaths.filter((p) => demoIsSub(p.toLowerCase(), k)).slice(0, limit || 40);
+      };
+      const demoFindText = (pattern) => {
+        let re;
+        try {
+          re = new RegExp(pattern, "g");
+        } catch {
+          return [];
+        }
+        const out = [];
+        for (const [rel, text] of Object.entries(demoFiles)) {
+          text.split("\n").forEach((raw, i) => {
+            re.lastIndex = 0;
+            const subs = [];
+            let m;
+            while ((m = re.exec(raw)) !== null) {
+              subs.push({
+                match: { text: m[0] },
+                start: demoUtf8.encode(raw.slice(0, m.index)).length,
+                end: demoUtf8.encode(raw.slice(0, m.index + m[0].length)).length,
+              });
+              if (m.index === re.lastIndex) re.lastIndex += 1;
+            }
+            if (subs.length)
+              out.push({
+                path: { text: rel },
+                lines: { text: `${raw}\n` },
+                line_number: i + 1,
+                absolute_offset: 0,
+                submatches: subs,
+              });
+          });
+        }
+        return out;
       };
       /** 文件栏「计划」页签：内核规划模式、内核数据目录、技能自建目录各来一份 */
       const demoPlanWorkspace = {
@@ -917,6 +999,14 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
       mockIPC((cmd, payload) => {
         if (cmd === "api_request") {
           const path = payload?.path ?? "";
+          const query = new URLSearchParams(path.includes("?") ? path.split("?")[1] : "");
+          // —— 内核检索（/find/file、/find）与 Git 分支（/vcs）——
+          if (payload?.method === "GET" && path.startsWith("/find/file"))
+            return demoFindFiles(query.get("query") ?? "", Number(query.get("limit") ?? 40));
+          if (payload?.method === "GET" && path.startsWith("/find?"))
+            return demoFindText(query.get("pattern") ?? "");
+          if (payload?.method === "GET" && path === "/vcs")
+            return window.__vcs ?? { branch: "main", default_branch: "master" };
           if (payload?.method === "GET" && path === "/session")
             return [
               sess(PARENT, { time: { created: now - 90000, updated: now } }),
@@ -1099,23 +1189,29 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
                     },
                   },
                 },
-                // 第三方那份按盘上配置拼出来：模型 id 用键名，显示名走 id 字段，图片一律算不支持
-                ...providersView().map((p) => ({
-                  id: p.id,
-                  name: p.name,
-                  source: "config",
-                  models: Object.fromEntries(
-                    p.models.map((m) => [
-                      m.id,
-                      {
-                        id: m.id,
-                        name: m.name,
-                        limit: { context: m.context, output: m.output },
-                        capabilities: { reasoning: m.reasoning, input: { image: false } },
-                      },
-                    ]),
-                  ),
-                })),
+                // 第三方那份按内核运行态拼：启动快照里的条目原样保留（删不掉、改 limit 也不生效），
+                // 配置里新冒出来的模型才补得进来；没在启动快照里的标识干脆不出现，只能重启内核
+                ...Object.keys(bootFrozen)
+                  .filter((id) => customs[id])
+                  .map((id) => {
+                    const merged = { ...(customs[id].models ?? {}), ...bootFrozen[id] };
+                    return {
+                      id,
+                      name: customs[id].name || id,
+                      source: "config",
+                      models: Object.fromEntries(
+                        Object.entries(merged).map(([mid, m]) => [
+                          mid,
+                          {
+                            id: mid,
+                            name: m?.id || mid,
+                            limit: { context: m?.limit?.context ?? 0, output: m?.limit?.output ?? 0 },
+                            capabilities: { reasoning: m?.reasoning === true, input: { image: false } },
+                          },
+                        ]),
+                      ),
+                    };
+                  }),
               ],
               default: { "huaweicloud-maas": "deepseek-v3" },
             };
@@ -1133,6 +1229,11 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           if (payload?.method === "GET" && path === "/skill") return [];
           if (payload?.method === "GET" && path === "/v1/skills") return { count: 0, skills: [] };
           if (payload?.method === "GET" && path === "/mcp") return {};
+          // 实例重载：真内核 27ms 回 {}，不换进程、会话不丢；这里记账供断言
+          if (payload?.method === "POST" && path.startsWith("/cag/instance/reload")) {
+            window.__reloaded = (window.__reloaded ?? 0) + 1;
+            return {};
+          }
           return null;
         }
         if (cmd === "env_check")
@@ -1152,7 +1253,7 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           if (mode === "error") throw new Error("模拟 OCR 失败");
           return window.__ocrText ?? "预览台 OCR：这是从截图里识别出的文字";
         }
-        if (cmd === "plugin:app|version") return "0.1.2";
+        if (cmd === "plugin:app|version") return "0.1.3";
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;
         if (cmd === "settings_save") {
@@ -1246,12 +1347,15 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
         if (cmd === "files_list") {
           if (!hasDir) return { entries: [], truncated: false };
           const rel = payload?.rel ?? "";
-          return { entries: demoTree[rel] ?? [], truncated: false };
+          // Rust 侧按 directory 参数解析根（只认登记过的工作区），别的区的会话要看自己那个区的树
+          const tree = payload?.directory === otherDir ? otherTree : demoTree;
+          return { entries: tree[rel] ?? [], truncated: false };
         }
         if (cmd === "file_read") {
           const rel = payload?.rel ?? "";
-          if (!(rel in demoFiles)) throw new Error(`路径不存在：${rel}`);
-          const content = demoFiles[rel];
+          const files = payload?.directory === otherDir ? otherFiles : demoFiles;
+          if (!(rel in files)) throw new Error(`路径不存在：${rel}`);
+          const content = files[rel];
           return {
             content,
             binary: false,
@@ -1260,7 +1364,8 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
             mtime: now,
           };
         }
-        if (cmd === "plans_list") return hasDir ? demoPlans : [];
+        if (cmd === "plans_list")
+          return hasDir ? (payload?.directory === otherDir ? [] : demoPlans) : [];
         if (cmd === "plan_read") {
           const path = payload?.path ?? "";
           const content = demoPlanFiles[path];
@@ -1276,6 +1381,8 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
         if (cmd === "kernel_start") {
           kernelUp = healthy;
           kernelPort += 1;
+          // 启动时扫一次配置里的 provider 段：新标识要走到这一步才进 /provider
+          bootFrozen = snapshotModels();
           return statusOf();
         }
         if (cmd === "kernel_stop") {

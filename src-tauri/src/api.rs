@@ -11,8 +11,8 @@ use crate::settings::Settings;
 /// 代理只放行这些前缀。`/global/dispose` 不给 WebView，只由壳自己在停内核时调用。
 const ALLOW_PREFIXES: &[&str] = &[
     "/global/health", "/session", "/permission", "/question", "/provider", "/config",
-    "/agent", "/command", "/skill", "/mcp", "/path", "/project", "/file", "/find", "/v1/", "/cag/",
-    "/sandbox", "/whitelist", "/doc",
+    "/agent", "/command", "/skill", "/mcp", "/path", "/project", "/file", "/find", "/vcs", "/v1/",
+    "/cag/", "/sandbox", "/whitelist", "/doc",
 ];
 
 pub fn check_path(path: &str) -> Result<()> {
@@ -284,6 +284,10 @@ mod tests {
         assert!(check_path("/session/abc").is_ok());
         assert!(check_path("/session?q=..").is_ok());
         assert!(check_path("/v1/chat").is_ok());
+        assert!(check_path("/find?pattern=x").is_ok());
+        assert!(check_path("/find/file?query=x").is_ok());
+        assert!(check_path("/vcs").is_ok());
+        assert!(check_path("/vcs-extra").is_err());
         assert!(check_path("/session-extra").is_err());
         assert!(check_path("/global/dispose").is_err());
         assert!(check_path("/global/disposeXXX").is_err());

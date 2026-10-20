@@ -37,8 +37,8 @@
 | `skills.*` | 6 | 技能创建/删除/批量改/云端同步 | 仅只读 |
 | `model.*` | 8 | 模型增删改、校验、禁用 | 未接 |
 | `rules.*` | 5 | 项目/用户/云端规则 CRUD | 未接 |
-| `project.*` / `vcs.*` / `worktree.*` | 10 | Git 初始化、分支信息、工作树 | 未接 |
-| `file.*` / `find.*` | 6 | 文件读写、模糊找文件、全文搜索、符号 | 未接（Rust 自己实现了文件树） |
+| `project.*` / `vcs.*` / `worktree.*` | 10 | Git 初始化、分支信息、工作树 | 仅 `GET /vcs`（标题栏分支），其余未接 |
+| `file.*` / `find.*` | 6 | 文件读写、模糊找文件、全文搜索、符号 | 找文件/全文搜索已接入；符号未接（LSP 关闭） |
 | `docgen.*` / `evolve.*` / `im.*` / `global.*` | 21 | 文档生成、自进化、IM 数字分身、全局配置/事件/升级 | 仅 health/dispose |
 
 ## 3. 建议接入的功能
@@ -64,10 +64,10 @@
 
 | # | 功能 | 接口 | 建议 UI |
 | --- | --- | --- | --- |
-| 11 | **快速打开文件** | `GET /find/file?query=&type=file&limit=`（已验证） | `Cmd+P` 模糊搜索，回车在 `FileViewer` 打开 |
-| 12 | **工作区全文搜索** | `GET /find?pattern=`（已验证，返回 path/lines/line_number/submatches） | `Cmd+Shift+F` 结果面板，点击跳到对应行 |
+| 11 | **快速打开文件** | `GET /find/file?query=&type=file&limit=` | ✅ 已接入：`Cmd+P` / 标题栏按钮，模糊搜索，回车在 `FileViewer` 打开（`Files.tsx` 的 `QuickOpen`） |
+| 12 | **工作区全文搜索** | `GET /find?pattern=` | ✅ 已接入：资源管理器「搜索」页签，`Cmd+Shift+F` 聚焦，点击跳到对应行。**该接口没有服务端条数上限**，壳侧限 300 行 + 350ms 防抖；`submatches.start/end` 是**行内 UTF-8 字节偏移**，不是 JS 下标，高亮前必须换算 |
 | 13 | **文件内容 / 变更状态** | `GET /file/content?path=`、`GET /file/status`（已验证） | 现有 Rust 读取保留；搜索跳转和“内核眼里的变更”用这两个接口对齐 |
-| 14 | **Git 分支 / 变更** | `GET /vcs`（已验证 `{branch, default_branch}`） | 标题栏或状态条显示当前分支；`vcs.diff` 可做“本次会话之外”的改动视图 |
+| 14 | **Git 分支 / 变更** | `GET /vcs`（已验证 `{branch, default_branch}`） | ✅ 分支已接入：标题栏分支胶囊，切工作区/会话跑动时刷新，非 Git 目录不显示（`api.rs` 白名单加了 `/vcs`）。`vcs.diff` 可做“本次会话之外”的改动视图，未接 |
 | 15 | **符号跳转 / LSP** | `GET /find/symbol?query=`、`GET /lsp`、`GET /cag/codebase/v1/lsp` | 需要先把配置里的 `lsp:false` 打开；本机当前 LSP 是关闭的，符号搜索返回空 |
 
 > 全文搜索和快速打开是投入产出比最高的一组：内核已经用 ripgrep 做好了索引和 ignore 规则，壳子不需要自己遍历工作区。
@@ -129,12 +129,11 @@
 ### 4.1 代理白名单
 
 `src-tauri/src/api.rs:12` 目前允许：
-`/global/health`、`/session`、`/permission`、`/question`、`/provider`、`/config`、`/agent`、`/command`、`/skill`、`/mcp`、`/path`、`/project`、`/file`、`/find`、`/v1/`、`/cag/`、`/sandbox`、`/whitelist`、`/doc`。
+`/global/health`、`/session`、`/permission`、`/question`、`/provider`、`/config`、`/agent`、`/command`、`/skill`、`/mcp`、`/path`、`/project`、`/file`、`/find`、`/vcs`、`/v1/`、`/cag/`、`/sandbox`、`/whitelist`、`/doc`。
 
-接新功能需要补的前缀：
+接新功能还需要补的前缀（`/vcs` 已于 26.10.20 补上）：
 
 ```text
-/vcs          # 分支信息、vcs diff
 /lsp          # LSP 状态
 /formatter    # 格式化状态
 /pty          # 终端
@@ -203,8 +202,8 @@
 1. 回退/重做 + pre-revert 预览
 2. 消息分叉
 3. 会话搜索 + 总数
-4. `Cmd+P` 快速打开 + `Cmd+Shift+F` 全文搜索
-5. 分支名显示（`/vcs`）
+4. ~~`Cmd+P` 快速打开 + `Cmd+Shift+F` 全文搜索~~ 已完成（26.10.20，走内核 ripgrep）
+5. ~~分支名显示（`/vcs`）~~ 已完成（26.10.20）
 
 **迭代 2（3～5 天）**
 6. 服务端斜杠命令 + `!` shell + 侧问

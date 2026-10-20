@@ -22,6 +22,7 @@ import {
   permissions,
   questions,
   sessions,
+  vcs,
   type AgentInfo,
   type BashMode,
   type CommandInfo,
@@ -38,9 +39,10 @@ import {
   type Session,
   type Todo,
   type ToolState,
+  type VcsInfo,
 } from "./kernelApi";
 import { APP_TITLE, useAppVersion, type KernelStatus } from "./App";
-import { FilePanel, FileViewer, relInRoot, type OpenFile } from "./Files";
+import { FilePanel, FileViewer, QuickOpen, relInRoot, type OpenFile } from "./Files";
 
 type Props = {
   projectDir: string;
@@ -53,6 +55,8 @@ type Props = {
   onAddDir: () => void;
   onSwitchDir: (dir: string) => void;
   onDropDir: (dir: string) => void;
+  /** 设置页同步过第三方模型：免重启的那条路不换端口，靠这个计数触发重拉 */
+  provTick: number;
   onOpenSettings: () => void;
 };
 
@@ -251,6 +255,7 @@ export default function Chat({
   onAddDir,
   onSwitchDir,
   onDropDir,
+  provTick,
   onOpenSettings,
 }: Props) {
   const live = status?.healthy ?? false;
@@ -378,6 +383,12 @@ export default function Chat({
   const [fileView, setFileView] = useState<OpenFile | null>(null);
   /** 当前会话的文件改动（内核 `/session/:id/diff`，带 before/after 全文） */
   const [sessionDiffs, setSessionDiffs] = useState<FileDiff[]>([]);
+  /** ⌘P 快捷打开浮层 */
+  const [quickOpen, setQuickOpen] = useState(false);
+  /** 递增一次 = 让文件栏切到搜索页签并聚焦输入框（⌘⇧F） */
+  const [searchTick, setSearchTick] = useState(0);
+  /** 当前工作区的 Git 分支；内核 /vcs 在非 git 目录回空对象，那时不显示 */
+  const [branch, setBranch] = useState<VcsInfo | null>(null);
 
   /**
    * 每个工作区各发一次 `GET /session`（带各自的 x-opencode-directory）。
@@ -447,7 +458,7 @@ export default function Chat({
       alive = false;
       window.clearTimeout(rejectTimer);
     };
-  }, [live, dir, status?.port]);
+  }, [live, dir, status?.port, provTick]);
 
   // 事前授权策略：内核落盘在 cli-data/storage/permission/，读一次就够，切工作区不用重设
   useEffect(() => {
@@ -493,6 +504,12 @@ export default function Chat({
   const activeSess = list.find((s) => s.id === active) ?? null;
   /** 当前会话归属的区；没打开会话时为 null，读写都退回界面当前区 */
   const wsOf = active ? dirOf(active) : null;
+  /**
+   * 界面右侧一切（资源管理器、快速打开、文件大窗、分支）都跟着会话所在的区走。
+   * 免重启切区之后跨区会话是能直接对话的，右侧还钉在界面当前区就会出现
+   * "点在别的区的会话、翻的却是原来那个区的文件"这种错位。
+   */
+  const wsDir = wsOf ?? dir;
   const wsOfRef = useRef(wsOf);
   wsOfRef.current = wsOf;
   // 子会话可能还没进 list（noteKid 先到），activeSess 找不到时也要按子会话处理
@@ -500,6 +517,51 @@ export default function Chat({
   /** 跨工作区也能直接对话：只有子会话（只读展示）才禁编辑 */
   const readOnly = !!active && isChild;
   const busy = !!active && busySet.has(active);
+
+  // 换到别的区的会话时，底下那个文件大窗已经不属于这个根了，直接关掉，别让它继续按新根去解析旧相对路径
+  useEffect(() => {
+    setFileView(null);
+  }, [wsDir]);
+
+  // 分支是工作区的属性：换区、点开别的区的会话、内核上下线、每轮起停各取一次（内核现读 git，很便宜）
+  useEffect(() => {
+    if (!live || !wsDir) {
+      setBranch(null);
+      return;
+    }
+    let alive = true;
+    vcs
+      .info(wsDir)
+      .then((r) => {
+        if (alive) setBranch(r);
+      })
+      .catch(() => {
+        // 拿不到就不显示分支，别在顶栏挂个错误条
+        if (alive) setBranch(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [wsDir, live, busy]);
+
+  /** ⌘P 快捷打开 / ⌘⇧F 全文搜索；内核没起来时不接管，免得按一下就把它拉起来 */
+  useEffect(() => {
+    if (!live) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (!e.metaKey || e.altKey || e.isComposing) return;
+      const k = e.key.toLowerCase();
+      if (k === "p" && !e.shiftKey) {
+        e.preventDefault();
+        setQuickOpen((v) => !v);
+      } else if (k === "f" && e.shiftKey) {
+        e.preventDefault();
+        showFiles();
+        setSearchTick((t) => t + 1);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [live]);
   const selectedModel = model
     ? models.find((m) => m.providerID === model.providerID && m.modelID === model.modelID)
     : undefined;
@@ -1671,7 +1733,6 @@ export default function Chat({
   const ofWs = (p: string) => list.filter((s) => sameDir(s.directory, p));
   const turns = msgs.filter((m) => m.info.role === "user");
   const lastRea = lastReasoning(msgs);
-  const tot = totals(msgs);
   /** 每轮小结的底账：切轮、数步、给每步拉一行摘要，详见 turnsOf */
   const { stat: turnStat, owner: turnOf } = turnsOf(msgs, busy);
   /** 全完成的旧清单不该在新一轮里继续悬浮，等内核写新清单再出现 */
@@ -1787,19 +1848,29 @@ export default function Chat({
     });
   }
 
-  /** 文件大窗只读当前工作区的文件；跨区会话的改动请先切过去。计划文件由 files.rs 单独限定根目录 */
+  /** ⌘⇧F 要用：展开文件栏并记住，别只改这一次渲染的状态 */
+  function showFiles() {
+    setFilesOpen(true);
+    try {
+      localStorage.setItem(FILES_KEY, "1");
+    } catch {
+      // 同上
+    }
+  }
+
+  /** 文件大窗只读它那个区的文件（root 已跟着会话走）；越界的仍然拦掉。计划文件由 files.rs 单独限定根目录 */
   function openWorkspaceFile(f: OpenFile) {
-    if (!f.plan && relInRoot(dir, f.abs) === null) {
-      setToast("这个文件不在当前工作区，切到对应工作区后再查看");
+    if (!f.plan && relInRoot(wsDir, f.abs) === null) {
+      setToast("这个文件不在当前会话的工作区里，无法在应用内预览");
       return;
     }
     setFileView(f);
   }
 
   function openDiffFile(d: FileDiff) {
-    const rel = relInRoot(dir, d.file);
+    const rel = relInRoot(wsDir, d.file);
     if (rel === null) {
-      setToast("该改动属于其他工作区，切过去后再查看");
+      setToast("这条改动不在当前会话的工作区里，无法在应用内预览");
       return;
     }
     setFileView({ rel, abs: d.file, tab: "diff" });
@@ -2084,16 +2155,27 @@ export default function Chat({
           <span className="muted">
             {live ? `内核在线 · ${status?.version}` : "内核未运行"}
           </span>
-          {!!active && (tot.input || tot.output) && (
+          {branch?.branch && (
             <span
-              className="stat"
-              title={`${turns.length} 轮对话 · ${tot.steps} 次助手回复 · 输入是各步累计（每步都会重发上下文）`}
+              className="branch"
+              title={`Git 分支 ${branch.branch} · ${baseName(wsDir)}${
+                branch.default_branch && branch.default_branch !== branch.branch
+                  ? ` · 默认 ${branch.default_branch}`
+                  : ""
+              }`}
             >
-              累计 · 输入 {fmtNum(tot.input)} · 输出 {fmtNum(tot.output)}
-              {tot.reasoning ? ` · 思考 ${fmtNum(tot.reasoning)}` : ""}
-              {tot.peak ? ` · 峰值上下文 ${fmtNum(tot.peak)}` : ""}
-              {tot.cost ? ` · 成本 ${fmtNum(tot.cost, 4)}` : ""}
-              {tot.ms ? ` · ${fmtDur(tot.ms)}` : ""}
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M6 3v12M18 9a9 9 0 0 1-9 9"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                />
+                <circle cx="18" cy="6" r="3" fill="none" stroke="currentColor" strokeWidth="2" />
+                <circle cx="6" cy="18" r="3" fill="none" stroke="currentColor" strokeWidth="2" />
+              </svg>
+              {branch.branch}
             </span>
           )}
           <button
@@ -2116,6 +2198,24 @@ export default function Chat({
                 fill="none"
                 stroke="currentColor"
                 strokeWidth="1.4"
+                strokeLinecap="round"
+              />
+            </svg>
+          </button>
+          <button
+            className="ico-btn"
+            onClick={() => setQuickOpen(true)}
+            disabled={!live}
+            title="按文件名打开文件（⌘P）"
+            aria-label="按文件名打开文件"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" strokeWidth="2" />
+              <path
+                d="M20 20l-3.6-3.6"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
                 strokeLinecap="round"
               />
             </svg>
@@ -2544,10 +2644,11 @@ export default function Chat({
 
       {filesOpen && (
         <FilePanel
-          root={dir}
+          root={wsDir}
           session={activeSess}
           diffs={sessionDiffs}
           pulse={editPulse}
+          focusSearch={searchTick}
           onOpenFile={openWorkspaceFile}
           onRefreshDiffs={reloadDiffs}
           onClose={toggleFiles}
@@ -2556,12 +2657,23 @@ export default function Chat({
 
       {fileView && (
         <FileViewer
-          root={dir}
+          root={wsDir}
           file={fileView}
           startTab={fileView.tab}
           diffs={sessionDiffs}
           pulse={editPulse}
           onClose={() => setFileView(null)}
+        />
+      )}
+
+      {quickOpen && (
+        <QuickOpen
+          root={wsDir}
+          onClose={() => setQuickOpen(false)}
+          onPick={(rel) => {
+            setQuickOpen(false);
+            setFileView({ rel, abs: `${wsDir.replace(/\/+$/, "")}/${rel}`, tab: "preview" });
+          }}
         />
       )}
 
@@ -2858,35 +2970,8 @@ function usage(info: MessageInfo): string {
   return bits.length > 1 ? bits.join(" · ") : "";
 }
 
-/**
- * 会话级累计。注意 `tokens.input` 是每一步的整段上下文（每步都会重发），
- * 所以"累计输入"是计费口径而不是工作量；真正的工作量看输出，上下文压力看峰值。
- */
-function totals(msgs: Message[]) {
-  const sum = { input: 0, output: 0, reasoning: 0, cost: 0, ms: 0, steps: 0, peak: 0 };
-  for (const m of msgs) {
-    if (m.info.role !== "assistant") continue;
-    const t = m.info.tokens ?? {};
-    const n = (x: unknown) => (typeof x === "number" && x > 0 ? x : 0);
-    sum.input += n(t.input);
-    sum.output += n(t.output);
-    sum.reasoning += n(t.reasoning);
-    sum.cost += n(m.info.cost);
-    sum.peak = Math.max(sum.peak, n(t.total), n(t.input) + n(t.cache?.read));
-    if (m.info.time?.completed && m.info.time?.created)
-      sum.ms += Math.max(0, m.info.time.completed - m.info.time.created);
-    sum.steps++;
-  }
-  return sum;
-}
-
 const fmtNum = (n: number, frac = 0) =>
   n.toLocaleString("zh-CN", { maximumFractionDigits: frac });
-
-const fmtDur = (ms: number) => {
-  const s = Math.round(ms / 1000);
-  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}分${String(s % 60).padStart(2, "0")}秒`;
-};
 
 /** 只有最新一段思考自动展开，否则一轮十几段思考能把正文顶出屏 */
 function lastReasoning(msgs: Message[]): string | null {

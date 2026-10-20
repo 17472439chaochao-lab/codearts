@@ -58,6 +58,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  // 改完第三方模型后让 Chat 重拉一次 /provider：免重启的同步不改端口，靠这个计数触发
+  const [provTick, setProvTick] = useState(0);
   // 进工作区要拉起内核，这几秒界面不能操作；进度卡告诉用户在干什么（切工作区已经不重启了）
   const [switching, setSwitching] = useState<{
     dir: string;
@@ -186,6 +188,7 @@ export default function App() {
           onAddDir={addDir}
           onSwitchDir={switchDir}
           onDropDir={dropDir}
+          provTick={provTick}
           onOpenSettings={() => setShowSettings(true)}
         />
       ) : (
@@ -209,6 +212,7 @@ export default function App() {
           onStart={start}
           onStop={stop}
           onChanged={refresh}
+          onModelChange={() => setProvTick((t) => t + 1)}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -479,6 +483,7 @@ function Settings({
   onStart,
   onStop,
   onChanged,
+  onModelChange,
   onClose,
 }: {
   check: EnvCheck | null;
@@ -489,6 +494,8 @@ function Settings({
   onStart: () => Promise<void>;
   onStop: () => Promise<void>;
   onChanged: () => Promise<void> | void;
+  /** 第三方模型列表同步进内核后通知外层，Chat 那边要重拉 /provider */
+  onModelChange: () => void;
   onClose: () => void;
 }) {
   const [ak, setAk] = useState("");
@@ -631,6 +638,7 @@ function Settings({
               dir={dir}
               healthy={!!status?.healthy}
               port={status?.port ?? null}
+              onModelChange={onModelChange}
               onRestart={async () => {
                 await onStop();
                 await onStart();
@@ -981,27 +989,84 @@ function formOf(p: CustomProvider): ModelForm {
   };
 }
 
+type LiveProviders = ReturnType<typeof normalizeProviders>;
+
+/** 一次模型配置操作；models 是这次想在内核里见到的模型清单，移除提供商时为空 */
+type ModelOp = { id: string; kind: "save" | "remove"; models: { id: string; context: number }[] };
+
+/** 还没同步进内核的那次操作；why 决定收尾给「重载内核」还是「重启内核」 */
+type PendingOp = ModelOp & { why: "sync" | "boot" };
+
+/**
+ * 拿内核运行态的模型和配置里想要的逐一对账。
+ * 2026-10-20 隔离实例实测：提供商的模型表在启动时整份灌进内核，重载只做增量——
+ * 新模型能补进来、整家提供商能删掉，但启动时就有的一篇都刷不掉（删掉、改 limit 都一样）。
+ */
+function modelGap(op: ModelOp, live: LiveProviders) {
+  const got = live.models.filter((m) => m.providerID === op.id);
+  const wantIds = new Set(op.models.map((m) => m.id));
+  const gotIds = new Set(got.map((m) => m.modelID));
+  const stale = got.filter((m) => !wantIds.has(m.modelID)).map((m) => m.modelID);
+  const missing = op.models.filter((m) => !gotIds.has(m.id)).map((m) => m.id);
+  const edited = op.models
+    .filter((m) => {
+      const g = got.find((x) => x.modelID === m.id);
+      return g != null && typeof g.context === "number" && g.context !== m.context;
+    })
+    .map((m) => m.id);
+  return { stale, missing, edited };
+}
+
+/** 对账结果里挑出对不上内核的那些，逐条说清楚 */
+function gapText(g: ReturnType<typeof modelGap>) {
+  const list = (ids: string[]) =>
+    ids.slice(0, 3).join("、") + (ids.length > 3 ? ` 等 ${ids.length} 个` : "");
+  const bits: string[] = [];
+  if (g.stale.length) bits.push(`已删除的 ${list(g.stale)} 还挂在列表里`);
+  if (g.missing.length) bits.push(`新增的 ${list(g.missing)} 还没装载`);
+  if (g.edited.length) bits.push(`${list(g.edited)} 的参数改动没生效`);
+  return bits.join("；");
+}
+
+/** 收尾文案集中在这儿：自动同步和点按钮重试共用同一套说法 */
+function notice(op: ModelOp, how: "off" | "busy" | "boot" | "ok" | "err", detail?: string) {
+  const wrote = op.kind === "save" ? "已写入内核配置" : `已移除「${op.id}」`;
+  if (how === "off") return `${wrote}；内核没在跑，下次启动内核时生效`;
+  if (how === "busy") return `${wrote}；有会话正在出活，先等它空闲再点「重载内核」`;
+  if (how === "boot")
+    return `${wrote}；${detail ?? "内核的模型列表还没对上"}。重载只能补新模型，删掉和改过的要重启内核才会刷新`;
+  if (how === "ok")
+    return op.kind === "save" ? `${wrote}，模型列表已经对上，下拉框现在就能选` : wrote;
+  return `${wrote}；内核同步失败：${detail ?? "未知错误"}`;
+}
+
 /**
  * 模型页：上半是内核此刻真正可用的模型，下半是接第三方提供商。
- * 写的是内核自己的全局配置文件，改完必须重启 serve 才会进 /provider。
+ * 写的是内核自己的全局配置文件。2026-10-20 隔离实例实测出的免重启边界：
+ * 新增模型、删掉整家提供商靠重载工作区实例就立刻生效（serve 进程不换、会话不丢）；
+ * 但删掉启动时就存在的模型、改它的参数、或新接一家提供商都得重启内核。
+ * 所以每次保存/移除都回读 /provider 逐模型对账，对不上就把按钮换成「重启内核」。
  */
 function ModelSettings({
   dir,
   healthy,
   port,
   onRestart,
+  onModelChange,
 }: {
   dir: string | null;
   healthy: boolean;
   port: number | null;
   onRestart: () => Promise<void>;
+  onModelChange: () => void;
 }) {
   const [custom, setCustom] = useState<CustomProvider[] | null>(null);
-  const [live, setLive] = useState<ReturnType<typeof normalizeProviders>>({ models: [], default: null });
+  const [live, setLive] = useState<LiveProviders>({ models: [], default: null });
   const [form, setForm] = useState<ModelForm | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [stale, setStale] = useState(false);
+  /** 内核还没同步的那次操作：忙 → 重载内核，新标识 → 重启内核 */
+  const [pending, setPending] = useState<PendingOp | null>(null);
   const [working, setWorking] = useState(false);
 
   const reload = useCallback(
@@ -1020,15 +1085,19 @@ function ModelSettings({
     void reload();
   }, [reload]);
 
+  const fetchLive = useCallback(
+    () =>
+      !healthy || !dir
+        ? Promise.resolve({ models: [], default: null } as LiveProviders)
+        : api<any>("GET", "/provider", undefined, dir).then(normalizeProviders),
+    [healthy, dir],
+  );
+
   useEffect(() => {
-    if (!healthy || !dir) {
-      setLive({ models: [], default: null });
-      return;
-    }
-    api<any>("GET", "/provider", undefined, dir)
-      .then((r) => setLive(normalizeProviders(r)))
+    fetchLive()
+      .then(setLive)
       .catch(() => setLive({ models: [], default: null }));
-  }, [healthy, dir, port]);
+  }, [fetchLive, port]);
 
   function applyPreset(id: string) {
     const p = PRESETS.find((x) => x.id === id);
@@ -1040,6 +1109,55 @@ function ModelSettings({
     setForm((f) =>
       f ? { ...f, models: f.models.map((r, j) => (j === i ? { ...r, ...patch } : r)) } : f,
     );
+  }
+
+  /**
+   * 落盘之后把配置同步进内核：空闲就重载工作区实例（实测 serve 进程不换、会话不丢），
+   * 再回读 /provider 逐模型对账。对不上就说明碰上了启动时才刷新的那批（删掉的、改过参数的、
+   * 新提供商标识），只能重启。
+   */
+  async function syncKernel(op: ModelOp) {
+    setPending(null);
+    if (!healthy || !dir) {
+      setNote(notice(op, "off"));
+      return;
+    }
+    try {
+      if (await kernelBusy(dir).catch(() => false)) {
+        setPending({ ...op, why: "sync" });
+        setNote(notice(op, "busy"));
+        return;
+      }
+      await reloadInstance(dir);
+      // 实例重建要一两秒，立刻回读拿到的是旧列表
+      await new Promise((r) => setTimeout(r, 600));
+      const next = await fetchLive();
+      setLive(next);
+      onModelChange();
+      const gap = modelGap(op, next);
+      if (gap.stale.length || gap.missing.length || gap.edited.length) {
+        setPending({ ...op, why: "boot" });
+        setNote(notice(op, "boot", gapText(gap)));
+      } else {
+        setNote(notice(op, "ok"));
+      }
+    } catch (e) {
+      setPending({ ...op, why: "sync" });
+      setNote(notice(op, "err", String(e)));
+    }
+  }
+
+  /** 待同步那次操作的补救：会话在跑就再重载一次，对不上账的先重启内核再走同一套校验 */
+  async function retry() {
+    if (!pending) return;
+    const op: ModelOp = { id: pending.id, kind: pending.kind, models: pending.models };
+    setWorking(true);
+    try {
+      if (pending.why === "boot") await onRestart();
+      await syncKernel(op);
+    } finally {
+      setWorking(false);
+    }
   }
 
   async function submit() {
@@ -1065,8 +1183,11 @@ function ModelSettings({
     try {
       setCustom(await customProviders.save(draft));
       setForm(null);
-      setStale(true);
-      setNote(healthy ? "已写入内核配置，重启内核后才会进模型下拉框" : "已写入内核配置，下次启动内核生效");
+      await syncKernel({
+        id: draft.id,
+        kind: "save",
+        models: draft.models.map((m) => ({ id: m.id, context: m.context })),
+      });
     } catch (e) {
       setErr(String(e));
     }
@@ -1078,9 +1199,8 @@ function ModelSettings({
     setWorking(true);
     try {
       setCustom(await customProviders.remove(id));
-      setStale(true);
-      setNote(`已移除「${id}」，重启内核后模型下拉框里就不再出现`);
       if (form?.id === id) setForm(null);
+      await syncKernel({ id, kind: "remove", models: [] });
     } catch (e) {
       setErr(String(e));
     }
@@ -1176,6 +1296,9 @@ function ModelSettings({
       )}
 
       <h3>接入第三方模型</h3>
+      <p className="hint">
+        加模型、删掉整家提供商，保存后自动重载实例就生效；新接一家提供商、删掉或改动内核启动时就带着的模型，需要重启内核。
+      </p>
       {custom && custom.length > 0 && (
         <ul className="cap managed">
           {custom.map((p) => (
@@ -1344,36 +1467,63 @@ function ModelSettings({
               </button>
             </div>
           ))}
-          <div className="row">
-            <button onClick={() => setForm({ ...form, models: [...form.models, blankRow()] })}>
-              加一个模型
+          {/* 三个动作全收成图标靠右：加一行 / 落盘 / 关掉编辑（真删除在列表行那枚垃圾桶上） */}
+          <div className="row mfoot">
+            <button
+              className="ico-btn"
+              title="增加一个模型"
+              aria-label="增加一个模型"
+              onClick={() => setForm({ ...form, models: [...form.models, blankRow()] })}
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M8 3.4v9.2M3.4 8h9.2"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                  strokeLinecap="round"
+                />
+              </svg>
             </button>
-            <button className="primary" onClick={submit} disabled={working}>
-              保存
+            <button className="ico-btn" title="保存" aria-label="保存" onClick={submit} disabled={working}>
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M3.2 8.6l3.2 3.2L12.8 4.4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
             </button>
             <button
+              className="ico-btn"
+              title="取消编辑"
+              aria-label="取消编辑"
               onClick={() => {
                 setForm(null);
                 setErr(null);
               }}
             >
-              取消
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                  strokeLinecap="round"
+                />
+              </svg>
             </button>
           </div>
         </div>
       )}
 
-      {stale && (
+      {pending && (
         <div className="row">
-          <button
-            onClick={() =>
-              void onRestart().then(() => {
-                setStale(false);
-                setNote(null);
-              })
-            }
-          >
-            重启内核
+          <button onClick={() => void retry()} disabled={working}>
+            {pending.why === "boot" ? "重启内核" : "重载内核"}
           </button>
         </div>
       )}

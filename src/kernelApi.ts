@@ -438,3 +438,40 @@ export const mcp = {
   list: (dir?: string | null) =>
     api<Record<string, { status?: string; error?: string } | string>>("GET", "/mcp", undefined, dir),
 };
+
+/**
+ * 内核侧的 ripgrep 检索：ignore 规则、大小写、多实例目录都由内核负责，壳只传参。
+ * 实测 26.9.26：`/find/file` 认 `type`（file|directory，别的值报 invalid_value）与 `limit`，
+ * 返回相对实例目录的路径，目录项带尾斜杠；`/find` 只有 `pattern`（正则，非法正则静默回 []）
+ * 和 `include`/`path`（后两个实测在这份构建里完全不生效，传什么都不改变结果集），**没有 limit**，
+ * 宽模式在大型工程里能回几千条匹配、几 MB，前端必须自己截。
+ */
+export type FindMatch = {
+  path: { text: string };
+  /** 整行原文，带行尾 \n */
+  lines: { text: string };
+  line_number: number;
+  absolute_offset: number;
+  /** start/end 是这一行内的 UTF-8 字节偏移，不是 JS 字符串下标 */
+  submatches: { match: { text: string }; start: number; end: number }[];
+};
+
+export const find = {
+  files: (query: string, dir?: string | null, limit = 40) =>
+    api<string[]>(
+      "GET",
+      `/find/file?query=${encodeURIComponent(query)}&type=file&limit=${limit}`,
+      undefined,
+      dir,
+    ),
+  text: (pattern: string, dir?: string | null) =>
+    api<FindMatch[]>("GET", `/find?pattern=${encodeURIComponent(pattern)}`, undefined, dir),
+};
+
+/** GET /vcs：非 git 工作区内核回空对象，分支名按当前实例的目录头取 */
+export type VcsInfo = { branch?: string; default_branch?: string };
+
+export const vcs = {
+  info: (dir?: string | null) => api<VcsInfo>("GET", "/vcs", undefined, dir),
+};
+

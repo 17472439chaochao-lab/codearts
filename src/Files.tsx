@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { structuredPatch, type StructuredPatchHunk } from "diff";
-import type { FileDiff, Session } from "./kernelApi";
+import type { FileDiff, FindMatch, Session } from "./kernelApi";
+import { find } from "./kernelApi";
 import type { ThemedToken } from "./highlight";
 import { renderMarkdown } from "./markdown";
 
@@ -13,6 +14,8 @@ export type OpenFile = {
   tab: "preview" | "diff";
   /** 计划文件可以落在内核数据目录，读取走 plan_read 而不是工作区内的 file_read */
   plan?: boolean;
+  /** 全文搜索跳过来时定位并高亮的行号（1 起） */
+  line?: number;
 };
 
 type Entry = {
@@ -51,6 +54,10 @@ const MAX_DIFF_CHARS = 800_000;
 const MAX_HIGHLIGHT_CHARS = 300_000;
 /** Markdown 渲染整棵 DOM，没有虚拟滚动；超过这个长度直接给原文 */
 const MAX_MD_CHARS = 300_000;
+/** 全文搜索一页最多渲染多少条匹配（内核不截，WebView 得自己收） */
+const SEARCH_ROWS = 300;
+/** 快捷打开的结果条数 */
+const QUICK_LIMIT = 40;
 const isMd = (rel: string) => /\.md$/i.test(rel);
 
 const trimSlash = (p: string) => p.replace(/\/+$/, "");
@@ -73,6 +80,50 @@ function fmtSize(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * 内核 `/find` 的 submatch 偏移是 ripgrep 的 UTF-8 字节下标；
+ * 行内有非 ASCII 时字节下标和 JS 下标会错开（实测「资源管理器」差 4），先换成字符下标再切片。
+ */
+function charRanges(line: string, subs: FindMatch["submatches"]): [number, number][] {
+  if (!subs.length) return [];
+  const bytes = new TextEncoder().encode(line);
+  const dec = new TextDecoder();
+  const at = (n: number) => dec.decode(bytes.subarray(0, Math.min(n, bytes.length))).length;
+  return subs.map((s) => [at(s.start), at(s.end)]);
+}
+
+/** 按文件分组：内核按匹配顺序平铺返回，同一文件的连续命中要并成一段 */
+type SearchGroup = { path: string; rows: { line: number; text: string; ranges: [number, number][] }[] };
+
+function groupHits(hits: FindMatch[], limit: number) {
+  const groups: SearchGroup[] = [];
+  let rows = 0;
+  for (const h of hits) {
+    if (rows >= limit) break;
+    const text = h.lines.text.replace(/\r?\n$/, "");
+    const row = { line: h.line_number, text, ranges: charRanges(text, h.submatches) };
+    const last = groups[groups.length - 1];
+    if (last && last.path === h.path.text) last.rows.push(row);
+    else groups.push({ path: h.path.text, rows: [row] });
+    rows += 1;
+  }
+  return { groups, rows, truncated: hits.length > rows };
+}
+
+/** 一行里把命中片段套上高亮；没有 submatch（例如只按文件命中）就整行原样输出 */
+function HitLine({ row }: { row: SearchGroup["rows"][number] }) {
+  if (!row.ranges.length) return <>{row.text}</>;
+  const out: React.ReactNode[] = [];
+  let cur = 0;
+  for (const [s, e] of row.ranges) {
+    if (s > cur) out.push(row.text.slice(cur, s));
+    out.push(<i key={`${s}-${e}`}>{row.text.slice(s, Math.max(e, s))}</i>);
+    cur = Math.max(cur, e);
+  }
+  if (cur < row.text.length) out.push(row.text.slice(cur));
+  return <>{out}</>;
 }
 
 /** 内核用 `<会话创建时间>-<slug>.md` 命名，时间戳没有展示价值 */
@@ -152,6 +203,8 @@ type PanelProps = {
   diffs: FileDiff[];
   /** file.edited 脉冲：合并短时间内的多次写入，刷新树和打开的目录 */
   pulse: number;
+  /** ⌘⇧F 递增一次：切到搜索页签并把光标放到输入框 */
+  focusSearch: number;
   onOpenFile: (f: OpenFile) => void;
   onRefreshDiffs: () => void;
   onClose: () => void;
@@ -162,17 +215,25 @@ export function FilePanel({
   session,
   diffs,
   pulse,
+  focusSearch,
   onOpenFile,
   onRefreshDiffs,
   onClose,
 }: PanelProps) {
-  const [tab, setTab] = useState<"tree" | "changes" | "plans">("tree");
+  const [tab, setTab] = useState<"tree" | "changes" | "plans" | "search">("tree");
   const [version, setVersion] = useState(0);
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [plans, setPlans] = useState<PlanEntry[] | null>(null);
   const [planErr, setPlanErr] = useState<string | null>(null);
+  const [pattern, setPattern] = useState("");
+  const [hits, setHits] = useState<FindMatch[] | null>(null);
+  const [searchErr, setSearchErr] = useState<string | null>(null);
+  const [searching, setSearching] = useState(false);
+  const searchBox = useRef<HTMLInputElement | null>(null);
+  /** 内核 /find 没有 limit，宽模式一次能回几千条，靠序号丢掉迟到的旧结果 */
+  const searchSeq = useRef(0);
 
   const wsDiffs = useMemo(
     () => diffs.filter((d) => relInRoot(root, d.file) !== null),
@@ -183,6 +244,7 @@ export function FilePanel({
     for (const d of wsDiffs) m.set(trimSlash(d.file), d);
     return m;
   }, [wsDiffs]);
+  const grouped = useMemo(() => groupHits(hits ?? [], SEARCH_ROWS), [hits]);
 
   /** 技能写的计划就在工作区里，展示相对目录比"项目目录"四个字有用 */
   const planWhere = (p: PlanEntry) => {
@@ -194,7 +256,7 @@ export function FilePanel({
   const loadRoot = useCallback(() => {
     let alive = true;
     setErr(null);
-    invoke<FileList>("files_list", { rel: "" })
+    invoke<FileList>("files_list", { rel: "", directory: root })
       .then((r) => {
         if (!alive) return;
         setEntries(r.entries);
@@ -206,14 +268,14 @@ export function FilePanel({
     return () => {
       alive = false;
     };
-    // files_list 读的是落盘后的当前工作区，但根目录变了仍要重新拉一次，
-    // 否则切工作区只会清空旧树，一直停在「读取中」
+    // 根目录由 Rust 侧按 directory 参数解析（只认登记过的工作区），换区/换会话都要重拉一次，
+    // 否则只会清空旧树、一直停在「读取中」
   }, [root]);
 
   const loadPlans = useCallback(() => {
     let alive = true;
     setPlanErr(null);
-    invoke<PlanEntry[]>("plans_list")
+    invoke<PlanEntry[]>("plans_list", { directory: root })
       .then((r) => {
         if (alive) setPlans(r);
       })
@@ -223,13 +285,15 @@ export function FilePanel({
     return () => {
       alive = false;
     };
-  }, []);
+  }, [root]);
 
   // 换工作区先清掉旧树，别让两层文件混在一起
   useEffect(() => {
     setEntries(null);
     setTruncated(false);
     setPlans(null);
+    setHits(null);
+    setSearchErr(null);
   }, [root]);
   useEffect(() => loadRoot(), [loadRoot, version]);
 
@@ -239,14 +303,56 @@ export function FilePanel({
     return loadPlans();
   }, [tab, loadPlans, version, root, session?.id]);
 
+  const runSearch = useCallback(
+    (p: string) => {
+      const pat = p.trim();
+      const id = ++searchSeq.current;
+      if (pat.length < 2) {
+        setHits(null);
+        setSearchErr(null);
+        setSearching(false);
+        return;
+      }
+      setSearching(true);
+      setSearchErr(null);
+      find
+        .text(pat, root)
+        .then((r) => {
+          if (searchSeq.current === id) setHits(r);
+        })
+        .catch((e) => {
+          if (searchSeq.current !== id) return;
+          setHits(null);
+          setSearchErr(String(e));
+        })
+        .finally(() => {
+          if (searchSeq.current === id) setSearching(false);
+        });
+    },
+    [root],
+  );
+
+  // 每敲一个字就打一次 ripgrep 没必要，停手 350ms 再查；只看当前页签
+  useEffect(() => {
+    if (tab !== "search") return;
+    const t = window.setTimeout(() => runSearch(pattern), 350);
+    return () => window.clearTimeout(t);
+  }, [tab, pattern, runSearch]);
+
+  // ⌘⇧F：切到搜索页签并把光标放进输入框（刚切过去时 input 还没挂载，等一帧）
+  useEffect(() => {
+    if (!focusSearch) return;
+    setTab("search");
+    const t = window.setTimeout(() => searchBox.current?.focus(), 0);
+    return () => window.clearTimeout(t);
+  }, [focusSearch]);
+
   // 内核写完文件会连发多次 file.edited；收拢成一次刷新，新增文件不必手动点
   useEffect(() => {
     if (!pulse) return;
     const t = window.setTimeout(() => setVersion((v) => v + 1), 700);
     return () => window.clearTimeout(t);
   }, [pulse]);
-
-  const crossWs = !!session?.directory && !samePath(session.directory, root);
 
   function refresh() {
     setVersion((v) => v + 1);
@@ -290,6 +396,9 @@ export function FilePanel({
         <button className={tab === "tree" ? "on" : ""} onClick={() => setTab("tree")}>
           文件
         </button>
+        <button className={tab === "search" ? "on" : ""} onClick={() => setTab("search")}>
+          搜索
+        </button>
         <button className={tab === "changes" ? "on" : ""} onClick={() => setTab("changes")}>
           改动
           {!!wsDiffs.length && <span className="cnt">{wsDiffs.length}</span>}
@@ -300,7 +409,83 @@ export function FilePanel({
         </button>
       </div>
 
-      {tab === "tree" ? (
+      {tab === "search" ? (
+        <div className="ftree fsearch">
+          <div className="sbox">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="7" cy="7" r="4.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
+              <path
+                d="M10.4 10.4L13.6 13.6"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.3"
+                strokeLinecap="round"
+              />
+            </svg>
+            <input
+              ref={searchBox}
+              value={pattern}
+              onChange={(e) => setPattern(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") runSearch(pattern);
+              }}
+              placeholder="在工作区里搜索（正则，区分大小写）"
+              aria-label="工作区全文搜索"
+              spellCheck={false}
+            />
+          </div>
+          {searchErr ? (
+            <p className="fhint err">{searchErr}</p>
+          ) : searching ? (
+            <p className="fhint">搜索中…</p>
+          ) : pattern.trim().length < 2 ? (
+            <p className="fhint">至少两个字符；ignore 规则与内核一致</p>
+          ) : !hits?.length ? (
+            <p className="fhint">没有匹配</p>
+          ) : (
+            <>
+              <p className="fhint smeta">
+                {grouped.rows} / {hits.length} 处匹配 · {grouped.groups.length} 个文件
+              </p>
+              <ul className="slist">
+                {grouped.groups.map((g) => (
+                  <li key={g.path} className="sgroup">
+                    <div className="spath" title={`${trimSlash(root)}/${g.path}`}>
+                      <FileIcon />
+                      <b>{baseName(g.path)}</b>
+                      <span className="muted">{dirName(g.path)}</span>
+                    </div>
+                    {g.rows.map((r) => (
+                      <button
+                        key={`${g.path}:${r.line}`}
+                        className="srow"
+                        onClick={() =>
+                          onOpenFile({
+                            rel: g.path,
+                            abs: `${trimSlash(root)}/${g.path}`,
+                            tab: "preview",
+                            line: r.line,
+                          })
+                        }
+                      >
+                        <span className="slno">{r.line}</span>
+                        <span className="sltx">
+                          <HitLine row={r} />
+                        </span>
+                      </button>
+                    ))}
+                  </li>
+                ))}
+              </ul>
+              {grouped.truncated && (
+                <p className="fhint">
+                  结果过多，只列出前 {grouped.rows} 条；缩小范围或加上更具体的模式
+                </p>
+              )}
+            </>
+          )}
+        </div>
+      ) : tab === "tree" ? (
         <div className="ftree">
           {err ? (
             <p className="fhint err">{err}</p>
@@ -338,8 +523,7 @@ export function FilePanel({
         </div>
       ) : tab === "changes" ? (
         <div className="ftree changes">
-          {crossWs && <p className="fhint">该会话属于其他工作区，切过去才能查看这些文件</p>}
-          {crossWs ? null : !wsDiffs.length ? (
+          {!wsDiffs.length ? (
             <p className="fhint">
               {session ? "当前会话还没有文件改动" : "打开一个会话后显示它改过的文件"}
             </p>
@@ -439,7 +623,7 @@ function DirNode({
     let alive = true;
     setLoading(true);
     setErr(null);
-    invoke<FileList>("files_list", { rel: entry.path })
+    invoke<FileList>("files_list", { rel: entry.path, directory: root })
       .then((r) => {
         if (alive) setList(r);
       })
@@ -452,7 +636,7 @@ function DirNode({
     return () => {
       alive = false;
     };
-  }, [open, entry.path, version]);
+  }, [open, entry.path, version, root]);
 
   return (
     <div className="fdir">
@@ -536,6 +720,128 @@ function FileRow({
   );
 }
 
+type QuickProps = {
+  root: string;
+  onClose: () => void;
+  onPick: (rel: string) => void;
+};
+
+/** ⌘P 快捷打开：模糊匹配、ignore 规则全交给内核的 ripgrep 索引，壳不自己遍历目录 */
+export function QuickOpen({ root, onClose, onPick }: QuickProps) {
+  const [q, setQ] = useState("");
+  const [rows, setRows] = useState<string[]>([]);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [sel, setSel] = useState(0);
+  const box = useRef<HTMLInputElement | null>(null);
+  const list = useRef<HTMLDivElement | null>(null);
+  const seq = useRef(0);
+
+  useEffect(() => {
+    box.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    const id = ++seq.current;
+    const t = window.setTimeout(() => {
+      setBusy(true);
+      setErr(null);
+      find
+        .files(q, root, QUICK_LIMIT)
+        .then((r) => {
+          if (seq.current !== id) return;
+          setRows(r);
+          setSel(0);
+        })
+        .catch((e) => {
+          if (seq.current !== id) return;
+          setRows([]);
+          setErr(String(e));
+        })
+        .finally(() => {
+          if (seq.current === id) setBusy(false);
+        });
+    }, 120);
+    return () => window.clearTimeout(t);
+  }, [q, root]);
+
+  // 方向键选中的那条要跟着进视野
+  useEffect(() => {
+    list.current?.querySelector(`[data-i="${sel}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [sel, rows.length]);
+
+  function onKey(e: React.KeyboardEvent) {
+    // 中文输入法选词的回车不是「打开」
+    if (e.nativeEvent.isComposing) return;
+    if (e.key === "Escape") onClose();
+    else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (rows.length) setSel((i) => (i + 1) % rows.length);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (rows.length) setSel((i) => (i - 1 + rows.length) % rows.length);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      const hit = rows[sel];
+      if (hit) onPick(hit);
+    }
+  }
+
+  return (
+    <div className="modal qomask" onClick={onClose}>
+      <div className="panel qo" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="快捷打开文件">
+        <div className="qoh">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="7" cy="7" r="4.4" fill="none" stroke="currentColor" strokeWidth="1.4" />
+            <path
+              d="M10.4 10.4L13.6 13.6"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.4"
+              strokeLinecap="round"
+            />
+          </svg>
+          <input
+            ref={box}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            onKeyDown={onKey}
+            placeholder="输入文件名，回车打开"
+            aria-label="按文件名搜索"
+            spellCheck={false}
+          />
+        </div>
+        <div className="qolist" ref={list}>
+          {err ? (
+            <p className="fhint err">{err}</p>
+          ) : !rows.length ? (
+            <p className="fhint">{busy ? "搜索中…" : "没有匹配的文件"}</p>
+          ) : (
+            rows.map((p, i) => (
+              <button
+                key={p}
+                data-i={i}
+                className={`qorow ${i === sel ? "on" : ""}`}
+                onClick={() => onPick(p)}
+                onMouseMove={() => setSel(i)}
+                title={`${trimSlash(root)}/${p}`}
+              >
+                <FileIcon />
+                <b>{baseName(p)}</b>
+                <span className="muted">{dirName(p)}</span>
+              </button>
+            ))
+          )}
+        </div>
+        <footer className="qof">
+          <span className="muted">↑↓ 选择 · ⏎ 打开 · Esc 关闭</span>
+          <span className="muted">{baseName(root)}</span>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
 type ViewerProps = {
   root: string;
   file: OpenFile;
@@ -544,7 +850,6 @@ type ViewerProps = {
   pulse: number;
   onClose: () => void;
 };
-
 /** 行号与 +/- 标记是界面装饰：Cmd+C 时按选中的行重建纯文本，别把它们带进剪贴板 */
 function cleanCopyText(root: HTMLElement): string | null {
   const sel = window.getSelection();
@@ -591,8 +896,8 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
       setErr(null);
     }
     const req = file.plan
-      ? invoke<FileContent>("plan_read", { path: file.abs })
-      : invoke<FileContent>("file_read", { rel: file.rel });
+      ? invoke<FileContent>("plan_read", { path: file.abs, directory: root })
+      : invoke<FileContent>("file_read", { rel: file.rel, directory: root });
     req
       .then((r) => {
         if (reqId.current !== id) return;
@@ -610,7 +915,7 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
       .finally(() => {
         if (reqId.current === id) setBusy(false);
       });
-  }, [file.rel, file.abs, file.plan]);
+  }, [file.rel, file.abs, file.plan, root]);
 
   useEffect(() => {
     setTab(startTab);
@@ -665,8 +970,9 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
     }
   }
 
+  // 搜索跳过来的一律看源码：Markdown 渲染后的 DOM 没有行号可对
   const markdown =
-    tab === "preview" && isMd(file.rel) && !!data && !data.binary && data.content !== null;
+    tab === "preview" && isMd(file.rel) && !!data && !data.binary && data.content !== null && !file.line;
 
   return (
     <div
@@ -820,7 +1126,12 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
             ) : markdown && !mdRaw ? (
               <MdView text={data.content} rel={file.rel} truncated={data.truncated} />
             ) : (
-              <CodeView text={data.content} rel={file.rel} truncated={data.truncated} />
+              <CodeView
+                text={data.content}
+                rel={file.rel}
+                truncated={data.truncated}
+                focusLine={file.line}
+              />
             )
           ) : (
             <DiffView row={diff} rel={file.rel} />
@@ -887,7 +1198,17 @@ function Tokens({ tokens, text }: { tokens?: ThemedToken[]; text: string }) {
 const CODE_LINE_PX = 19;
 const CODE_OVERSCAN = 48;
 
-function CodeView({ text, rel, truncated }: { text: string; rel: string; truncated: boolean }) {
+function CodeView({
+  text,
+  rel,
+  truncated,
+  focusLine,
+}: {
+  text: string;
+  rel: string;
+  truncated: boolean;
+  focusLine?: number;
+}) {
   const host = useRef<HTMLDivElement>(null);
   const [win, setWin] = useState({ start: 0, end: 160 });
   const lines = useMemo(() => {
@@ -900,6 +1221,10 @@ function CodeView({ text, rel, truncated }: { text: string; rel: string; truncat
   useEffect(() => {
     const scroller = host.current?.closest(".fvbody") as HTMLElement | null;
     if (!scroller) return;
+    // 搜索跳行：先滚到目标行附近，再按新的滚动位置算渲染窗口
+    if (focusLine && focusLine <= shown.length) {
+      scroller.scrollTop = Math.max(0, (focusLine - 1) * CODE_LINE_PX - scroller.clientHeight / 3);
+    }
     const onScroll = () => {
       const start = Math.max(0, Math.floor(scroller.scrollTop / CODE_LINE_PX) - CODE_OVERSCAN);
       const end = Math.min(
@@ -911,7 +1236,7 @@ function CodeView({ text, rel, truncated }: { text: string; rel: string; truncat
     onScroll();
     scroller.addEventListener("scroll", onScroll, { passive: true });
     return () => scroller.removeEventListener("scroll", onScroll);
-  }, [shown.length]);
+  }, [shown.length, focusLine]);
 
   const slice = shown.slice(win.start, win.end);
   const sliceText = slice.join("\n");
@@ -932,7 +1257,11 @@ function CodeView({ text, rel, truncated }: { text: string; rel: string; truncat
         }}
       >
         {slice.map((line, i) => (
-          <div className="cl" key={win.start + i} style={{ minHeight: CODE_LINE_PX }}>
+          <div
+            className={`cl ${win.start + i + 1 === focusLine ? "hit" : ""}`}
+            key={win.start + i}
+            style={{ minHeight: CODE_LINE_PX }}
+          >
             <span className="no">{win.start + i + 1}</span>
             <span className="tx">
               <Tokens tokens={tokens?.[i]} text={line} />
