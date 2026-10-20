@@ -17,6 +17,9 @@ const BINARY_PROBE: usize = 8192;
 const SKIP_NAMES: &[&str] = &[".git", ".DS_Store"];
 /// 「计划」页签一次最多列这么多份，防止某个大目录里的 plans 把列表刷爆
 const MAX_PLANS: usize = 200;
+/// 壳子代内核落盘的计划正文上限：真计划是万字级，超过这个尺寸的多半是模型跑飞了
+const MAX_PLAN_BYTES: usize = 512 * 1024;
+const MAX_PLAN_STEM_CHARS: usize = 48;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +103,23 @@ pub fn plan_read(
     let settings = Settings::load(&app)?;
     let root = workspace_root(&settings, directory.as_deref())?;
     read_plan(&plan_roots(&settings, Some(&root)), &path)
+}
+
+/// 把规划模式的计划正文落盘，返回绝对路径。
+/// 内核的 plan agent 只把计划当聊天文本输出、从不写文件（实测 26.9.26 一整轮只有
+/// read/bash/grep/question），「计划」页签因此永远为空，这里代它写一次。
+/// 同一个会话（按创建时间认）只有一份文件，且只留最完整的那版正文。
+#[tauri::command]
+pub fn plan_save(
+    app: tauri::AppHandle,
+    directory: Option<String>,
+    title: String,
+    created: u64,
+    content: String,
+) -> Result<String> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
+    save_plan(&settings, &root, &title, created, &content)
 }
 
 /// 资源管理器读哪个工作区：不带 `directory` 时用落盘的当前区；点开别的区的会话时前端显式带上那个区，
@@ -287,6 +307,107 @@ fn read_plan(roots: &[PlanRoot], path: &str) -> Result<FileContent> {
         return Err(Error::Msg("不属于计划目录".into()));
     }
     read_at(&target)
+}
+
+/// 壳子代内核写计划用哪个目录：跟 `plan_roots` 认的两个内核落盘根保持一致，
+/// 写完 `plans_list` 才认、`plan_read` 才读得回来。返回 (越界检查的 jail, 计划目录)。
+fn plan_write_root(settings: &Settings, workspace: &Path) -> (PathBuf, PathBuf) {
+    match workspace.ancestors().find(|p| p.join(".git").exists()) {
+        Some(base) => (base.to_path_buf(), base.join(".opencode").join("plans")),
+        None => {
+            let data = settings.kernel_data_dir();
+            (data.clone(), data.join("plans"))
+        }
+    }
+}
+
+/// 会话标题当文件名，「计划」页签上才有可读的条目；分隔符和控制字符换成 `-`，过长的截断。
+fn plan_stem(title: &str) -> String {
+    let mut out = String::new();
+    for ch in title.trim().chars() {
+        if out.chars().count() >= MAX_PLAN_STEM_CHARS {
+            break;
+        }
+        match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '.' => out.push('-'),
+            c if c.is_control() => out.push('-'),
+            c => out.push(c),
+        }
+    }
+    let cleaned = out
+        .split('-')
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if cleaned.is_empty() {
+        "plan".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 同一会话的自动改名不能各存一份：先按 `<创建时间>-` 前缀找回已有文件名。
+fn existing_plan_name(dir: &Path, created: u64) -> Option<String> {
+    let prefix = format!("{created}-");
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with(&prefix) && n.ends_with(".md"))
+}
+
+fn save_plan(
+    settings: &Settings,
+    workspace: &Path,
+    title: &str,
+    created: u64,
+    content: &str,
+) -> Result<String> {
+    let body = content.trim();
+    if body.is_empty() {
+        return Err(Error::Msg("计划正文为空，未保存".into()));
+    }
+    if body.len() > MAX_PLAN_BYTES {
+        return Err(Error::Msg(format!(
+            "计划正文 {} 字节，超过 {} 字节的保存上限",
+            body.len(),
+            MAX_PLAN_BYTES
+        )));
+    }
+    if created == 0 {
+        return Err(Error::Msg("缺少会话创建时间".into()));
+    }
+    let (jail, dir) = plan_write_root(settings, workspace);
+    if contained_plan_root(&dir, &jail).is_none() {
+        return Err(Error::Msg("计划目录被符号链接指向了工作区外".into()));
+    }
+    let name = existing_plan_name(&dir, created)
+        .unwrap_or_else(|| format!("{created}-{}.md", plan_stem(title)));
+    let logical = dir.join(&name);
+    // 目录或同名文件被换成链出 jail 的符号链接时，这里再拒一次
+    if contained_plan_root(&logical, &jail).is_none() {
+        return Err(Error::Msg("计划文件路径越界".into()));
+    }
+    let title = title.trim();
+    let heading = if title.is_empty() {
+        "计划".to_string()
+    } else {
+        format!("# {title}")
+    };
+    let doc = if body.starts_with("# ") {
+        body.to_string()
+    } else {
+        format!("{heading}\n\n{body}\n")
+    };
+    std::fs::create_dir_all(&dir).msg("无法创建计划目录")?;
+    // 一个会话一份计划、只留最完整的那版：后面「计划无需改动」这类短回复不能把长计划冲掉
+    if let Ok(old) = std::fs::read_to_string(&logical) {
+        if old == doc || old.chars().count() > doc.chars().count() {
+            return Ok(logical.display().to_string());
+        }
+    }
+    std::fs::write(&logical, &doc).msg("计划写入失败")?;
+    Ok(logical.display().to_string())
 }
 
 /// 前端传入的是相对路径；绝对路径、`..`、盘符一律拒绝。
@@ -573,6 +694,86 @@ mod tests {
                 .as_deref(),
             Some("# 互斥\n")
         );
+    }
+
+    #[test]
+    fn saves_plan_where_the_kernel_would_and_lists_it() {
+        let root = TempRoot::new();
+        let repo = root.0.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+
+        let mut settings = Settings::default();
+        settings.kernel_home = Some(root.0.display().to_string());
+
+        let saved =
+            save_plan(&settings, &repo.join("sub"), "商品接入计划", 1760000000000, "## 目标\n先同步 SPU").unwrap();
+        assert_eq!(
+            saved,
+            repo.join(".opencode/plans/1760000000000-商品接入计划.md")
+                .display()
+                .to_string()
+        );
+
+        let roots = plan_roots(&settings, Some(&repo.join("sub")));
+        let listed = collect_plans(&roots);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, "workspace");
+        // 列表与预览走的是同一条校验链：写完立刻能读
+        assert_eq!(
+            read_plan(&roots, &saved).unwrap().content.as_deref(),
+            Some("# 商品接入计划\n\n## 目标\n先同步 SPU\n")
+        );
+    }
+
+    #[test]
+    fn keeps_one_plan_file_per_session_when_the_title_changes() {
+        let root = TempRoot::new();
+        let project = root.0.join("plain");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut settings = Settings::default();
+        settings.kernel_home = Some(root.0.display().to_string());
+
+        let first = save_plan(&settings, &project, "旧标题", 1760000000001, "长计划").unwrap();
+        let second = save_plan(&settings, &project, "自动改名后的标题", 1760000000001, "更长的计划").unwrap();
+        assert_eq!(first, second);
+        // 文件名认会话（前缀复用），正文里的标题跟着会话改名走
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "# 自动改名后的标题\n\n更长的计划\n"
+        );
+        // 短回复不覆盖长计划：规划轮后面那句「计划无需改动」也会在 idle 时送来
+        let shorter = save_plan(&settings, &project, "确认", 1760000000001, "计划无需改动").unwrap();
+        assert_eq!(shorter, second);
+        assert_eq!(
+            std::fs::read_to_string(&shorter).unwrap(),
+            "# 自动改名后的标题\n\n更长的计划\n"
+        );
+        // 非 git 工作区落内核数据目录；plan_roots 里登记的是 canonicalize 后的真实路径
+        let roots = plan_roots(&settings, Some(&project));
+        assert!(roots
+            .iter()
+            .any(|(_, p)| p == &root.0.canonicalize().unwrap().join(".codeartsdoer").join("cli-data").join("plans")));
+        assert_eq!(collect_plans(&roots).len(), 1);
+
+        assert!(save_plan(&settings, &project, "空", 1760000000002, "   ").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_save_through_an_escaped_plan_directory() {
+        let root = TempRoot::new();
+        let outside = TempRoot::new();
+        let project = root.0.join("plain");
+        std::fs::create_dir_all(&project).unwrap();
+        let data = root.0.join(".codeartsdoer").join("cli-data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::os::unix::fs::symlink(&outside.0, data.join("plans")).unwrap();
+
+        let mut settings = Settings::default();
+        settings.kernel_home = Some(root.0.display().to_string());
+        assert!(save_plan(&settings, &project, "外逃", 1760000000003, "正文").is_err());
+        assert!(std::fs::read_dir(&outside.0).unwrap().next().is_none());
     }
 
     #[cfg(unix)]

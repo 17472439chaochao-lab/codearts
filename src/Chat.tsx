@@ -134,6 +134,8 @@ const AGENT_KEY = "codearts.agent";
 const FILES_KEY = "codearts.filesPanel";
 /** 侧栏默认露出的条数：工作区列表，以及每个工作区下的会话。「加载更多」按同样步长展开，「收起」回到这个数 */
 const SIDE_PAGE = 3;
+/** 规划轮的回复短于这么多字符就不当计划存盘（真计划是千字级，「确认无误」这种不算） */
+const MIN_PLAN_CHARS = 120;
 
 /** 内核用来起标题、做摘要、压缩上下文的内部 agent，选它们当主对话只会得到一句废话 */
 const INTERNAL_AGENTS = new Set(["title", "summary", "compaction"]);
@@ -917,6 +919,46 @@ export default function Chat({
     };
   }, []);
 
+  /**
+   * 内核的 plan agent 只把计划当聊天文本输出、从不写文件（实测 26.9.26：规划一整轮
+   * 只有 read/bash/grep/question，`.opencode/plans` 连目录都没建），所以资源管理器
+   * 「计划」页签永远空。规划轮收尾时由壳子代它落盘一份，谁更完整由 files.rs 判定。
+   */
+  const persistPlan = useCallback(async (sid: string, ms: Message[]) => {
+    let final: Message | undefined;
+    for (let i = ms.length - 1; i >= 0 && final === undefined; i--) {
+      const m = ms[i];
+      // 只认本轮（最后一条用户消息之后）的规划回复，之前几轮的旧计划不重复存
+      if (m.info.role === "user") break;
+      if (m.info.role === "assistant" && m.info.agent === "plan") final = m;
+    }
+    if (!final) return;
+    const text = final.parts
+      .filter((p) => p.type === "text" && !(p as any).synthetic && !p.metadata?.synthetic)
+      .map((p) => p.text ?? "")
+      .join("\n\n")
+      .trim();
+    // 短确认语（「好的，就按计划来」）不值得单立一份文件
+    if (text.length < MIN_PLAN_CHARS) return;
+    const d = dirOfRef.current(sid);
+    try {
+      const s = await sessions.get(sid, d);
+      const path: string = await invoke("plan_save", {
+        directory: s.directory ?? d,
+        title: s.title,
+        created: s.time.created,
+        content: text,
+      });
+      // 计划页签靠 file.edited 的脉冲刷新，内核这次没发，自己来一下
+      setEditPulse((n) => n + 1);
+      setToast(`计划已保存到 ${path.split("/").pop()}`);
+    } catch (e) {
+      setToast(`计划保存失败：${String(e)}`);
+    }
+  }, []);
+  const persistPlanRef = useRef(persistPlan);
+  persistPlanRef.current = persistPlan;
+
   useEffect(() => {
     /** 帧属于当前会话就进主时间线，属于它派出的子会话就进那张 task 卡 */
     const merge = (sid: string, fn: (m: Message[]) => Message[]) => {
@@ -1073,6 +1115,8 @@ export default function Chat({
               .messages(want, wsOfRef.current ?? dirRef.current)
               .then((ms) => {
                 if (activeRef.current === want) setMsgs(ms);
+                // 规划轮的正文内核不落盘，收尾时代它存一份，资源管理器才有「计划」
+                void persistPlanRef.current(want, ms);
               })
               .catch(() => {});
             reloadDiffsRef.current();

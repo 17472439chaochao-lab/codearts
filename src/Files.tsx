@@ -565,7 +565,7 @@ export function FilePanel({
             <p className="fhint">读取中…</p>
           ) : !plans.length ? (
             <p className="fhint">
-              还没有计划。点输入区左下的「规划」开关，让 agent 先出计划再动手
+              还没有计划。点输入区左下的「规划」开关让 agent 先出计划，那一轮讲完这里会自动存一份
             </p>
           ) : (
             <ul className="chlist">

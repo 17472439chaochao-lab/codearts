@@ -236,6 +236,7 @@ pub fn run() {
             files::file_read,
             files::plans_list,
             files::plan_read,
+            files::plan_save,
             skills::skills_managed,
             skills::skill_install_github,
             skills::skill_update_github,
