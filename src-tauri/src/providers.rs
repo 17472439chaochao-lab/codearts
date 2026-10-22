@@ -224,9 +224,16 @@ pub fn save(app: &tauri::AppHandle, draft: ProviderDraft) -> Result<Vec<Provider
     }
     let path = config_path(app)?;
     let mut root = read_root(&path)?;
+    merge_draft(&mut root, &draft)?;
+    write_root(&path, &root)?;
+    list(app)
+}
 
+/// 把草稿并进全局配置的 provider 段。与盘上已有条目逐键合并：
+/// 界面不认识的键（`options.headers`、模型上的 `cost` 等）原样保留。
+fn merge_draft(root: &mut Value, draft: &ProviderDraft) -> Result<()> {
     // 密钥留空 = 沿用盘上原值（内核会把明文加密回写，所以原值可能是 enc:v3:）
-    let existing = providers_of(&root).get(&draft.id).cloned();
+    let existing = providers_of(root).get(&draft.id).cloned();
     let kept_key = existing
         .as_ref()
         .and_then(|e| e.get("options"))
@@ -239,20 +246,47 @@ pub fn save(app: &tauri::AppHandle, draft: ProviderDraft) -> Result<Vec<Provider
         _ => kept_key,
     };
 
+    // 盘上条目里可能有界面上没有的键（options.headers / timeout、模型上的 cost / attachment），
+    // 逐键覆盖而不是整块重建，否则保存一次就悄悄丢掉一片配置
+    let prev_entry = existing.as_ref().and_then(Value::as_object).cloned();
+    let prev_options = prev_entry
+        .as_ref()
+        .and_then(|e| e.get("options"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let prev_models = prev_entry
+        .as_ref()
+        .and_then(|e| e.get("models"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
     let mut models = Map::new();
-    for m in draft.models {
+    for m in &draft.models {
         let id = m.id.trim().to_string();
         if id.is_empty() {
             return Err(Error::Msg("模型 ID 不能为空".into()));
         }
         if m.context == 0 || m.output == 0 {
-            return Err(Error::Msg(format!("模型「{id}」的上下文和最大输出都要填大于 0 的 token 数")));
+            return Err(Error::Msg(format!(
+                "模型「{id}」的上下文和最大输出都要填大于 0 的 token 数"
+            )));
         }
-        let mut entry = Map::new();
-        let name = m.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
-        entry.insert("id".into(), Value::String(name.unwrap_or_else(|| id.clone())));
+        let mut entry = prev_models
+            .get(&id)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let name = m.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+        entry.insert(
+            "id".into(),
+            Value::String(name.unwrap_or(id.as_str()).to_string()),
+        );
         if m.reasoning.unwrap_or(false) {
             entry.insert("reasoning".into(), Value::Bool(true));
+        } else {
+            entry.remove("reasoning");
         }
         entry.insert(
             "limit".into(),
@@ -261,24 +295,30 @@ pub fn save(app: &tauri::AppHandle, draft: ProviderDraft) -> Result<Vec<Provider
         models.insert(id, Value::Object(entry));
     }
 
-    let mut options = Map::new();
+    let mut options = prev_options;
     options.insert("baseURL".into(), Value::String(draft.base_url.trim().to_string()));
     if !api_key.is_empty() {
         options.insert("apiKey".into(), Value::String(api_key));
     }
-    let mut entry = Map::new();
-    let name = draft.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
-    if let Some(name) = name {
-        entry.insert("name".into(), Value::String(name));
+    let mut entry = prev_entry.unwrap_or_default();
+    match draft.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => {
+            entry.insert("name".into(), Value::String(name.to_string()));
+        }
+        None => {
+            entry.remove("name");
+        }
     }
     entry.insert(
         "npm".into(),
         Value::String(
             draft
                 .npm
-                .map(|n| n.trim().to_string())
+                .as_deref()
+                .map(str::trim)
                 .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| DEFAULT_NPM.to_string()),
+                .unwrap_or(DEFAULT_NPM)
+                .to_string(),
         ),
     );
     entry.insert("options".into(), Value::Object(options));
@@ -294,9 +334,7 @@ pub fn save(app: &tauri::AppHandle, draft: ProviderDraft) -> Result<Vec<Provider
         .as_object_mut()
         .ok_or_else(|| Error::Msg("配置里的 provider 不是对象".into()))?
         .insert(draft.id.clone(), Value::Object(entry));
-
-    write_root(&path, &root)?;
-    list(app)
+    Ok(())
 }
 
 pub fn remove(app: &tauri::AppHandle, id: &str) -> Result<Vec<ProviderView>> {
@@ -383,5 +421,54 @@ mod tests {
         assert_eq!(key_mask(""), None);
         assert_eq!(key_mask("enc:v3:abcdef").as_deref(), Some("已加密"));
         assert_eq!(key_mask("sk-proj-abcdefghij").as_deref(), Some("****ghij"));
+    }
+
+    #[test]
+    fn save_keeps_fields_the_ui_does_not_know() {
+        let mut root = serde_json::json!({
+            "provider": {
+                "myproxy": {
+                    "name": "旧名字",
+                    "npm": "@ai-sdk/openai-compatible",
+                    "unknownTop": { "keep": true },
+                    "options": {
+                        "baseURL": "https://old.example/v1",
+                        "apiKey": "enc:v3:kept",
+                        "headers": { "x-trace": "1" },
+                        "timeout": 120000
+                    },
+                    "models": {
+                        "m1": {
+                            "id": "m1",
+                            "cost": { "input": 1, "output": 2 },
+                            "attachment": true,
+                            "limit": { "context": 1, "output": 1 }
+                        }
+                    }
+                }
+            }
+        });
+        let draft: ProviderDraft = serde_json::from_value(serde_json::json!({
+            "id": "myproxy",
+            "baseUrl": "https://new.example/v1",
+            "models": [{ "id": "m1", "context": 128000, "output": 8192 }]
+        }))
+        .unwrap();
+        merge_draft(&mut root, &draft).unwrap();
+
+        let e = &root["provider"]["myproxy"];
+        // 界面上没有的键必须还在
+        assert_eq!(e["unknownTop"]["keep"], true);
+        assert_eq!(e["options"]["headers"]["x-trace"], "1");
+        assert_eq!(e["options"]["timeout"], 120000);
+        assert_eq!(e["models"]["m1"]["cost"]["input"], 1);
+        assert_eq!(e["models"]["m1"]["attachment"], true);
+        // 界面上有的键按草稿覆盖
+        assert_eq!(e["options"]["baseURL"], "https://new.example/v1");
+        assert_eq!(e["models"]["m1"]["limit"]["context"], 128000);
+        // 密钥留空 = 沿用原值
+        assert_eq!(e["options"]["apiKey"], "enc:v3:kept");
+        // 名称留空 = 清掉旧的，而不是继续挂着上次的名字
+        assert!(e.get("name").is_none());
     }
 }

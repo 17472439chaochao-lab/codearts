@@ -58,6 +58,8 @@ const MAX_MD_CHARS = 300_000;
 const SEARCH_ROWS = 300;
 /** 快捷打开的结果条数 */
 const QUICK_LIMIT = 40;
+/** 「计划」页签被文件写入事件带着自动刷新的最小间隔 */
+const PLAN_REFRESH_MS = 4000;
 const isMd = (rel: string) => /\.md$/i.test(rel);
 
 const trimSlash = (p: string) => p.replace(/\/+$/, "");
@@ -205,6 +207,10 @@ type PanelProps = {
   pulse: number;
   /** ⌘⇧F 递增一次：切到搜索页签并把光标放到输入框 */
   focusSearch: number;
+  /** 右上角目录下拉：可切换的工作区，以及「添加工作区」入口 */
+  workspaces: string[];
+  onSwitchDir: (dir: string) => void;
+  onAddDir: () => void;
   onOpenFile: (f: OpenFile) => void;
   onRefreshDiffs: () => void;
   onClose: () => void;
@@ -216,6 +222,9 @@ export function FilePanel({
   diffs,
   pulse,
   focusSearch,
+  workspaces,
+  onSwitchDir,
+  onAddDir,
   onOpenFile,
   onRefreshDiffs,
   onClose,
@@ -231,9 +240,31 @@ export function FilePanel({
   const [hits, setHits] = useState<FindMatch[] | null>(null);
   const [searchErr, setSearchErr] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
+  const [wsOpen, setWsOpen] = useState(false);
+  const wsBox = useRef<HTMLDivElement | null>(null);
   const searchBox = useRef<HTMLInputElement | null>(null);
   /** 内核 /find 没有 limit，宽模式一次能回几千条，靠序号丢掉迟到的旧结果 */
   const searchSeq = useRef(0);
+
+  // 目录下拉的收起方式与顶栏分支一致：点外面或按 Esc
+  useEffect(() => {
+    if (!wsOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (wsBox.current && !wsBox.current.contains(e.target as Node)) setWsOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setWsOpen(false);
+    };
+    window.addEventListener("mousedown", onDown, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [wsOpen]);
+
+  // 当前会话可能停在别的区的目录上，那个目录不一定在 projects 里，补一行保证能看见自己在哪
+  const wsList = workspaces.some((p) => samePath(p, root)) ? workspaces : [root, ...workspaces];
 
   const wsDiffs = useMemo(
     () => diffs.filter((d) => relInRoot(root, d.file) !== null),
@@ -272,8 +303,12 @@ export function FilePanel({
     // 否则只会清空旧树、一直停在「读取中」
   }, [root]);
 
+  /** 上一次拉计划清单的时间，用来给 version 驱动的自动刷新限流 */
+  const plansAt = useRef(0);
+
   const loadPlans = useCallback(() => {
     let alive = true;
+    plansAt.current = Date.now();
     setPlanErr(null);
     invoke<PlanEntry[]>("plans_list", { directory: root })
       .then((r) => {
@@ -297,11 +332,20 @@ export function FilePanel({
   }, [root]);
   useEffect(() => loadRoot(), [loadRoot, version]);
 
-  // 计划文件由 agent 增量写入，跟 file.edited 的 version 一起刷新；只看当前页签，别空转
+  // 计划文件由 agent 增量写入；切页签/换区/换会话立刻拉，别空转
   useEffect(() => {
     if (tab !== "plans") return;
     return loadPlans();
-  }, [tab, loadPlans, version, root, session?.id]);
+  }, [tab, loadPlans, root, session?.id]);
+
+  // version 在 agent 干活时每 0.7 秒就 +1，每次都重扫工作区太贵（Rust 侧要递归找 plans 目录），
+  // 所以这里压到最多 4 秒一次，且只在这个页签开着时才排期
+  useEffect(() => {
+    if (tab !== "plans" || !version) return;
+    const wait = Math.max(0, PLAN_REFRESH_MS - (Date.now() - plansAt.current));
+    const t = window.setTimeout(() => void loadPlans(), wait);
+    return () => window.clearTimeout(t);
+  }, [tab, version, loadPlans]);
 
   const runSearch = useCallback(
     (p: string) => {
@@ -363,9 +407,83 @@ export function FilePanel({
     <aside className="files">
       <div className="fhead" data-tauri-drag-region="deep">
         <b>资源管理器</b>
-        <span className="muted small fws" title={root}>
-          {baseName(root)}
-        </span>
+        <div className="fwsdrop" ref={wsBox}>
+          <button
+            type="button"
+            className={`fwsbtn ${wsOpen ? "open" : ""}`}
+            onClick={() => setWsOpen((o) => !o)}
+            title={`${root} · 点击切换工作区`}
+            aria-haspopup="menu"
+            aria-expanded={wsOpen}
+          >
+            <span className="fws">{baseName(root)}</span>
+            <svg className="chchev" viewBox="0 0 12 12" aria-hidden="true">
+              <path
+                d="M3 4.7l3 3 3-3"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </button>
+          {wsOpen && (
+            <div
+              className="fwsmenu"
+              role="menu"
+              aria-label="切换工作区"
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <div className="fwsgroup">工作区</div>
+              {wsList.map((p) => {
+                const cur = samePath(p, root);
+                return (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    key={p}
+                    className={`fwsrow ${cur ? "on" : ""}`}
+                    disabled={cur}
+                    onClick={() => {
+                      setWsOpen(false);
+                      if (!cur) onSwitchDir(p);
+                    }}
+                    title={p}
+                  >
+                    <span className="fwstx">
+                      <span className="lbl">{baseName(p)}</span>
+                      <span className="sub">{p}</span>
+                    </span>
+                    {cur && (
+                      <svg className="ck" viewBox="0 0 16 16" aria-hidden="true">
+                        <path
+                          d="M3.6 8.3l3 3 5.8-6.4"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    )}
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                role="menuitem"
+                className="fwsadd"
+                onClick={() => {
+                  setWsOpen(false);
+                  onAddDir();
+                }}
+              >
+                ＋ 添加工作区…
+              </button>
+            </div>
+          )}
+        </div>
         <span className="grow" />
         <button className="ico-btn" onClick={refresh} title="刷新" aria-label="刷新文件列表">
           <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -1194,9 +1312,56 @@ function Tokens({ tokens, text }: { tokens?: ThemedToken[]; text: string }) {
   );
 }
 
-/** 与 .fvcode 的 12px/1.55 对齐，做滚动窗口估算 */
-const CODE_LINE_PX = 19;
+/**
+ * 滚动估算的三个基准。行高必须与 .fvcode 的 12px/1.55 对齐（18.6px），
+ * 否则每行 0.4px 的误差累到几千行就是上千像素的空窗。
+ */
+const CODE_LINE_PX = 18.6;
+/** .no 的 54px + .tx 的 24px 右内边距，扣掉之后才是排版宽度 */
+const CODE_GUTTER_PX = 78;
 const CODE_OVERSCAN = 48;
+/** .fvcode 的上内边距，滚动坐标要减掉它才能对上第一条线 */
+const CODE_PAD_TOP = 8;
+
+/** 折行按“终端列”算：制表符补到 8 的倍数，全角字符占两列 */
+function visualCols(s: string): number {
+  let n = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (ch === "\t") n += 8 - (n % 8);
+    else if (
+      (c >= 0x1100 && c <= 0x115f) ||
+      (c >= 0x2e80 && c <= 0xa4cf) ||
+      (c >= 0xac00 && c <= 0xd7a3) ||
+      (c >= 0xf900 && c <= 0xfaff) ||
+      (c >= 0xfe30 && c <= 0xfe6f) ||
+      (c >= 0xff00 && c <= 0xff60) ||
+      (c >= 0xffe0 && c <= 0xffe6) ||
+      (c >= 0x1f300 && c <= 0x1faff)
+    )
+      n += 2;
+    else n += 1;
+  }
+  return n;
+}
+
+/** 实测等宽字符宽度和行高：字号、字体被系统改过也能对上，测不到就退回常量 */
+function measureMono(el: HTMLElement | null): { char: number; line: number } {
+  if (!el) return { char: 7.2, line: CODE_LINE_PX };
+  try {
+    const cs = getComputedStyle(el);
+    const ctx = document.createElement("canvas").getContext("2d");
+    if (!ctx) return { char: 7.2, line: CODE_LINE_PX };
+    ctx.font = `${cs.fontSize} ${cs.fontFamily}`;
+    const char = ctx.measureText("0").width;
+    return {
+      char: char > 1 ? char : 7.2,
+      line: parseFloat(cs.lineHeight) || CODE_LINE_PX,
+    };
+  } catch {
+    return { char: 7.2, line: CODE_LINE_PX };
+  }
+}
 
 function CodeView({
   text,
@@ -1211,32 +1376,79 @@ function CodeView({
 }) {
   const host = useRef<HTMLDivElement>(null);
   const [win, setWin] = useState({ start: 0, end: 160 });
+  const [box, setBox] = useState({ width: 0, char: 0, line: CODE_LINE_PX });
   const lines = useMemo(() => {
     const all = text.split("\n");
     if (all.length && all[all.length - 1] === "") all.pop();
     return all;
   }, [text]);
-  const shown = lines.slice(0, MAX_LINES);
+  const shown = useMemo(() => lines.slice(0, MAX_LINES), [lines]);
+
+  /** 每行顶部的累计偏移：折行行数由实测字宽推出，长行走不了固定行高 */
+  const offs = useMemo(() => {
+    const off = new Float64Array(shown.length + 1);
+    const cols = box.width > 0 && box.char > 0 ? Math.max(1, Math.floor(box.width / box.char)) : 0;
+    for (let i = 0; i < shown.length; i++) {
+      const rows = cols ? Math.max(1, Math.ceil(visualCols(shown[i]) / cols)) : 1;
+      off[i + 1] = off[i] + rows * box.line;
+    }
+    return off;
+  }, [shown, box]);
+
+  /** 给定滚动位置，二分出落在哪一行 */
+  const at = useCallback(
+    (y: number) => {
+      let lo = 0;
+      let hi = shown.length;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= y) lo = mid;
+        else hi = mid - 1;
+      }
+      return lo;
+    },
+    [offs, shown.length],
+  );
+
+  // 字体、字号或窗宽变化都要重算基准，否则窗口会飘
+  useEffect(() => {
+    const scroller = host.current?.closest(".fvbody") as HTMLElement | null;
+    if (!scroller) return;
+    const sync = () => {
+      const m = measureMono(host.current);
+      const width = Math.max(0, scroller.clientWidth - CODE_GUTTER_PX);
+      setBox((b) =>
+        b.width === width && Math.abs(b.char - m.char) < 0.01 && b.line === m.line
+          ? b
+          : { width, char: m.char, line: m.line },
+      );
+    };
+    sync();
+    const ro = new ResizeObserver(sync);
+    ro.observe(scroller);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     const scroller = host.current?.closest(".fvbody") as HTMLElement | null;
     if (!scroller) return;
     // 搜索跳行：先滚到目标行附近，再按新的滚动位置算渲染窗口
     if (focusLine && focusLine <= shown.length) {
-      scroller.scrollTop = Math.max(0, (focusLine - 1) * CODE_LINE_PX - scroller.clientHeight / 3);
+      scroller.scrollTop = Math.max(
+        0,
+        CODE_PAD_TOP + offs[focusLine - 1] - scroller.clientHeight / 3,
+      );
     }
     const onScroll = () => {
-      const start = Math.max(0, Math.floor(scroller.scrollTop / CODE_LINE_PX) - CODE_OVERSCAN);
-      const end = Math.min(
-        shown.length,
-        Math.ceil((scroller.scrollTop + scroller.clientHeight) / CODE_LINE_PX) + CODE_OVERSCAN,
-      );
+      const top = Math.max(0, scroller.scrollTop - CODE_PAD_TOP);
+      const start = Math.max(0, at(top) - CODE_OVERSCAN);
+      const end = Math.min(shown.length, at(top + scroller.clientHeight) + 1 + CODE_OVERSCAN);
       setWin((w) => (w.start === start && w.end === end ? w : { start, end }));
     };
     onScroll();
     scroller.addEventListener("scroll", onScroll, { passive: true });
     return () => scroller.removeEventListener("scroll", onScroll);
-  }, [shown.length, focusLine]);
+  }, [shown.length, focusLine, at, offs]);
 
   const slice = shown.slice(win.start, win.end);
   const sliceText = slice.join("\n");
@@ -1252,15 +1464,15 @@ function CodeView({
         className="fvcode"
         ref={host}
         style={{
-          paddingTop: 8 + win.start * CODE_LINE_PX,
-          paddingBottom: 14 + Math.max(0, shown.length - win.end) * CODE_LINE_PX,
+          paddingTop: CODE_PAD_TOP + offs[win.start],
+          paddingBottom: 14 + Math.max(0, offs[shown.length] - offs[win.end]),
         }}
       >
         {slice.map((line, i) => (
           <div
             className={`cl ${win.start + i + 1 === focusLine ? "hit" : ""}`}
             key={win.start + i}
-            style={{ minHeight: CODE_LINE_PX }}
+            style={{ minHeight: box.line }}
           >
             <span className="no">{win.start + i + 1}</span>
             <span className="tx">

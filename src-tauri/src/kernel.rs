@@ -14,6 +14,8 @@ use crate::{secrets, trust};
 const HEALTH_PATH: &str = "/global/health";
 const LOG_TAIL: usize = 4000;
 const PROBE_FRESH: Duration = Duration::from_secs(2);
+/// watch 每 10 秒探测一次；进程还在但连续这么多次不应答（约 2 分钟）才算僵死
+const STALL_MISSES: u32 = 12;
 
 struct Begun {
     endpoint: Endpoint,
@@ -162,14 +164,25 @@ impl Kernel {
             if self.probe_fresh(&ep) {
                 return Ok(ep);
             }
-            if self.probe(&ep).await.is_some() {
+            if self.probe_retry(&ep, 2).await.is_some() {
+                self.remember_probe(&ep);
+                return Ok(ep);
+            }
+            // 进程活着、只是这一下没回声：重启等于把正在跑的会话打断。
+            // 先把端点交回去，让调用方的请求自己决定成败；真的僵死由 watch 在宽限期后处理。
+            // 顺手记一次探测结果，免得紧接着的每个请求都再等两轮 4 秒超时。
+            if self.child_alive_now() {
                 self.remember_probe(&ep);
                 return Ok(ep);
             }
         }
         let _gate = self.gate.lock().await;
         if let Some(ep) = self.current_endpoint() {
-            if self.probe(&ep).await.is_some() {
+            if self.probe_retry(&ep, 2).await.is_some() {
+                self.remember_probe(&ep);
+                return Ok(ep);
+            }
+            if self.child_alive_now() {
                 self.remember_probe(&ep);
                 return Ok(ep);
             }
@@ -431,7 +444,7 @@ impl Kernel {
                 }
             }
             // 壳被强杀过，句柄早丢了；按上次持久化的 pid 收掉遗留进程
-            None => reap_stored_pid(),
+            None => reap_stored_pid().await,
         }
         let _ = secrets::remove(secrets::ENDPOINT);
     }
@@ -468,6 +481,13 @@ impl Kernel {
             .map(str::to_string)
     }
 
+    fn child_alive_now(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|mut g| Kernel::child_alive(&mut g.child))
+            .unwrap_or(false)
+    }
+
     async fn await_healthy(&self, ep: &Endpoint) -> Option<String> {
         for _ in 0..180 {
             if let Some(v) = self.probe(ep).await {
@@ -485,6 +505,19 @@ impl Kernel {
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        None
+    }
+
+    /// 探测失败后再试一次：内核忙的时候单次超时不代表它已经死了
+    async fn probe_retry(&self, ep: &Endpoint, tries: u32) -> Option<String> {
+        for i in 0..tries.max(1) {
+            if let Some(v) = self.probe(ep).await {
+                return Some(v);
+            }
+            if i + 1 < tries {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
         }
         None
     }
@@ -521,12 +554,11 @@ async fn watch(app: tauri::AppHandle) {
             continue;
         }
         misses += 1;
-        let alive = kernel
-            .inner
-            .lock()
-            .map(|mut g| Kernel::child_alive(&mut g.child))
-            .unwrap_or(false);
-        if alive || misses < 3 {
+        let alive = kernel.child_alive_now();
+        // 进程退出：连续 3 次（约 30 秒）判定崩溃；进程活着但一声不吭：给它两分钟宽限，
+        // 免得一次长任务把健康接口堵住就被判死刑
+        let needed = if alive { STALL_MISSES } else { 3 };
+        if misses < needed {
             continue;
         }
         // 复核端点仍在线才接管重启；真正重启走 start()，与手动启动在 gate 上排队
@@ -590,7 +622,9 @@ fn scenario_env(cmd: &mut Command, home: &std::path::Path) {
     .env("OPENCODE_ALWAYS_NOTIFY_UPDATE", "false");
 }
 
-fn reap_stored_pid() {
+/// 全程走 tokio 的进程与计时器：以前用阻塞版 `ps` / `kill` + `thread::sleep`，
+/// 最长会把一个 async worker 占住 6 秒，启动和停止路径都要经过这里。
+async fn reap_stored_pid() {
     let Ok(Some(raw)) = secrets::get(secrets::ENDPOINT) else {
         return;
     };
@@ -599,9 +633,10 @@ fn reap_stored_pid() {
     };
     let Some(pid) = stored.pid else { return };
     // pid 会被系统复用：要求命令行里既有名为 codearts 的可执行文件，又有 serve 参数
-    let cmdline = std::process::Command::new("ps")
+    let cmdline = tokio::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
+        .await
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -610,24 +645,26 @@ fn reap_stored_pid() {
         return;
     }
     eprintln!("[kernel] 回收上次遗留的内核 pid={pid}");
-    let _ = std::process::Command::new("kill")
+    let _ = tokio::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
-        .status();
+        .status()
+        .await;
     // 等进程退出，避免立刻再起一个 serve 叠在同一数据目录上
     for _ in 0..50 {
-        if !pid_alive(pid) {
+        if !pid_alive(pid).await {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let _ = std::process::Command::new("kill")
+    let _ = tokio::process::Command::new("kill")
         .args(["-KILL", &pid.to_string()])
-        .status();
+        .status()
+        .await;
     for _ in 0..20 {
-        if !pid_alive(pid) {
+        if !pid_alive(pid).await {
             return;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -644,10 +681,11 @@ fn is_codearts_serve(cmdline: &str) -> bool {
     has_bin && has_serve
 }
 
-fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
+async fn pid_alive(pid: u32) -> bool {
+    tokio::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
+        .await
         .map(|s| s.success())
         .unwrap_or(false)
 }

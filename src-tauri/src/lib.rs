@@ -1,6 +1,7 @@
 mod api;
 mod error;
 mod files;
+mod git;
 mod kernel;
 mod ocr;
 mod providers;
@@ -237,6 +238,8 @@ pub fn run() {
             files::plans_list,
             files::plan_read,
             files::plan_save,
+            git::git_branches,
+            git::git_switch,
             skills::skills_managed,
             skills::skill_install_github,
             skills::skill_update_github,

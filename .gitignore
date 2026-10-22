@@ -34,3 +34,4 @@ cli.env
 
 # ---- 内核选中本目录为工作区时留下的运行态 ----
 .codeartsdoer/
+.workbuddy/

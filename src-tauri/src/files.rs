@@ -1,7 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -20,6 +21,24 @@ const MAX_PLANS: usize = 200;
 /// 壳子代内核落盘的计划正文上限：真计划是万字级，超过这个尺寸的多半是模型跑飞了
 const MAX_PLAN_BYTES: usize = 512 * 1024;
 const MAX_PLAN_STEM_CHARS: usize = 48;
+/// 找技能自建 plans 目录时最多访问多少个目录：大 monorepo 里不能无边递归
+const MAX_SCAN_DIRS: usize = 1500;
+/// 扫描结果缓存时长：够挡住 agent 干活时的连环刷新，又不至于让新建目录久久不出现
+const SCAN_TTL: Duration = Duration::from_secs(20);
+/// 明显不会有计划的构建产物/依赖目录，遍历时直接跳过
+const NO_SCAN_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    "venv",
+    "__pycache__",
+    "coverage",
+    "Pods",
+    "obj",
+];
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,7 +61,7 @@ pub struct FileList {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileContent {
-    /// 二进制/非 UTF-8 文件为 None
+    /// 二进制文件为 None；GBK 等非 UTF-8 文本会转成 UTF-8 后返回
     content: Option<String>,
     binary: bool,
     truncated: bool,
@@ -91,7 +110,7 @@ pub fn file_read(
 pub fn plans_list(app: tauri::AppHandle, directory: Option<String>) -> Result<Vec<PlanEntry>> {
     let settings = Settings::load(&app)?;
     let root = workspace_root(&settings, directory.as_deref())?;
-    Ok(collect_plans(&plan_roots(&settings, Some(&root))))
+    Ok(collect_plans(&plan_roots_cached(&settings, Some(&root))))
 }
 
 #[tauri::command]
@@ -125,7 +144,7 @@ pub fn plan_save(
 /// 资源管理器读哪个工作区：不带 `directory` 时用落盘的当前区；点开别的区的会话时前端显式带上那个区，
 /// 否则会出现"翻着 A 区的会话、树里是 B 区的文件"。这个参数来自 WebView，所以只放行
 /// settings 里登记过的工作区，不能拿它去读任意路径。
-fn workspace_root(settings: &Settings, directory: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn workspace_root(settings: &Settings, directory: Option<&str>) -> Result<PathBuf> {
     let Some(raw) = directory.map(str::trim).filter(|s| !s.is_empty()) else {
         return settings.project_dir();
     };
@@ -150,6 +169,16 @@ fn workspace_root(settings: &Settings, directory: Option<&str>) -> Result<PathBu
 /// 工作区里技能自建的 plans 目录再按目录名收进来。
 /// 符号链接解析后必须仍落在仓库或数据目录内，否则丢掉这个根。
 fn plan_roots(settings: &Settings, workspace: Option<&Path>) -> Vec<PlanRoot> {
+    plan_roots_with(settings, workspace, false)
+}
+
+/// `plans_list` 走缓存版：agent 干活时前端每几秒就会来问一次，
+/// 每次都从工作区根重扫一遍的话，开着「计划」页签等于持续跑一遍 find。
+fn plan_roots_cached(settings: &Settings, workspace: Option<&Path>) -> Vec<PlanRoot> {
+    plan_roots_with(settings, workspace, true)
+}
+
+fn plan_roots_with(settings: &Settings, workspace: Option<&Path>, cached: bool) -> Vec<PlanRoot> {
     let mut roots = Vec::new();
     // 跨区会话要看的是那个区自己的计划，不是一律跟着落盘的当前区
     if let Some(project) = workspace.map(PathBuf::from).or(settings.project_dir().ok()) {
@@ -166,8 +195,14 @@ fn plan_roots(settings: &Settings, workspace: Option<&Path>) -> Vec<PlanRoot> {
             }
         }
         // 技能（如 writing-plans）把计划写在工作区自己的 plans 目录，内核不知道这些路径
-        let mut dirs = Vec::new();
-        project_plan_dirs(&project, &project, 0, &mut dirs);
+        let dirs = if cached {
+            project_plan_dirs_cached(&project)
+        } else {
+            let mut dirs = Vec::new();
+            let mut budget = MAX_SCAN_DIRS;
+            project_plan_dirs(&project, &project, 0, &mut dirs, &mut budget);
+            dirs
+        };
         roots.extend(dirs.into_iter().map(|dir| ("project", dir)));
     }
     // `{{.codeartsdoer}}` 也可能落到用户目录；CLI 在非仓库目录会用它
@@ -185,13 +220,20 @@ fn plan_roots(settings: &Settings, workspace: Option<&Path>) -> Vec<PlanRoot> {
 }
 
 /// 工作区里名叫 `plans` 的目录（技能写的计划）。不跟符号链接，只在工程根内找。
-fn project_plan_dirs(jail: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn project_plan_dirs(
+    jail: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+    budget: &mut usize,
+) {
     const MAX_DEPTH: usize = 4;
     const MAX_DIRS: usize = 20;
-    if depth > MAX_DEPTH || out.len() >= MAX_DIRS {
+    if depth > MAX_DEPTH || out.len() >= MAX_DIRS || *budget == 0 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
+    *budget -= 1;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Ok(ft) = entry.file_type() else { continue };
@@ -204,11 +246,38 @@ fn project_plan_dirs(jail: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBu
             }
             continue;
         }
-        if name.starts_with('.') || name == "node_modules" {
+        if name.starts_with('.') || NO_SCAN_DIRS.contains(&name.as_str()) {
             continue;
         }
-        project_plan_dirs(jail, &entry.path(), depth + 1, out);
+        project_plan_dirs(jail, &entry.path(), depth + 1, out, budget);
     }
+}
+
+/// 只按 20 秒一次的真实扫描算：agent 跑起来后 `file.edited` 会让前端反复来要清单
+fn project_plan_dirs_cached(project: &Path) -> Vec<PathBuf> {
+    if let Ok(map) = scan_cache().lock() {
+        if let Some((at, dirs)) = map.get(project) {
+            if at.elapsed() < SCAN_TTL {
+                return dirs.clone();
+            }
+        }
+    }
+    let mut dirs = Vec::new();
+    let mut budget = MAX_SCAN_DIRS;
+    project_plan_dirs(project, project, 0, &mut dirs, &mut budget);
+    if let Ok(mut map) = scan_cache().lock() {
+        // 工作区数量有上限，攒到一定规模就整表清掉，不必做 LRU
+        if map.len() > 64 {
+            map.clear();
+        }
+        map.insert(project.to_path_buf(), (Instant::now(), dirs.clone()));
+    }
+    dirs
+}
+
+fn scan_cache() -> &'static Mutex<HashMap<PathBuf, (Instant, Vec<PathBuf>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (Instant, Vec<PathBuf>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// 目录还不存在时，只要已存在的祖先没有链出 jail，就保留逻辑路径。
@@ -491,7 +560,7 @@ fn read_at(path: &Path) -> Result<FileContent> {
     }
     let binary = looks_binary(&buf);
     Ok(FileContent {
-        content: (!binary).then(|| String::from_utf8_lossy(&buf).into_owned()),
+        content: (!binary).then(|| decode_text(&buf)),
         binary,
         truncated,
         size: md.len(),
@@ -499,16 +568,28 @@ fn read_at(path: &Path) -> Result<FileContent> {
     })
 }
 
+/// 二进制判定只看控制字符：NUL 或 0x00–0x08 / 0x0E–0x1F 占超过 2%。
+/// 不再要求"必须是合法 UTF-8"——GBK 的中文一个字节都不是合法 UTF-8，老项目会被整片误判成二进制。
 fn looks_binary(buf: &[u8]) -> bool {
     let probe = &buf[..buf.len().min(BINARY_PROBE)];
     if probe.contains(&0) {
         return true;
     }
-    match std::str::from_utf8(probe) {
-        Ok(_) => false,
-        // 探测窗口刚好切在多字节字符中间不算二进制
-        Err(e) => e.error_len().is_some() || e.valid_up_to() + 4 < probe.len(),
+    let ctrl = probe
+        .iter()
+        .filter(|b| **b < 0x09 || (**b > 0x0d && **b < 0x20))
+        .count();
+    ctrl * 50 > probe.len()
+}
+
+/// UTF-8 优先，不是 UTF-8 就当 GB18030（兼容 GBK/GB2312）解。
+/// 解码失败仍返回替换字符版：调用方已经排除了二进制，给原文总比给一片问号强。
+fn decode_text(buf: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(buf) {
+        return s.trim_start_matches('\u{feff}').to_string();
     }
+    let (text, _, _) = encoding_rs::GB18030.decode(buf);
+    text.trim_start_matches('\u{feff}').to_string()
 }
 
 fn mtime_of(md: &std::fs::Metadata) -> u64 {
@@ -612,6 +693,17 @@ mod tests {
         let bin = read(&root.0, "a.bin").unwrap();
         assert!(bin.binary);
         assert!(bin.content.is_none());
+    }
+
+    #[test]
+    fn reads_gbk_text_instead_of_calling_it_binary() {
+        let root = TempRoot::new();
+        // 「中文测试」的 GBK 编码：旧实现按"合法 UTF-8"判定，会把整片老项目当成二进制
+        let gbk: [u8; 8] = [0xd6, 0xd0, 0xce, 0xc4, 0xb2, 0xe2, 0xca, 0xd4];
+        std::fs::write(root.0.join("gbk.txt"), gbk).unwrap();
+        let f = read(&root.0, "gbk.txt").unwrap();
+        assert!(!f.binary, "GBK 文本不该被判成二进制");
+        assert_eq!(f.content.as_deref(), Some("中文测试"));
     }
 
     #[test]

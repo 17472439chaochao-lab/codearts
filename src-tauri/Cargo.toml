@@ -33,6 +33,8 @@ libc = "0.2"
 # 技能安装：解压 GitHub tarball 后按目录落盘，全程不调用外部 tar
 flate2 = "1"
 tar = "0.4"
+# 预览非 UTF-8 文本：国内老项目里的 GBK/GB18030 文件不该被当成二进制
+encoding_rs = "0.8"
 
 # 本地 Vision OCR：截图没有视觉模型时，用 macOS 自带框架把文字读出来
 [target.'cfg(target_os = "macos")'.dependencies]

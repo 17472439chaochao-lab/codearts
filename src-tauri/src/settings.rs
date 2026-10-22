@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +29,18 @@ impl Settings {
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(&path)?;
-        serde_json::from_str(&text).msg("配置文件损坏")
+        match serde_json::from_str::<Self>(&text) {
+            Ok(s) => Ok(s),
+            // 配置写坏不该让整个壳卡在检测页：原文件留一份备份，先按默认值跑起来，
+            // 用户下次保存就会写回一份干净的
+            Err(e) => {
+                match backup_corrupt(&path) {
+                    Ok(dst) => eprintln!("配置文件损坏，已备份到 {}（{e}）", dst.display()),
+                    Err(err) => eprintln!("配置文件损坏且备份失败（{err}）：{e}"),
+                }
+                Ok(Self::default())
+            }
+        }
     }
 
     pub fn save(&self, app: &tauri::AppHandle) -> Result<()> {
@@ -169,6 +181,22 @@ fn config_path(app: &tauri::AppHandle) -> Result<PathBuf> {
         .app_config_dir()
         .msg("无法解析应用配置目录")?;
     Ok(dir.join("settings.json"))
+}
+
+/// 把写坏的配置挪到 `settings.corrupt-<时间戳>.json`，不覆盖已有备份
+fn backup_corrupt(path: &Path) -> std::io::Result<PathBuf> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut dst = path.with_extension(format!("corrupt-{stamp}.json"));
+    let mut n = 1;
+    while dst.exists() {
+        dst = path.with_extension(format!("corrupt-{stamp}-{n}.json"));
+        n += 1;
+    }
+    std::fs::rename(path, &dst)?;
+    Ok(dst)
 }
 
 #[cfg(test)]

@@ -522,23 +522,47 @@ fn write_bundles(scope: &Scope, source: &Source, bundles: Vec<Bundle>, mode: Mod
                 report.conflicts.push(b.name.clone());
                 continue;
             }
-            // 覆盖前先确认要删的目录确实在技能目录里
-            let real = dest.canonicalize().msg("技能目录异常")?;
-            let real_root = root.canonicalize()?;
-            if !real.starts_with(&real_root) || real == real_root {
-                return Err(Error::Msg("技能目录越界".into()));
+            // 目录被手工删过时 canonicalize 会失败，那不叫异常，直接当首次写入；
+            // 还在的话先确认要替换的目录确实在技能目录里
+            if dest.exists() {
+                let real = dest.canonicalize().msg("技能目录异常")?;
+                let real_root = root.canonicalize()?;
+                if !real.starts_with(&real_root) || real == real_root {
+                    return Err(Error::Msg("技能目录越界".into()));
+                }
             }
-            std::fs::remove_dir_all(&real).msg("删除旧技能失败")?;
         }
-        std::fs::create_dir_all(&dest)?;
-        for (rel, bytes) in &b.files {
-            safe_rel(rel)?;
-            let target = dest.join(rel);
-            if let Some(p) = target.parent() {
-                std::fs::create_dir_all(p)?;
+        // 先写到同级临时目录再整体换上去：中途失败不会留下半残的技能目录
+        let staging = root.join(format!(".{}.staging-{}", b.name, now_ms()));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).msg("创建技能目录失败")?;
+        let staged = (|| -> Result<()> {
+            for (rel, bytes) in &b.files {
+                safe_rel(rel)?;
+                let target = staging.join(rel);
+                if let Some(p) = target.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                std::fs::write(&target, bytes).msg(format!("写入 {}/{} 失败", b.name, rel))?;
             }
-            std::fs::write(&target, bytes)
-                .msg(format!("写入 {}/{} 失败", b.name, rel))?;
+            Ok(())
+        })();
+        if let Err(e) = staged {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        if dest.exists() {
+            let trash = root.join(format!(".{}.old-{}", b.name, now_ms()));
+            std::fs::rename(&dest, &trash).msg("替换旧技能失败")?;
+            if let Err(e) = std::fs::rename(&staging, &dest) {
+                // 新目录挂不上去就把旧的放回原处，别让用户既没新的也没旧的
+                let _ = std::fs::rename(&trash, &dest);
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(e).msg("替换技能目录失败");
+            }
+            let _ = std::fs::remove_dir_all(&trash);
+        } else {
+            std::fs::rename(&staging, &dest).msg("落盘技能目录失败")?;
         }
         let now = now_ms();
         let entry = manifest.skills.entry(b.name.clone()).or_insert(ManagedSkill {

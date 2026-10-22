@@ -9,6 +9,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -43,6 +44,7 @@ import {
 } from "./kernelApi";
 import { APP_TITLE, useAppVersion, type KernelStatus } from "./App";
 import { FilePanel, FileViewer, QuickOpen, relInRoot, type OpenFile } from "./Files";
+import { BranchPicker, type GitState } from "./GitBranch";
 
 type Props = {
   projectDir: string;
@@ -132,10 +134,117 @@ export const MODEL_KEY = "codearts.model";
 const AGENT_KEY = "codearts.agent";
 /** 文件栏默认展开；用户收起一次之后记住 */
 const FILES_KEY = "codearts.filesPanel";
-/** 侧栏默认露出的条数：工作区列表，以及每个工作区下的会话。「加载更多」按同样步长展开，「收起」回到这个数 */
+/** 每个工作区默认露出的会话条数；「加载更多」按同样步长展开，「收起」回到这个数。工作区本身不再折叠 */
 const SIDE_PAGE = 3;
+
+/**
+ * 自绘滚动条：平时完全透明，滚动时浮出、停手 900ms 后渐隐（与正文区 .threadbar 同一观感）。
+ * 原生滚动条由 CSS 隐掉，否则会和这条并存。
+ */
+function OverlayBar({ box }: { box: RefObject<HTMLElement | null> }) {
+  const bar = useRef<HTMLDivElement>(null);
+  const thumb = useRef<HTMLDivElement>(null);
+  const hideTimer = useRef(0);
+  const drag = useRef<{ y: number; top: number; k: number } | null>(null);
+
+  /** 把滑块尺寸和位置对齐到当前视口；内容不够长时直接藏掉 */
+  const sync = useCallback(() => {
+    const el = box.current;
+    const wrap = bar.current;
+    const th = thumb.current;
+    if (!el || !wrap || !th) return false;
+    const track = wrap.clientHeight;
+    const max = el.scrollHeight - el.clientHeight;
+    if (max <= 2 || track <= 32) {
+      wrap.classList.remove("on");
+      return false;
+    }
+    const h = Math.max(28, Math.round((el.clientHeight / el.scrollHeight) * track));
+    th.style.height = `${h}px`;
+    th.style.transform = `translateY(${Math.round((el.scrollTop / max) * (track - h))}px)`;
+    return true;
+  }, [box]);
+
+  const flash = useCallback(() => {
+    if (!sync()) return;
+    const wrap = bar.current;
+    if (!wrap) return;
+    wrap.classList.add("on");
+    window.clearTimeout(hideTimer.current);
+    hideTimer.current = window.setTimeout(() => {
+      if (!drag.current) wrap.classList.remove("on");
+    }, 900);
+  }, [sync]);
+
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    el.addEventListener("scroll", flash, { passive: true });
+    // 窗口缩放、会话增删/改名都会改变内容高度，滑块要跟着重算
+    const ro = new ResizeObserver(() => sync());
+    ro.observe(el);
+    const mo = new MutationObserver(() => sync());
+    mo.observe(el, { childList: true, subtree: true, characterData: true });
+    sync();
+    return () => {
+      el.removeEventListener("scroll", flash);
+      ro.disconnect();
+      mo.disconnect();
+      window.clearTimeout(hideTimer.current);
+    };
+  }, [box, flash, sync]);
+
+  function down(e: ReactPointerEvent<HTMLDivElement>) {
+    const el = box.current;
+    const wrap = bar.current;
+    const th = thumb.current;
+    if (!el || !wrap || !th) return;
+    const track = wrap.clientHeight;
+    const h = th.offsetHeight;
+    const max = el.scrollHeight - el.clientHeight;
+    if (max <= 2 || track <= h) return;
+    e.preventDefault();
+    wrap.setPointerCapture(e.pointerId);
+    const rect = wrap.getBoundingClientRect();
+    const top = Math.max(0, Math.min(track - h, e.clientY - rect.top - h / 2));
+    el.scrollTop = (top / (track - h)) * max;
+    drag.current = { y: e.clientY, top: el.scrollTop, k: max / (track - h) };
+    window.clearTimeout(hideTimer.current);
+    wrap.classList.add("on");
+  }
+
+  function move(e: ReactPointerEvent<HTMLDivElement>) {
+    const d = drag.current;
+    const el = box.current;
+    if (d && el) el.scrollTop = d.top + (e.clientY - d.y) * d.k;
+  }
+
+  function up(e: ReactPointerEvent<HTMLDivElement>) {
+    if (!drag.current) return;
+    drag.current = null;
+    const wrap = bar.current;
+    if (wrap?.hasPointerCapture(e.pointerId)) wrap.releasePointerCapture(e.pointerId);
+    flash();
+  }
+
+  return (
+    <div
+      className="wsbar"
+      ref={bar}
+      onPointerDown={down}
+      onPointerMove={move}
+      onPointerUp={up}
+      onPointerCancel={up}
+      aria-hidden="true"
+    >
+      <div className="wsthumb" ref={thumb} />
+    </div>
+  );
+}
 /** 规划轮的回复短于这么多字符就不当计划存盘（真计划是千字级，「确认无误」这种不算） */
 const MIN_PLAN_CHARS = 120;
+/** 改动快照带前后全文，agent 连续改文件时别每 0.7 秒就重取一次，至少隔这么久 */
+const DIFF_MIN_GAP_MS = 2500;
 
 /** 内核用来起标题、做摘要、压缩上下文的内部 agent，选它们当主对话只会得到一句废话 */
 const INTERNAL_AGENTS = new Set(["title", "summary", "compaction"]);
@@ -263,13 +372,13 @@ export default function Chat({
   const live = status?.healthy ?? false;
   const dir = projectDir;
   const ver = useAppVersion();
+  /** 侧栏滚动容器：自绘滚动条按它算滑块 */
+  const wsList = useRef<HTMLUListElement>(null);
 
   const [list, setList] = useState<Session[]>([]);
-  /** 已展开的工作区个数；缺省按 SIDE_PAGE */
-  const [wsShown, setWsShown] = useState<number | null>(null);
-  /** 每个工作区已展开的会话条数；缺省按 SIDE_PAGE */
-  const [sessShown, setSessShown] = useState<Record<string, number>>({});
   const [active, setActive] = useState<string | null>(null);
+  /** 每个工作区已展开的会话条数；缺省按 SIDE_PAGE（工作区本身不再折叠） */
+  const [sessShown, setSessShown] = useState<Record<string, number>>({});
   /** 异步回填对比用：listener / fetch 完成时 active 可能已变 */
   const activeRef = useRef<string | null>(null);
   activeRef.current = active;
@@ -317,9 +426,8 @@ export default function Chat({
   const bridgeDown = useRef(false);
   /** file.edited 的脉冲：让正在跑的那轮小结胶囊跳动一下 */
   const [editPulse, setEditPulse] = useState(0);
-  /** 删除会话的二次确认：先按 × 或菜单进入待确认，再点「删」才真的删 */
-  const [delAsk, setDelAsk] = useState<string | null>(null);
-  const delTimer = useRef<number | null>(null);
+  /** 标题兜底计时器：按会话 id 归堆，卸载或删会话时统一撤销 */
+  const titleTimers = useRef(new Map<string, number[]>());
   /**
    * 公开发布前的确认弹窗（存待发布的会话 id）。
    * 这条路由会把整段对话上传到公网，只点一次菜单不该发生，所以强制走弹窗。
@@ -391,6 +499,16 @@ export default function Chat({
   const [searchTick, setSearchTick] = useState(0);
   /** 当前工作区的 Git 分支；内核 /vcs 在非 git 目录回空对象，那时不显示 */
   const [branch, setBranch] = useState<VcsInfo | null>(null);
+  /** 分支列表 / 游离 HEAD / 未提交改动数，由壳侧的 git 命令读取 */
+  const [gitState, setGitState] = useState<GitState | null>(null);
+  /** 窗口重新获得焦点就重读一次分支：用户可能在终端里 checkout 过 */
+  const [focusTick, setFocusTick] = useState(0);
+
+  useEffect(() => {
+    const onFocus = () => setFocusTick((t) => t + 1);
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, []);
 
   /**
    * 每个工作区各发一次 `GET /session`（带各自的 x-opencode-directory）。
@@ -525,10 +643,12 @@ export default function Chat({
     setFileView(null);
   }, [wsDir]);
 
-  // 分支是工作区的属性：换区、点开别的区的会话、内核上下线、每轮起停各取一次（内核现读 git，很便宜）
+  // 分支是工作区的属性：换区、点开别的区的会话、内核上下线、每轮起停各取一次
+  // （内核现读 git，很便宜）。壳侧的 git_branches 顺带给出游离 HEAD 与未提交改动数。
   useEffect(() => {
     if (!live || !wsDir) {
       setBranch(null);
+      setGitState(null);
       return;
     }
     let alive = true;
@@ -541,10 +661,26 @@ export default function Chat({
         // 拿不到就不显示分支，别在顶栏挂个错误条
         if (alive) setBranch(null);
       });
+    invoke<GitState>("git_branches", { directory: wsDir })
+      .then((st) => {
+        if (alive) setGitState(st);
+      })
+      .catch(() => {
+        // 顶栏有 /vcs 的分支名就够用了，git 读不到时只是不给切
+        if (alive) setGitState(null);
+      });
     return () => {
       alive = false;
     };
-  }, [wsDir, live, busy]);
+  }, [wsDir, live, busy, focusTick]);
+
+  /** 切完分支：顶栏跟着换名字，文件树与 diff 按新分支重读 */
+  function onBranchSwitched(st: GitState) {
+    setGitState(st);
+    setBranch((b) => ({ ...(b ?? {}), branch: st.current ?? undefined }));
+    setEditPulse((v) => v + 1);
+    setToast(st.current ? `已切到分支 ${st.current}` : `已切到游离 HEAD ${st.head ?? ""}`.trim());
+  }
 
   /** ⌘P 快捷打开 / ⌘⇧F 全文搜索；内核没起来时不接管，免得按一下就把它拉起来 */
   useEffect(() => {
@@ -632,16 +768,24 @@ export default function Chat({
   }, [active, live, wsOf, dir]);
   const reloadDiffsRef = useRef(reloadDiffs);
   reloadDiffsRef.current = reloadDiffs;
+  /** 上次重取改动的时间 */
+  const diffsAt = useRef(0);
 
   useEffect(() => {
     setSessionDiffs([]);
+    diffsAt.current = Date.now();
     reloadDiffs();
   }, [reloadDiffs]);
 
-  // file.edited 可能一轮里来几十次，收拢成一次重取
+  // file.edited 可能一轮里来几十次，收拢成一次重取；diff 带前后全文，
+  // 所以再加下限间隔，只在最后一轮 idle 时补一次精确结果
   useEffect(() => {
     if (!editPulse) return;
-    const t = window.setTimeout(reloadDiffs, 700);
+    const wait = Math.max(700, DIFF_MIN_GAP_MS - (Date.now() - diffsAt.current));
+    const t = window.setTimeout(() => {
+      diffsAt.current = Date.now();
+      reloadDiffs();
+    }, wait);
     return () => window.clearTimeout(t);
   }, [editPulse, reloadDiffs]);
 
@@ -777,7 +921,6 @@ export default function Chat({
     setActive((cur) => (cur && sameDir(dirOfRef.current(cur), dir) ? cur : null));
     setRetry(null);
     setAlert(null);
-    setDelAsk(null);
     setFileView(null);
     setSessionDiffs([]);
     setAttachments([]);
@@ -1314,21 +1457,44 @@ export default function Chat({
    * 内核自动起名插件偶发 AI_NoOutputGeneratedError，会把标题停在「新会话」。
    * 壳侧在首轮后隔几秒补一次标题；若内核随后自己起好了就不再覆盖。
    */
-  function scheduleTitleFallback(sid: string, title: string, where: string) {
-    for (const wait of [2500, 7000, 15000]) {
-      window.setTimeout(async () => {
-        try {
-          const cur = await sessions.get(sid, where);
-          if (cur.title && !DEFAULT_TITLES.has(cur.title.trim())) return;
-          const updated = await sessions.update(sid, title, where);
-          setList((l) => l.map((s) => (s.id === sid ? { ...s, ...updated } : s)));
-        } catch {
-          // 内核重启、工作区切换或会话已删：放弃这次兜底
-          return;
-        }
-      }, wait);
-    }
+  function cancelTitleFallback(sid: string) {
+    const ids = titleTimers.current.get(sid);
+    if (!ids) return;
+    for (const t of ids) window.clearTimeout(t);
+    titleTimers.current.delete(sid);
   }
+
+  function scheduleTitleFallback(sid: string, title: string, where: string) {
+    cancelTitleFallback(sid);
+    const ids: number[] = [];
+    for (const wait of [2500, 7000, 15000]) {
+      ids.push(
+        window.setTimeout(async () => {
+          try {
+            const cur = await sessions.get(sid, where);
+            if (cur.title && !DEFAULT_TITLES.has(cur.title.trim())) return;
+            const updated = await sessions.update(sid, title, where);
+            setList((l) => l.map((s) => (s.id === sid ? { ...s, ...updated } : s)));
+          } catch {
+            // 内核重启、工作区切换或会话已删：放弃这次兜底
+            return;
+          }
+        }, wait),
+      );
+    }
+    titleTimers.current.set(sid, ids);
+  }
+
+  // 卸载时把没跑完的兜底计时器清掉，别在已拆掉的界面上 setState
+  useEffect(() => {
+    const timers = titleTimers;
+    return () => {
+      for (const ids of timers.current.values()) {
+        for (const t of ids) window.clearTimeout(t);
+      }
+      timers.current.clear();
+    };
+  }, []);
 
   /** 粘贴后立刻在 Rust 侧跑 Vision OCR；不阻塞缩略图出现 */
   function startOcr(a: Attachment) {
@@ -1541,27 +1707,16 @@ export default function Chat({
     }
   }
 
+  /** 侧栏的 × 与右键菜单都走这里，直接删；不再有「点两下才删」的二次确认 */
   async function removeSession(id: string) {
     try {
+      cancelTitleFallback(id);
       await sessions.remove(id, dirOf(id));
       if (id === active) setActive(null);
       reloadList();
     } catch (e) {
       setErr(String(e));
     }
-  }
-
-  /** 第一次点删除只进入待确认（几秒后自动收回），第二次才是真删 */
-  function armDelete(id: string) {
-    setDelAsk(id);
-    if (delTimer.current) window.clearTimeout(delTimer.current);
-    delTimer.current = window.setTimeout(() => setDelAsk(null), 4000);
-  }
-
-  function confirmDelete(id: string) {
-    setDelAsk(null);
-    if (delTimer.current) window.clearTimeout(delTimer.current);
-    void removeSession(id);
   }
 
   /** 生命周期接口都返回整条会话，就地并回侧栏列表，不必重拉全部工作区 */
@@ -1577,9 +1732,9 @@ export default function Chat({
     try {
       const from = dirOf(id);
       const s = await sessions.fork(id, from);
-      // 分叉出来的会话必然还在原实例里，内核没带 directory 就按原区补齐
+      // 分叉出来的会话必然还在原实例里，内核没带 directory 就按原区补齐。
+      // 只并一次：先补再并原始响应会把 directory 又按 null 覆盖回去
       mergeSession({ ...s, directory: s.directory ?? from });
-      mergeSession(s);
       // 分叉完直接切到新那条：切会话会清空 toast，所以这里不弹提示，跳转本身就是回执
       setActive(s.id);
     } catch (e) {
@@ -1752,6 +1907,8 @@ export default function Chat({
   }, []);
 
   const policy = matchPolicy(rules, bashMode);
+  /** 手动禁止的条目在切策略时必须原样留着，否则用户收紧过的规则会被静默放开 */
+  const denyRules = rules?.filter((r) => r.action === "deny") ?? [];
 
   async function applyPolicy(id: string) {
     const p = POLICIES.find((x) => x.id === id);
@@ -1761,14 +1918,17 @@ export default function Chat({
       // bash 只认 /permission/bash/mode，global 规则集里没有它，两次写缺一不可
       await permissionConfig.setBashMode(p.mode, dir);
       const allow = allowedSet(p, rules);
-      const next: PermRule[] = rules.map((r) => ({
-        ...r,
-        action: allow.has(r.permission) ? "allow" : "ask",
-      }));
+      const next: PermRule[] = rules.map((r) =>
+        r.action === "deny" ? r : { ...r, action: allow.has(r.permission) ? "allow" : "ask" },
+      );
       await permissionConfig.setRules(next, dir);
       setRules(next);
       setBashMode(p.mode);
-      setToast(`授权策略已切到「${p.label}」`);
+      setToast(
+        denyRules.length
+          ? `授权策略已切到「${p.label}」，保留 ${denyRules.length} 项手动禁止`
+          : `授权策略已切到「${p.label}」`,
+      );
     } catch (e) {
       setErr(String(e));
     }
@@ -1982,7 +2142,7 @@ export default function Chat({
       ...(s?.share
         ? [{ label: "取消公开发布", run: () => void doUnshare(id) }]
         : [{ label: "公开发布到公网…", danger: true, run: () => setShareAsk(id) }]),
-      { label: "删除会话", danger: true, run: () => armDelete(id) },
+      { label: "删除会话", danger: true, run: () => void removeSession(id) },
     ];
   }
 
@@ -1996,17 +2156,6 @@ export default function Chat({
     items.push({ label: "只删除这条消息", danger: true, run: () => void removeMessage(m.info.id) });
     return items;
   }
-
-  const wsCap = wsShown ?? SIDE_PAGE;
-  const wsHead = projects.slice(0, wsCap);
-  // 当前工作区如果落在折叠区，单独补一行，不必把中间全部摊开
-  const wsPinned = wsHead.some((p) => sameDir(p, projectDir))
-    ? undefined
-    : projects.find((p) => sameDir(p, projectDir));
-  const visibleProjects = wsPinned ? [...wsHead, wsPinned] : wsHead;
-  const wsOpen = new Set(visibleProjects);
-  const wsRest = projects.filter((p) => !wsOpen.has(p)).length;
-  const wsExpanded = wsCap > SIDE_PAGE;
 
   return (
     <div className="shell2">
@@ -2036,146 +2185,111 @@ export default function Chat({
               </svg>
             </button>
           </header>
-          <ul className="wslist" data-tauri-drag-region="deep">
-            {visibleProjects.map((p) => {
-              const cur = sameDir(p, projectDir);
-              const items = ofWs(p);
-              const cap = sessShown[p] ?? SIDE_PAGE;
-              const head = items.slice(0, cap);
-              // 当前打开的那条如果落在折叠区，单独补一行，不必把中间全部摊开
-              const pinned = head.some((s) => s.id === active)
-                ? undefined
-                : items.find((s) => s.id === active);
-              const visible = pinned ? [...head, pinned] : head;
-              const shown = new Set(visible.map((s) => s.id));
-              const rest = items.filter((s) => !shown.has(s.id)).length;
-              const expanded = cap > SIDE_PAGE;
-              return (
-                <li key={p} className={`ws ${cur ? "on" : ""}`}>
-                  <div
-                    className="wsrow"
-                    onContextMenu={(e) => openMenu(e, wsMenu(p, cur))}
-                  >
-                    <button
-                      className="wsname"
-                      onClick={() => switchTo(p)}
-                      title={cur ? p : `切到 ${p}`}
-                    >
-                      <svg className="ico" viewBox="0 0 16 16" aria-hidden="true">
-                        <path
-                          d="M1.5 4.3A1.5 1.5 0 0 1 3 2.8h2.9l1.4 1.6H13a1.5 1.5 0 0 1 1.5 1.5v6A1.5 1.5 0 0 1 13 13.4H3a1.5 1.5 0 0 1-1.5-1.5z"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.2"
-                        />
-                      </svg>
-                      {baseName(p)}
-                    </button>
-                    {!cur && (
+          {/* 工作区全量列出；会话仍按 SIDE_PAGE 分批。滚动条是自绘的，只在滚动时渐显 */}
+          <div className="wslistwrap">
+            <ul className="wslist" data-tauri-drag-region="deep" ref={wsList}>
+              {projects.map((p) => {
+                const cur = sameDir(p, projectDir);
+                const items = ofWs(p);
+                const cap = sessShown[p] ?? SIDE_PAGE;
+                const head = items.slice(0, cap);
+                // 当前打开的那条如果落在折叠区，单独补一行，不必把中间全部摊开
+                const pinned = head.some((s) => s.id === active)
+                  ? undefined
+                  : items.find((s) => s.id === active);
+                const visible = pinned ? [...head, pinned] : head;
+                const shown = new Set(visible.map((s) => s.id));
+                const rest = items.filter((s) => !shown.has(s.id)).length;
+                const expanded = cap > SIDE_PAGE;
+                return (
+                  <li key={p} className={`ws ${cur ? "on" : ""}`}>
+                    <div className="wsrow" onContextMenu={(e) => openMenu(e, wsMenu(p, cur))}>
                       <button
-                        className="x"
-                        onClick={() => dropWs(p)}
-                        title="从列表移除（不删除文件夹）"
-                        aria-label="从列表移除该工作区（不删除文件夹）"
+                        className="wsname"
+                        onClick={() => switchTo(p)}
+                        title={cur ? p : `切到 ${p}`}
                       >
-                        ×
+                        <svg className="ico" viewBox="0 0 16 16" aria-hidden="true">
+                          <path
+                            d="M1.5 4.3A1.5 1.5 0 0 1 3 2.8h2.9l1.4 1.6H13a1.5 1.5 0 0 1 1.5 1.5v6A1.5 1.5 0 0 1 13 13.4H3a1.5 1.5 0 0 1-1.5-1.5z"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.2"
+                          />
+                        </svg>
+                        {baseName(p)}
                       </button>
-                    )}
-                  </div>
-                  <ul className="sess">
-                    {visible.map((s) => (
-                      <li
-                        key={s.id}
-                        className={s.id === active ? "on" : ""}
-                        onContextMenu={(e) => openMenu(e, sessMenu(p, s.id, cur))}
-                      >
+                      {!cur && (
                         <button
-                          className="link"
-                          onClick={() => openSession(s.id)}
-                          title={s.parentID ? `子任务会话 · ${s.id}` : s.id}
+                          className="x"
+                          onClick={() => dropWs(p)}
+                          title="从列表移除（不删除文件夹）"
+                          aria-label="从列表移除该工作区（不删除文件夹）"
                         >
-                          {s.parentID ? `↳ ${s.title || s.id}` : s.title || s.id}
+                          ×
                         </button>
-                        {delAsk === s.id ? (
-                          <>
-                            <button
-                              className="x armed danger"
-                              onClick={() => confirmDelete(s.id)}
-                              title="确认删除这条会话"
-                            >
-                              删
-                            </button>
-                            <button
-                              className="x armed"
-                              onClick={() => setDelAsk(null)}
-                              title="取消"
-                            >
-                              ×
-                            </button>
-                          </>
-                        ) : (
+                      )}
+                    </div>
+                    <ul className="sess">
+                      {visible.map((s) => (
+                        <li
+                          key={s.id}
+                          className={s.id === active ? "on" : ""}
+                          onContextMenu={(e) => openMenu(e, sessMenu(p, s.id, cur))}
+                        >
+                          <button
+                            className="link"
+                            onClick={() => openSession(s.id)}
+                            title={s.parentID ? `子任务会话 · ${s.id}` : s.id}
+                          >
+                            {s.parentID ? `↳ ${s.title || s.id}` : s.title || s.id}
+                          </button>
                           <button
                             className="x"
-                            onClick={() => armDelete(s.id)}
+                            onClick={() => void removeSession(s.id)}
                             title="删除会话"
                             aria-label="删除会话"
                           >
                             ×
                           </button>
-                        )}
-                      </li>
-                    ))}
-                    {(rest > 0 || expanded) && (
-                      <li className="ops">
-                        {rest > 0 && (
-                          <button
-                            className="link more"
-                            onClick={() =>
-                              setSessShown((prev) => ({ ...prev, [p]: cap + SIDE_PAGE }))
-                            }
-                          >
-                            加载更多（{rest}）
-                          </button>
-                        )}
-                        {expanded && (
-                          <button
-                            className="link more"
-                            onClick={() =>
-                              setSessShown((prev) => {
-                                const next = { ...prev };
-                                delete next[p];
-                                return next;
-                              })
-                            }
-                          >
-                            收起
-                          </button>
-                        )}
-                      </li>
-                    )}
-                    {!items.length && <li className="muted pad">暂无会话</li>}
-                  </ul>
-                </li>
-              );
-            })}
-            {(wsRest > 0 || wsExpanded) && (
-              <li className="ops">
-                {wsRest > 0 && (
-                  <button
-                    className="more"
-                    onClick={() => setWsShown(wsCap + SIDE_PAGE)}
-                  >
-                    加载更多（{wsRest}）
-                  </button>
-                )}
-                {wsExpanded && (
-                  <button className="more" onClick={() => setWsShown(null)}>
-                    收起
-                  </button>
-                )}
-              </li>
-            )}
-          </ul>
+                        </li>
+                      ))}
+                      {(rest > 0 || expanded) && (
+                        <li className="ops">
+                          {rest > 0 && (
+                            <button
+                              className="link more"
+                              onClick={() =>
+                                setSessShown((prev) => ({ ...prev, [p]: cap + SIDE_PAGE }))
+                              }
+                            >
+                              加载更多（{rest}）
+                            </button>
+                          )}
+                          {expanded && (
+                            <button
+                              className="link more"
+                              onClick={() =>
+                                setSessShown((prev) => {
+                                  const next = { ...prev };
+                                  delete next[p];
+                                  return next;
+                                })
+                              }
+                            >
+                              收起
+                            </button>
+                          )}
+                        </li>
+                      )}
+                      {!items.length && <li className="muted pad">暂无会话</li>}
+                    </ul>
+                  </li>
+                );
+              })}
+            </ul>
+            <OverlayBar box={wsList} />
+          </div>
         </div>
         <footer>
           <button className="ico-btn" onClick={onOpenSettings} title="设置" aria-label="设置">
@@ -2199,28 +2313,21 @@ export default function Chat({
           <span className="muted">
             {live ? `内核在线 · ${status?.version}` : "内核未运行"}
           </span>
-          {branch?.branch && (
-            <span
-              className="branch"
-              title={`Git 分支 ${branch.branch} · ${baseName(wsDir)}${
-                branch.default_branch && branch.default_branch !== branch.branch
-                  ? ` · 默认 ${branch.default_branch}`
-                  : ""
-              }`}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M6 3v12M18 9a9 9 0 0 1-9 9"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                />
-                <circle cx="18" cy="6" r="3" fill="none" stroke="currentColor" strokeWidth="2" />
-                <circle cx="6" cy="18" r="3" fill="none" stroke="currentColor" strokeWidth="2" />
-              </svg>
-              {branch.branch}
-            </span>
+          {(gitState?.repo || branch?.branch) && (
+            <BranchPicker
+              dir={wsDir}
+              name={
+                gitState?.repo
+                  ? (gitState.current ?? (gitState.head ? `(${gitState.head})` : "无分支"))
+                  : (branch?.branch ?? "")
+              }
+              blocked={
+                busySet.size
+                  ? "还有会话在运行，等这一轮结束再切分支（避免切到一半文件被换掉）"
+                  : null
+              }
+              onSwitched={onBranchSwitched}
+            />
           )}
           <button
             className="ico-btn"
@@ -2384,6 +2491,8 @@ export default function Chat({
             })}
             {busy && (
               <BusyHint
+                // 秒表挂在组件内部：不带 key 时从忙的 A 切到忙的 B 会沿用 A 的起点
+                key={active ?? "none"}
                 waitingPerm={perms.length > 0}
                 waitingAsk={asks.length > 0}
                 retry={retry && retry.sid === active ? retry : null}
@@ -2618,7 +2727,13 @@ export default function Chat({
                 ]}
                 placeholder="授权策略加载中"
                 disabled={!rules}
-                title={POLICIES.find((p) => p.id === policy)?.hint ?? "当前策略与三种预设都不一致"}
+                title={
+                  (POLICIES.find((p) => p.id === policy)?.hint ??
+                    "当前策略与三种预设都不一致") +
+                  (denyRules.length
+                    ? `；另有 ${denyRules.length} 项手动禁止，切换策略时保留`
+                    : "")
+                }
                 onChange={(v) => void applyPolicy(v)}
               />
               <ChipSelect
@@ -2693,6 +2808,9 @@ export default function Chat({
           diffs={sessionDiffs}
           pulse={editPulse}
           focusSearch={searchTick}
+          workspaces={projects.length ? projects : [projectDir]}
+          onSwitchDir={(d) => switchTo(d)}
+          onAddDir={onAddDir}
           onOpenFile={openWorkspaceFile}
           onRefreshDiffs={reloadDiffs}
           onClose={toggleFiles}
@@ -2974,11 +3092,13 @@ const allowedSet = (p: Policy, rules: PermRule[]) =>
 
 function matchPolicy(rules: PermRule[] | null, mode: BashMode | null): string {
   if (!rules || !mode) return "custom";
+  // deny 是用户额外加的手铐，不参与预设比对：否则切完策略立刻显示成「自定义」
+  const live = rules.filter((r) => r.action !== "deny");
   for (const p of POLICIES) {
     const allow = allowedSet(p, rules);
     if (
       p.mode === mode &&
-      rules.every((r) => r.action === (allow.has(r.permission) ? "allow" : "ask"))
+      live.every((r) => r.action === (allow.has(r.permission) ? "allow" : "ask"))
     )
       return p.id;
   }
@@ -3009,13 +3129,38 @@ function usage(info: MessageInfo): string {
   const secs = info.time?.completed
     ? Math.max(0, Math.round((info.time.completed - info.time.created) / 100) / 10)
     : 0;
-  if (secs > 0) bits.push(`${secs}s`);
+  if (secs > 0) bits.push(fmtSpan(secs));
   // 流式过程中 token 全 0，这行只会变成噪音
   return bits.length > 1 ? bits.join(" · ") : "";
 }
 
 const fmtNum = (n: number, frac = 0) =>
   n.toLocaleString("zh-CN", { maximumFractionDigits: frac });
+
+/**
+ * 时长按量级换单位：秒 → 分 → 时 → 天，最多报两级（3分12秒 / 2小时5分 / 3天4小时）。
+ * 入参是秒；不足一秒保留一位小数，跑长了的会话不会再变成 1832s 这种读数。
+ */
+function fmtSpan(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return "";
+  if (sec === 0) return "0秒";
+  if (sec < 1) {
+    // 0.96 秒四舍五入到 1.0 后别再退回秒的小数位
+    const tenth = Math.round(sec * 10) / 10;
+    return tenth < 1 ? `${tenth.toFixed(1)}秒` : "1秒";
+  }
+  const total = Math.floor(sec);
+  if (total < 60) return `${total}秒`;
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  if (m < 60) return s ? `${m}分${s}秒` : `${m}分`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  if (h < 24) return mm ? `${h}小时${mm}分` : `${h}小时`;
+  const d = Math.floor(h / 24);
+  const hh = h % 24;
+  return hh ? `${d}天${hh}小时` : `${d}天`;
+}
 
 /** 只有最新一段思考自动展开，否则一轮十几段思考能把正文顶出屏 */
 function lastReasoning(msgs: Message[]): string | null {
@@ -3073,6 +3218,7 @@ function BusyHint({
   useEffect(() => {
     const t0 = Date.now();
     setElapsed(0);
+    // 每秒一次只更新这个叶子；换算成秒交给 fmtSpan，跑久了自动走分/时
     const iv = window.setInterval(() => setElapsed(Math.floor((Date.now() - t0) / 1000)), 1000);
     return () => window.clearInterval(iv);
   }, []);
@@ -3082,7 +3228,7 @@ function BusyHint({
       ? "等待你在下方回答…"
       : retry
         ? `自动重试中（第 ${retry.attempt} 次）：${retry.message}`
-        : `内核处理中 ${elapsed}s · ${activity}`;
+        : `内核处理中 ${fmtSpan(elapsed)} · ${activity}`;
   return (
     <p className="hint busy">
       <span className="pulse" />
@@ -3335,7 +3481,7 @@ function StatusChip({ status }: { status: string }) {
 const FSTATUS_CN: Record<string, string> = { added: "A", deleted: "D", modified: "M" };
 
 const dur = (t?: { start?: number; end?: number }) =>
-  t?.start && t?.end && t.end >= t.start ? `${((t.end - t.start) / 1000).toFixed(1)}s` : "";
+  t?.start && t?.end && t.end >= t.start ? fmtSpan((t.end - t.start) / 1000) : "";
 
 /** 这些工具的入参本身就写在标题行里，再摊一份 JSON 只会把正文挤成一堵墙 */
 const SELF_EXPLANATORY = new Set([

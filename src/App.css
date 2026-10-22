@@ -362,12 +362,65 @@ code {
   justify-content: space-between;
 }
 
+.wslistwrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
 .wslist {
   list-style: none;
   margin: 0;
   padding: 0;
   flex: 1;
-  overflow: auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* 原生滚动条隐掉，用自绘的 .wsbar：滚动时浮出、停手渐隐（同正文区） */
+  scrollbar-width: none;
+}
+
+.wslist::-webkit-scrollbar {
+  display: none;
+}
+
+/* 自绘滚动条：默认透明，滚动时 .on 渐显，位置由 Chat.tsx 的 OverlayBar 算 */
+.wsbar {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  /* 落在 .side 的 12px 右内边距里，不压住会话标题 */
+  right: -10px;
+  width: 8px;
+  border-radius: 999px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.wsbar.on {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.wsthumb {
+  position: absolute;
+  top: 0;
+  left: 1px;
+  right: 1px;
+  min-height: 28px;
+  border-radius: 999px;
+  background: rgba(28, 28, 30, 0.22);
+  cursor: default;
+  transition: background 0.15s ease;
+}
+
+.wsbar:hover .wsthumb {
+  background: rgba(28, 28, 30, 0.34);
+}
+
+.wsbar:active .wsthumb {
+  background: rgba(28, 28, 30, 0.42);
 }
 
 .wslist li.ws {
@@ -519,27 +572,6 @@ code {
   color: var(--fg);
 }
 
-.wslist li.ops {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px 2px 0;
-}
-
-.wslist .more {
-  border: 0;
-  background: none;
-  text-align: left;
-  padding: 5px 6px;
-  font-size: 12px;
-  font-weight: 400;
-  color: var(--muted);
-}
-
-.wslist .more:hover {
-  color: var(--fg);
-}
-
 .side footer {
   display: flex;
   gap: 6px;
@@ -578,11 +610,152 @@ code {
   font-weight: 600;
 }
 
+.files .fwsdrop {
+  position: relative;
+  min-width: 0;
+}
+
+/* 资源管理器标题栏的目录：点开就是工作区切换 */
+.files .fwsbtn {
+  appearance: none;
+  -webkit-appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 132px;
+  height: 22px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.files .fwsbtn:hover,
+.files .fwsbtn.open {
+  background: #f2f2f5;
+  color: var(--fg);
+}
+
+.files .fwsbtn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .files .fws {
-  max-width: 92px;
+  min-width: 0;
+  max-width: 96px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.files .fwsbtn .chchev {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  opacity: 0.7;
+  transition: transform 0.12s ease;
+}
+
+.files .fwsbtn.open .chchev {
+  transform: rotate(180deg);
+}
+
+.fwsmenu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  width: 268px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.18);
+}
+
+.fwsgroup {
+  padding: 6px 8px 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.fwsrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fwsrow:hover:not(:disabled) {
+  background: #f2f2f5;
+}
+
+.fwsrow.on {
+  background: #eef2f9;
+  cursor: default;
+}
+
+.fwsrow .fwstx {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.fwsrow .lbl {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fwsrow .sub {
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fwsrow .ck {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+}
+
+.fwsadd {
+  width: 100%;
+  margin-top: 2px;
+  padding: 7px 8px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fwsadd:hover {
+  background: #f2f2f5;
 }
 
 .files .fhead .ico-btn {
@@ -1020,28 +1193,263 @@ code {
   font-size: 11px;
 }
 
-/* 顶栏的 Git 分支：只读展示，默认分支等细节收进 title */
+/* 顶栏的 Git 分支：点开下拉切分支，默认分支等细节收进 title */
+.branchsel {
+  position: relative;
+  flex: none;
+  display: flex;
+}
+
 .branch {
+  appearance: none;
+  -webkit-appearance: none;
   flex: none;
   display: inline-flex;
   align-items: center;
   gap: 5px;
   max-width: 220px;
-  padding: 2px 9px;
+  padding: 2px 8px 2px 9px;
   border: 1px solid var(--line);
   border-radius: 999px;
   background: #fff;
   color: var(--muted);
+  font: inherit;
   font-size: 11px;
   white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+
+.branch:hover:not(:disabled),
+.branch.open {
+  background: #f2f2f5;
+  color: var(--fg);
+}
+
+.branch:disabled {
+  cursor: default;
+  color: #a8a8af;
+}
+
+.branch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.branch > svg {
+  flex: none;
+  width: 12px;
+  height: 12px;
+}
+
+.branch .btx {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.branch svg {
+.branch .chchev {
   flex: none;
-  width: 12px;
-  height: 12px;
+  width: 10px;
+  height: 10px;
+  opacity: 0.7;
+  transition: transform 0.12s ease;
+}
+
+.branch.open .chchev {
+  transform: rotate(180deg);
+}
+
+/* 分支下拉：顶栏在窗口最上方，所以向下弹 */
+.branchmenu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  width: 300px;
+  max-height: 420px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+}
+
+.bmhead {
+  flex: none;
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.bmhead input,
+.bmfoot input {
+  width: 100%;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 12px;
+  background: #fbfbfc;
+  color: var(--fg);
+}
+
+/* 下拉里的搜索框靠光标表示焦点：顶栏弹出层里一圈蓝框太扎眼，只把边框轻微加深 */
+.bmhead input:focus,
+.bmfoot input:focus {
+  outline: none;
+  border-color: #d3d3d9;
+  background: #fff;
+}
+
+.bmlist {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px;
+}
+
+.bmrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  text-align: left;
+  cursor: pointer;
+}
+
+.bmrow:hover:not(:disabled) {
+  background: #f2f2f5;
+}
+
+.bmrow:disabled {
+  cursor: default;
+}
+
+.bmrow.on {
+  background: #eef2f9;
+}
+
+.bmrow.on .bmlbl {
+  font-weight: 500;
+}
+
+.bmrow.remote .bmlbl {
+  color: var(--muted);
+}
+
+.bmlbl {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bmsub {
+  flex: none;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.bmrow .ck {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+}
+
+.bmgroup {
+  padding: 8px 8px 3px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.bmnote {
+  margin: 0;
+  padding: 6px 9px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.bmnote.warn {
+  color: #9a6a00;
+}
+
+.bmerr {
+  margin: 6px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  background: #fdf1f1;
+  color: #a12a2a;
+  font-size: 11px;
+  line-height: 1.5;
+  max-height: 120px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.bmfoot {
+  flex: none;
+  padding: 6px;
+  border-top: 1px solid var(--line);
+  background: #fbfbfc;
+}
+
+.bmfoot form {
+  display: flex;
+  gap: 6px;
+}
+
+.bmfoot form button {
+  flex: none;
+  height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.bmfoot form button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.bmlink {
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.bmlink:hover {
+  background: #f2f2f5;
 }
 
 /* 顶栏的文件栏开关：只留一个图标 */
@@ -3289,23 +3697,6 @@ button.primary {
   border-bottom: 1px dashed var(--line);
   padding: 4px 0;
   margin: 10px 0;
-}
-
-/* 删除确认：armed 的两个按钮必须常显，不能等 hover */
-.sess .x.armed {
-  opacity: 1;
-  font-size: 12px;
-  padding: 0 4px;
-}
-
-.sess .x.armed.danger {
-  color: #d0342c;
-  font-weight: 600;
-}
-
-.sess .x.armed.danger:hover {
-  background: #fbe9e7;
-  border-radius: 5px;
 }
 
 /* 首次进工作区要拉起内核，几秒内界面不可操作：用进度卡说明正在做什么 */
