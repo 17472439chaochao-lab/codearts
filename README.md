@@ -1,6 +1,18 @@
 # CodeArts Desktop
 
-本程序为Rust编写的华为云码道CodeArts的Mac桌面端（非官方版），官方只构建了 Apple Silicon 包，Intel版的Mac无法安装。
+![platform](docs/badges/platform.svg) ![license](docs/badges/license.svg) ![version](docs/badges/version.svg) ![UI](docs/badges/ui.svg)
+
+**华为云码道 CodeArts 的 Mac 桌面端，开源（MIT）。** 源码开放在 [GitHub](https://github.com/17472439chaochao-lab/codearts)，可自由使用、修改、分发。
+
+本程序用 Rust + Tauri 2 编写（非官方版），官方只构建了 Apple Silicon 包，Intel 版的 Mac 无法安装。
+
+首次启动先过检测页，码道 CLI、华为云 AK/SK、工作区三项都绿了才给「进入工作区」：
+
+![首次启动的检测页](screenshots/setup.png)
+
+主界面：左侧多工作区会话列表，中间流式会话（工具调用折成卡片、每轮末尾带步骤与文件改动小结），右侧资源管理器看文件与本次会话的改动：
+
+![主界面](screenshots/main.png)
 
 ## 功能
 
@@ -45,3 +57,9 @@ npm run tauri build -- --target x86_64-apple-darwin
 - 只出 macOS 包，Windows / Linux 不做
 - 不做自动更新，内核升级是手动按钮
 - 技能只能从 GitHub 公开仓库装，私有仓库不走；装完要重载内核实例才生效。MCP 仍只做只读展示，增删改去 CLI 侧配置
+
+## 开源许可
+
+本项目以 [MIT 许可证](LICENSE) 开源，源码托管在 [GitHub](https://github.com/17472439chaochao-lab/codearts)。可以自由使用、修改、分发，包括商业用途；二次分发时保留版权声明和许可证全文即可。Issue 与 PR 都欢迎。
+
+本程序是非官方客户端，与华为云官方无关；CodeArts 名称及相关内核的权利归华为云所有。
