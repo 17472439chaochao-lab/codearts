@@ -71,8 +71,9 @@ pub struct ProviderDraft {
     models: Vec<ModelDraft>,
 }
 
-/// 内核全局配置里 provider 段落所在文件；不存在时按首选名字新建
-fn config_path(app: &tauri::AppHandle) -> Result<PathBuf> {
+/// 内核全局配置里 provider 段落所在文件；不存在时按首选名字新建。
+/// mcp.rs 也写同一份文件，所以这里的三个读写函数对 crate 内可见。
+pub(crate) fn config_path(app: &tauri::AppHandle) -> Result<PathBuf> {
     let dir = Settings::load(app)?.kernel_home().join(".codeartsdoer");
     for name in CONFIG_NAMES {
         let p = dir.join(name);
@@ -83,7 +84,7 @@ fn config_path(app: &tauri::AppHandle) -> Result<PathBuf> {
     Ok(dir.join(CONFIG_NAMES[0]))
 }
 
-fn read_root(path: &Path) -> Result<Value> {
+pub(crate) fn read_root(path: &Path) -> Result<Value> {
     match std::fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(Value::Object(Map::new())),
         Ok(text) => serde_json::from_str(&text).msg(format!("配置文件不是合法 JSON：{}", path.display())),
@@ -93,7 +94,7 @@ fn read_root(path: &Path) -> Result<Value> {
 }
 
 /// 只改 provider 下对应的那一项，其余键原样保留；先落临时文件再原子替换
-fn write_root(path: &Path, root: &Value) -> Result<()> {
+pub(crate) fn write_root(path: &Path, root: &Value) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).msg(format!("无法创建 {}", dir.display()))?;
     }

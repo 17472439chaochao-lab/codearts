@@ -143,6 +143,110 @@ pub async fn git_switch(
     Err(Error::Msg(format!("找不到分支 {raw}，先刷新一下列表")))
 }
 
+/// 一处在 `git status` 里出现的改动。`status` 是给界面着色的归一化结果，
+/// `index` / `worktree` 两个字符原样保留（` X`、`M ` 这种组合信息界面偶尔要看）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GitChange {
+    /// 相对工作区根，始终用 `/` 分隔
+    pub path: String,
+    pub index: String,
+    pub worktree: String,
+    pub staged: bool,
+    pub untracked: bool,
+    pub status: String,
+}
+
+/// 工作区的未提交状态。`repo = false` 时 `changes` 必为空——界面据此整段不画，
+/// 而不是显示一个「没有改动」的空列表。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GitStatus {
+    pub repo: bool,
+    pub changes: Vec<GitChange>,
+}
+
+/// 未提交清单：内核的 `/session/:id/diff` 只认"这条会话改过什么"，
+/// 用户自己或别的工具留下的改动要另看一眼，所以直读 git。
+#[tauri::command]
+pub async fn git_status(
+    app: tauri::AppHandle,
+    directory: Option<String>,
+) -> Result<GitStatus> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
+    status_of(&root).await
+}
+
+async fn status_of(root: &Path) -> Result<GitStatus> {
+    let probe = git(root, &["rev-parse", "--is-inside-work-tree"]).await?;
+    if !probe.status.success() || String::from_utf8_lossy(&probe.stdout).trim() != "true" {
+        return Ok(GitStatus {
+            repo: false,
+            changes: Vec::new(),
+        });
+    }
+    // -z：路径不进 shell 引号，中文名与带空格的名字都不会被转义成 "\346\226\207"
+    let out = git(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .await?;
+    if !out.status.success() {
+        return Err(git_err("读取 git 状态失败", &out));
+    }
+    Ok(GitStatus {
+        repo: true,
+        changes: parse_status(&String::from_utf8_lossy(&out.stdout)),
+    })
+}
+
+/// 解析 `--porcelain=v1 -z`：记录之间用 NUL 分隔，重命名/复制会紧跟一条原路径记录。
+fn parse_status(raw: &str) -> Vec<GitChange> {
+    let mut out = Vec::new();
+    let mut records = raw.split('\0');
+    while let Some(rec) = records.next() {
+        if rec.len() < 4 {
+            continue;
+        }
+        let b = rec.as_bytes();
+        let index = (b[0] as char).to_string();
+        let worktree = (b[1] as char).to_string();
+        // 用 get 而不是直接切片：万一内核之外的 git 版本吐出畸形记录，切片会 panic 在字符边界上
+        let Some(path) = rec.get(3..) else { continue };
+        let path = path.to_string();
+        // R / C 会多带一条"原路径"，那一项不是独立改动
+        if index == "R" || index == "C" || worktree == "R" || worktree == "C" {
+            records.next();
+        }
+        if path.is_empty() {
+            continue;
+        }
+        let untracked = index == "?" && worktree == "?";
+        let status = if untracked {
+            "untracked"
+        } else if index == "A" || worktree == "A" {
+            "added"
+        } else if index == "D" || worktree == "D" {
+            "deleted"
+        } else if index == "R" || worktree == "R" {
+            "renamed"
+        } else {
+            "modified"
+        };
+        out.push(GitChange {
+            path,
+            // 暂存区有变化（X 不是空格）就算 staged，"MM" 这种半暂存也算
+            staged: index != " " && index != "?",
+            index,
+            worktree,
+            untracked,
+            status: status.to_string(),
+        });
+    }
+    out
+}
+
 async fn collect(root: &Path) -> Result<BranchState> {
     let probe = git(root, &["rev-parse", "--is-inside-work-tree"]).await?;
     if !probe.status.success() || String::from_utf8_lossy(&probe.stdout).trim() != "true" {
@@ -326,6 +430,30 @@ mod tests {
         assert_eq!(list[1].local.as_deref(), Some("feat/x"));
     }
 
+    /// `--porcelain=v1 -z` 的真实形状：状态两个字符 + 空格 + 路径，记录间 NUL；
+    /// 重命名后面紧跟一条原路径记录，不能当成独立改动。
+    #[test]
+    fn parses_nul_separated_status() {
+        let raw = " M src/a.rs\0?? docs/新文件.md\0A  staged.txt\0D  gone.txt\0R  new.rs\0old.rs\0MM both.txt\0";
+        let list = parse_status(raw);
+        let by = |p: &str| list.iter().find(|c| c.path == p).unwrap();
+        assert_eq!(list.len(), 6, "重命名的原路径不该单独出现：{list:?}");
+        assert!(!list.iter().any(|c| c.path == "old.rs"), "old.rs 是重命名的原路径，不是独立条目");
+        assert_eq!(by("src/a.rs").status, "modified");
+        assert!(!by("src/a.rs").staged);
+        assert_eq!(by("docs/新文件.md").status, "untracked");
+        assert!(by("docs/新文件.md").untracked);
+        assert_eq!(by("staged.txt").status, "added");
+        assert!(by("staged.txt").staged);
+        assert_eq!(by("gone.txt").status, "deleted");
+        assert_eq!(by("new.rs").status, "renamed");
+        // 半暂存的两侧都算改过，界面把它归到"已暂存"里也更接近 git 的真实状态
+        assert_eq!(by("both.txt").index, "M");
+        assert_eq!(by("both.txt").worktree, "M");
+        assert!(by("both.txt").staged);
+        assert!(parse_status("").is_empty());
+    }
+
     /// 真起一个仓库跑一遍：列表、当前分支、未提交改动数都按界面要的形状给出来。
     /// 没装 git 的机器直接跳过——这个功能本来也要 git 才能用。
     #[tokio::test]
@@ -377,7 +505,19 @@ mod tests {
         let st = collect(&dir).await.unwrap();
         assert_eq!(st.dirty, 1);
 
-        // 非 git 目录返回 repo=false，界面据此不给入口（必须放在仓库外，仓库里的子目录也算 repo）
+        // 未提交清单：改了 a.txt，再放一个未跟踪文件，两个都要出现
+        std::fs::write(dir.join("新 文件.txt"), "hi\n").unwrap();
+        let st = status_of(&dir).await.unwrap();
+        assert!(st.repo);
+        let changes = st.changes;
+        assert!(changes
+            .iter()
+            .any(|c| c.path == "a.txt" && c.status == "modified" && !c.staged));
+        assert!(changes
+            .iter()
+            .any(|c| c.path == "新 文件.txt" && c.status == "untracked"));
+
+        // 非 git 目录返回 repo=false，界面据此整段不画（必须放在仓库外，仓库里的子目录也算 repo）
         let plain = std::env::temp_dir().join(format!(
             "codearts-nogit-{}-{}",
             std::process::id(),
@@ -387,6 +527,9 @@ mod tests {
         let st = collect(&plain).await.unwrap();
         assert!(!st.repo);
         assert!(st.branches.is_empty());
+        let st = status_of(&plain).await.unwrap();
+        assert!(!st.repo);
+        assert!(st.changes.is_empty());
 
         let _ = std::fs::remove_dir_all(&plain);
         let _ = std::fs::remove_dir_all(&dir);

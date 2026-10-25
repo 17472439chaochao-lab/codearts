@@ -136,6 +136,8 @@ export type EnvCheck = {
   kernelHome: string;
   /** 会话跑动期间是否握着阻止休眠的断言 */
   keepAwake: boolean;
+  /** 点红叉是收进托盘还是退出 */
+  closeToTray: boolean;
 };
 
 /** /provider → { all:[{id,name,models:{...}}], default:{providerID:modelID} } */
@@ -438,6 +440,52 @@ export const mcp = {
   list: (dir?: string | null) =>
     api<Record<string, { status?: string; error?: string } | string>>("GET", "/mcp", undefined, dir),
 };
+
+/**
+ * 写内核全局配置里的 `mcp` 段。壳子不解释内核的 mcp schema（不同传输方式字段不一样），
+ * 所以整段配置按用户填的原始 JSON 存，壳只负责名字校验和整体写入。
+ */
+export type McpServer = { name: string; config: unknown };
+
+export const mcpAdmin = {
+  list: () => invoke<McpServer[]>("mcp_list"),
+  save: (name: string, raw: string) => invoke<McpServer[]>("mcp_save", { name, raw }),
+  remove: (name: string) => invoke<McpServer[]>("mcp_remove", { name }),
+};
+
+/** `git status --porcelain` 的一条；`status` 是壳侧归一化过的英文标签，给界面着色用 */
+export type GitChange = {
+  path: string;
+  index: string;
+  worktree: string;
+  staged: boolean;
+  untracked: boolean;
+  status: "added" | "modified" | "deleted" | "renamed" | "untracked";
+};
+
+/** `repo = false` 表示工作区不在 git 仓库里，界面据此不画未提交那一段 */
+export type GitStatus = {
+  repo: boolean;
+  changes: GitChange[];
+};
+
+/** 未提交清单：与「当前会话改过什么」不是一回事，看的是整个工作区 */
+export const workspaceGit = {
+  status: (dir?: string | null) => invoke<GitStatus>("git_status", { directory: dir ?? null }),
+};
+
+/**
+ * 把文件写回某次改动之前的样子：content 为 null 表示这份文件改动前不存在，
+ * 还原即删除。路径由 Rust 侧按工作区 jail 校验，前端传相对路径。
+ */
+export function restoreFile(rel: string, content: string | null, dir?: string | null) {
+  return invoke<string>("file_restore", { rel, content, directory: dir ?? null });
+}
+
+/** 会话导出：path 必须是保存对话框给出的绝对路径 */
+export function exportMarkdown(path: string, content: string) {
+  return invoke<string>("export_write", { path, content });
+}
 
 /**
  * 内核侧的 ripgrep 检索：ignore 规则、大小写、多实例目录都由内核负责，壳只传参。

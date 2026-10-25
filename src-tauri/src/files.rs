@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::Serialize;
 
 use crate::error::{Error, MsgExt, Result};
@@ -13,7 +14,12 @@ use crate::settings::Settings;
 const MAX_ENTRIES: usize = 4000;
 /// 预览上限。再大的文件给壳子渲染只会卡住界面，截断并明确告知
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
+/// 图片预览上限。图片要 base64 后整串过 IPC，比文本贵得多，再大就把 WebView 拖住；
+/// 超过这个尺寸只报类型和大小，不转 data URL
+const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const BINARY_PROBE: usize = 8192;
+/// 认图片格式只需要文件头这几个字节
+const SNIFF_BYTES: u64 = 16;
 /// VCS 元数据和系统垃圾文件不进树；其余一律照常展示
 const SKIP_NAMES: &[&str] = &[".git", ".DS_Store"];
 /// 「计划」页签一次最多列这么多份，防止某个大目录里的 plans 把列表刷爆
@@ -61,12 +67,16 @@ pub struct FileList {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileContent {
-    /// 二进制文件为 None；GBK 等非 UTF-8 文本会转成 UTF-8 后返回
+    /// 二进制与图片为 None；GBK 等非 UTF-8 文本会转成 UTF-8 后返回
     content: Option<String>,
     binary: bool,
     truncated: bool,
     size: u64,
     mtime: u64,
+    /// 图片按 `data:<mime>;base64,...` 回传，界面直接塞进 <img>；文本文件为 None
+    data_url: Option<String>,
+    /// 文件头认出来的图片类型。体积超限时 data_url 为空但这里仍有值，界面据此说清原因
+    mime: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -500,6 +510,87 @@ fn resolve(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(target)
 }
 
+/// 写路径的越界检查：与 `resolve` 同一套规则，但允许目标文件还不存在
+/// （"还原为改动前"要能把新增文件删掉、把删掉的文件写回来）。
+/// 关键是父目录必须 canonicalize 后仍落在工作区里，且最后一段只能是普通文件名，
+/// 这样 `../`、绝对路径、以及指向工作区外的符号链接目录都过不去。
+fn resolve_write(root: &Path, rel: &str) -> Result<PathBuf> {
+    let root = root.canonicalize().msg("工作区不存在")?;
+    if rel.starts_with(['/', '\\']) {
+        return Err(Error::Msg("只接受工作区内的相对路径".into()));
+    }
+    let rel_path = Path::new(rel);
+    let comps: Vec<Component> = rel_path.components().collect();
+    let Some(Component::Normal(name)) = comps.last() else {
+        return Err(Error::Msg("非法路径".into()));
+    };
+    if comps
+        .iter()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(Error::Msg("非法路径".into()));
+    }
+    let parent = rel_path.parent().unwrap_or(Path::new(""));
+    let parent_abs = root.join(parent).canonicalize().msg("上级目录不存在")?;
+    if !parent_abs.starts_with(&root) {
+        return Err(Error::Msg("路径越界".into()));
+    }
+    let target = parent_abs.join(name);
+    // 目标已存在时再核一次：文件本身可能是链到工作区外的符号链接
+    if target.exists() {
+        let real = target.canonicalize().msg("路径不存在")?;
+        if !real.starts_with(&root) {
+            return Err(Error::Msg("路径越界".into()));
+        }
+    }
+    Ok(target)
+}
+
+/// 工作区里最大能还原的文件：diff 的 before 全文来自内核，超过这个尺寸的多半不是文本
+const MAX_RESTORE_BYTES: usize = 8 * 1024 * 1024;
+
+/// 把某个文件还原成改动前的样子。`content` 为 None 表示这份文件在改动前根本不存在
+/// （diff 的 status = added），还原就等于删掉它。
+#[tauri::command]
+pub fn file_restore(
+    app: tauri::AppHandle,
+    rel: String,
+    content: Option<String>,
+    directory: Option<String>,
+) -> Result<String> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
+    restore(&root, &rel, content.as_deref())
+}
+
+fn restore(root: &Path, rel: &str, content: Option<&str>) -> Result<String> {
+    let target = resolve_write(root, rel)?;
+    match content {
+        None => {
+            if target.exists() {
+                std::fs::remove_file(&target).msg("删除文件失败")?;
+                Ok(format!("已删除 {}", rel))
+            } else {
+                Ok(format!("{rel} 本来就不存在"))
+            }
+        }
+        Some(text) => {
+            if text.len() > MAX_RESTORE_BYTES {
+                return Err(Error::Msg(format!(
+                    "还原内容 {} MB，超过 {} MB 上限",
+                    text.len() / 1024 / 1024,
+                    MAX_RESTORE_BYTES / 1024 / 1024
+                )));
+            }
+            // 先落临时文件再原子替换：写到一半失败不会留下半个文件
+            let tmp = target.with_extension("codearts-restore.tmp");
+            std::fs::write(&tmp, text).msg("写入还原内容失败")?;
+            std::fs::rename(&tmp, &target).msg("还原文件失败")?;
+            Ok(format!("已还原 {}", rel))
+        }
+    }
+}
+
 fn list(root: &Path, rel: &str) -> Result<FileList> {
     let dir = resolve(root, rel)?;
     if !dir.is_dir() {
@@ -550,10 +641,18 @@ fn read_at(path: &Path) -> Result<FileContent> {
     if md.is_dir() {
         return Err(Error::Msg("这是一个目录".into()));
     }
+    let mut file = std::fs::File::open(path)?;
+    // 图片按文件头认，不看扩展名：改过后缀的图、没后缀的截图都得能看
+    let mut head = Vec::with_capacity(SNIFF_BYTES as usize);
+    file.by_ref()
+        .take(SNIFF_BYTES)
+        .read_to_end(&mut head)?;
+    if let Some(mime) = image_mime(&head) {
+        return read_image(&mut file, mime, &md);
+    }
+    file.seek(SeekFrom::Start(0))?;
     let mut buf = Vec::new();
-    std::fs::File::open(path)?
-        .take(MAX_TEXT_BYTES as u64 + 1)
-        .read_to_end(&mut buf)?;
+    file.take(MAX_TEXT_BYTES as u64 + 1).read_to_end(&mut buf)?;
     let truncated = buf.len() > MAX_TEXT_BYTES;
     if truncated {
         buf.truncate(MAX_TEXT_BYTES);
@@ -565,7 +664,76 @@ fn read_at(path: &Path) -> Result<FileContent> {
         truncated,
         size: md.len(),
         mtime: mtime_of(&md),
+        data_url: None,
+        mime: None,
     })
+}
+
+/// 图片走 data URL：WebView 不能读 file://，base64 是唯一不用起本地服务就能显示的路径
+fn read_image(
+    file: &mut std::fs::File,
+    mime: &str,
+    md: &std::fs::Metadata,
+) -> Result<FileContent> {
+    let size = md.len();
+    let too_big = size > MAX_IMAGE_BYTES;
+    let data_url = if too_big {
+        None
+    } else {
+        file.seek(SeekFrom::Start(0))?;
+        let mut buf = Vec::with_capacity(size as usize);
+        file.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut buf)?;
+        Some(format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&buf)
+        ))
+    };
+    Ok(FileContent {
+        content: None,
+        binary: true,
+        truncated: too_big,
+        size,
+        mtime: mtime_of(md),
+        data_url,
+        mime: Some(mime.to_string()),
+    })
+}
+
+/// 只认文件头一眼能确定的位图格式。SVG 本身是文本，照旧按源码预览
+fn image_mime(head: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if head.starts_with(PNG) {
+        return Some("image/png");
+    }
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if head.len() >= 12 {
+        // WebP 是 RIFF 容器，`WEBP` 在偏移 8；HEIC/AVIF 是 ISO BMFF，品牌在偏移 8
+        if head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+            return Some("image/webp");
+        }
+        if &head[4..8] == b"ftyp" {
+            match &head[8..12] {
+                b"avif" | b"avis" => return Some("image/avif"),
+                b"heic" | b"heix" | b"hevc" | b"mif1" | b"msf1" => return Some("image/heic"),
+                _ => {}
+            }
+        }
+    }
+    if head.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    if head.starts_with(b"II*\0") || head.starts_with(b"MM\0*") {
+        return Some("image/tiff");
+    }
+    if head.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        return Some("image/x-icon");
+    }
+    None
 }
 
 /// 二进制判定只看控制字符：NUL 或 0x00–0x08 / 0x0E–0x1F 占超过 2%。
@@ -627,6 +795,69 @@ mod tests {
         }
     }
 
+    /// 图片以前被 looks_binary 判成二进制（PNG 文件头里就有 NUL），预览只剩一行提示。
+    /// 现在按文件头认格式并以 data URL 回传；文本文件仍走原来的文本分支。
+    #[test]
+    fn reads_images_as_data_urls_and_text_as_text() {
+        let root = TempRoot::new();
+        // 1x1 透明 PNG 的头部：够让嗅探认出来，不需要真能解码
+        const PNG: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R',
+        ];
+        std::fs::write(root.0.join("shot.png"), PNG).unwrap();
+        let png = read(&root.0, "shot.png").unwrap();
+        assert_eq!(png.mime.as_deref(), Some("image/png"));
+        assert!(png
+            .data_url
+            .as_deref()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+        assert!(png.content.is_none() && png.binary && !png.truncated);
+
+        // 回传的字节必须和磁盘上一模一样，否则 <img> 只会显示裂图
+        use base64::Engine as _;
+        let payload = png.data_url.as_deref().unwrap().split(",").nth(1).unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.decode(payload).unwrap(),
+            PNG
+        );
+
+        // 没有扩展名的截图照样认得出
+        std::fs::write(root.0.join("screenshot"), PNG).unwrap();
+        assert_eq!(
+            read(&root.0, "screenshot").unwrap().mime.as_deref(),
+            Some("image/png")
+        );
+
+        // JPEG 走另一条分支，确认不是只有 PNG 能过
+        std::fs::write(
+            root.0.join("a.jpg"),
+            [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F'],
+        )
+        .unwrap();
+        assert_eq!(read(&root.0, "a.jpg").unwrap().mime.as_deref(), Some("image/jpeg"));
+
+        // 文本文件不能被当成图片
+        std::fs::write(root.0.join("notes.md"), "# 标题\n").unwrap();
+        let txt = read(&root.0, "notes.md").unwrap();
+        assert!(txt.mime.is_none() && txt.data_url.is_none());
+        assert_eq!(txt.content.as_deref(), Some("# 标题\n"));
+    }
+
+    #[test]
+    fn sniffs_common_bitmaps_and_leaves_other_formats_alone() {
+        assert_eq!(image_mime(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
+        assert_eq!(image_mime(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(image_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(image_mime(b"BM6\0\0\0"), Some("image/bmp"));
+        assert_eq!(image_mime(b"\0\0\0\x1aftypheic"), Some("image/heic"));
+        // 拿不准的一律不认：PDF / ZIP / 空文件交给 looks_binary 走原来的路
+        assert_eq!(image_mime(b"%PDF-1.7"), None);
+        assert_eq!(image_mime(b"PK\x03\x04"), None);
+        assert_eq!(image_mime(b""), None);
+    }
+
     #[test]
     fn lists_dirs_first_and_skips_vcs_metadata() {
         let root = TempRoot::new();
@@ -644,6 +875,46 @@ mod tests {
         std::fs::write(root.0.join("src/main.rs"), "fn main() {}").unwrap();
         let nested = list(&root.0, "src").unwrap();
         assert_eq!(nested.entries[0].path, "src/main.rs");
+    }
+
+    /// 还原是唯一一条"壳子替用户写盘"的路，越界检查必须和读路径同一套：
+    /// 相对路径 + 父目录归属校验，新增文件（还不存在）也要走通。
+    #[test]
+    fn restore_writes_inside_jail_only() {
+        let root = TempRoot::new();
+        let outside = TempRoot::new();
+        std::fs::create_dir_all(root.0.join("src")).unwrap();
+        std::fs::write(root.0.join("src/a.rs"), "改后的内容\n").unwrap();
+
+        // 有内容 = 写回改动前的版本
+        restore(&root.0, "src/a.rs", Some("改前\n")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.0.join("src/a.rs")).unwrap(),
+            "改前\n"
+        );
+
+        // 新增文件的还原 = 删掉它
+        std::fs::write(root.0.join("src/new.rs"), "x\n").unwrap();
+        restore(&root.0, "src/new.rs", None).unwrap();
+        assert!(!root.0.join("src/new.rs").exists());
+
+        // 删掉的文件可以写回来（父目录仍在）
+        restore(&root.0, "src/back.rs", Some("回来了\n")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.0.join("src/back.rs")).unwrap(),
+            "回来了\n"
+        );
+
+        // 越界一律拒绝
+        assert!(restore(&root.0, "../escape.rs", Some("x")).is_err());
+        assert!(restore(&root.0, "/tmp/abs.rs", Some("x")).is_err());
+        assert!(restore(&root.0, "src/../../escape.rs", Some("x")).is_err());
+        assert!(restore(&root.0, "missing-dir/a.rs", Some("x")).is_err());
+
+        // 指向工作区外的符号链接目录不能被当成合法父目录
+        std::os::unix::fs::symlink(&outside.0, root.0.join("link")).unwrap();
+        assert!(restore(&root.0, "link/a.rs", Some("x")).is_err());
+        assert!(!outside.0.join("a.rs").exists());
     }
 
     #[test]

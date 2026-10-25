@@ -6,7 +6,11 @@ import {
 } from "shiki/core";
 import { createOnigurumaEngine } from "shiki/engine/oniguruma";
 
-const THEME = "github-light";
+/** 深浅两套主题都进高亮器：切换时只换主题名，不重建实例、不重载语言 */
+const THEMES = {
+  light: "github-light",
+  dark: "github-dark",
+} as const;
 
 type LangModule = { default: LanguageRegistration | LanguageRegistration[] };
 
@@ -168,7 +172,7 @@ function highlighter(): Promise<HighlighterCore> {
   if (!core) {
     loaded.clear();
     core = createHighlighterCore({
-      themes: [import("@shikijs/themes/github-light")],
+      themes: [import("@shikijs/themes/github-light"), import("@shikijs/themes/github-dark")],
       langs: [],
       engine: createOnigurumaEngine(import("shiki/wasm")),
     }).catch((e) => {
@@ -193,12 +197,20 @@ async function language(hl: HighlighterCore, key: string): Promise<string> {
   return pending;
 }
 
-export async function highlight(code: string, rel: string): Promise<ThemedToken[][] | null> {
+/**
+ * `theme` 由调用方按当前界面主题传入：同一个文件在深色下要换一套 token 颜色，
+ * 而是否重算由 React 侧的主题订阅决定，这里只负责按名字取主题。
+ */
+export async function highlight(
+  code: string,
+  rel: string,
+  theme: "light" | "dark" = "light",
+): Promise<ThemedToken[][] | null> {
   const key = langForPath(rel);
   if (!key) return null;
   const hl = await highlighter();
   const lang = await language(hl, key);
-  return hl.codeToTokensBase(code, { lang, theme: THEME });
+  return hl.codeToTokensBase(code, { lang, theme: THEMES[theme] });
 }
 
 export type { ThemedToken };

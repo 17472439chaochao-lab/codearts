@@ -1,8 +1,9 @@
 [package]
 name = "codearts-desktop"
-version = "0.1.3"
+version = "0.1.4"
 description = "CodeArts Desktop shell"
 authors = ["wuchengchao"]
+license = "MIT"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -15,9 +16,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon：关窗收进菜单栏后仍能拉起窗口的入口，见 tray.rs
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+# 会话在后台跑完时发 macOS 通知；未签名 dev 构建可能不显示，release 正常
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { structuredPatch, type StructuredPatchHunk } from "diff";
-import type { FileDiff, FindMatch, Session } from "./kernelApi";
-import { find } from "./kernelApi";
+import type { FileDiff, GitStatus, Session } from "./kernelApi";
+import { find, restoreFile, workspaceGit } from "./kernelApi";
+import { useResolvedTheme, type ResolvedTheme } from "./theme";
 import type { ThemedToken } from "./highlight";
 import { renderMarkdown } from "./markdown";
 
@@ -32,21 +33,20 @@ type FileContent = {
   truncated: boolean;
   size: number;
   mtime: number;
-};
-type PlanEntry = {
-  name: string;
-  path: string;
-  source: "workspace" | "kernel" | "project";
-  size: number;
-  mtime: number;
+  /** 图片的 base64 data URL，直接塞 <img>；文本文件为 null */
+  dataUrl: string | null;
+  /** 文件头认出来的图片类型；有值但 dataUrl 为空说明体积超限 */
+  mime: string | null;
 };
 
-const FSTATUS_CN: Record<string, string> = { added: "A", deleted: "D", modified: "M" };
-const PLAN_SOURCE_CN: Record<string, string> = {
-  workspace: "工作区",
-  kernel: "内核数据",
-  project: "项目目录",
+const FSTATUS_CN: Record<string, string> = {
+  added: "A",
+  deleted: "D",
+  modified: "M",
+  renamed: "R",
+  untracked: "?",
 };
+
 const MAX_LINES = 5000;
 /** 改动前后加起来超过这个量就不在 WebView 里算逐行 diff，避免整窗卡死 */
 const MAX_DIFF_CHARS = 800_000;
@@ -54,12 +54,10 @@ const MAX_DIFF_CHARS = 800_000;
 const MAX_HIGHLIGHT_CHARS = 300_000;
 /** Markdown 渲染整棵 DOM，没有虚拟滚动；超过这个长度直接给原文 */
 const MAX_MD_CHARS = 300_000;
-/** 全文搜索一页最多渲染多少条匹配（内核不截，WebView 得自己收） */
-const SEARCH_ROWS = 300;
 /** 快捷打开的结果条数 */
 const QUICK_LIMIT = 40;
-/** 「计划」页签被文件写入事件带着自动刷新的最小间隔 */
-const PLAN_REFRESH_MS = 4000;
+/** 「改动」里那半段 git 清单被文件写入事件带着刷新的最小间隔 */
+const GIT_REFRESH_MS = 4000;
 const isMd = (rel: string) => /\.md$/i.test(rel);
 
 const trimSlash = (p: string) => p.replace(/\/+$/, "");
@@ -84,67 +82,8 @@ function fmtSize(n: number): string {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/**
- * 内核 `/find` 的 submatch 偏移是 ripgrep 的 UTF-8 字节下标；
- * 行内有非 ASCII 时字节下标和 JS 下标会错开（实测「资源管理器」差 4），先换成字符下标再切片。
- */
-function charRanges(line: string, subs: FindMatch["submatches"]): [number, number][] {
-  if (!subs.length) return [];
-  const bytes = new TextEncoder().encode(line);
-  const dec = new TextDecoder();
-  const at = (n: number) => dec.decode(bytes.subarray(0, Math.min(n, bytes.length))).length;
-  return subs.map((s) => [at(s.start), at(s.end)]);
-}
-
-/** 按文件分组：内核按匹配顺序平铺返回，同一文件的连续命中要并成一段 */
-type SearchGroup = { path: string; rows: { line: number; text: string; ranges: [number, number][] }[] };
-
-function groupHits(hits: FindMatch[], limit: number) {
-  const groups: SearchGroup[] = [];
-  let rows = 0;
-  for (const h of hits) {
-    if (rows >= limit) break;
-    const text = h.lines.text.replace(/\r?\n$/, "");
-    const row = { line: h.line_number, text, ranges: charRanges(text, h.submatches) };
-    const last = groups[groups.length - 1];
-    if (last && last.path === h.path.text) last.rows.push(row);
-    else groups.push({ path: h.path.text, rows: [row] });
-    rows += 1;
-  }
-  return { groups, rows, truncated: hits.length > rows };
-}
-
-/** 一行里把命中片段套上高亮；没有 submatch（例如只按文件命中）就整行原样输出 */
-function HitLine({ row }: { row: SearchGroup["rows"][number] }) {
-  if (!row.ranges.length) return <>{row.text}</>;
-  const out: React.ReactNode[] = [];
-  let cur = 0;
-  for (const [s, e] of row.ranges) {
-    if (s > cur) out.push(row.text.slice(cur, s));
-    out.push(<i key={`${s}-${e}`}>{row.text.slice(s, Math.max(e, s))}</i>);
-    cur = Math.max(cur, e);
-  }
-  if (cur < row.text.length) out.push(row.text.slice(cur));
-  return <>{out}</>;
-}
-
 /** 内核用 `<会话创建时间>-<slug>.md` 命名，时间戳没有展示价值 */
 const planTitle = (name: string) => name.replace(/\.md$/i, "").replace(/^\d{10,}-/, "");
-
-/** 规划模式写 `<feature>/plan.md`；文件名本身没信息量时用目录名 */
-const planLabel = (p: PlanEntry) => {
-  const title = planTitle(p.name);
-  if (title.toLowerCase() !== "plan") return title;
-  const parts = p.path.split("/").filter(Boolean);
-  return parts.length > 1 ? parts[parts.length - 2] : title;
-};
-
-function fmtWhen(ms: number): string {
-  if (!ms) return "";
-  const d = new Date(ms);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
 
 function Chevron({ open }: { open: boolean }) {
   return (
@@ -205,12 +144,6 @@ type PanelProps = {
   diffs: FileDiff[];
   /** file.edited 脉冲：合并短时间内的多次写入，刷新树和打开的目录 */
   pulse: number;
-  /** ⌘⇧F 递增一次：切到搜索页签并把光标放到输入框 */
-  focusSearch: number;
-  /** 右上角目录下拉：可切换的工作区，以及「添加工作区」入口 */
-  workspaces: string[];
-  onSwitchDir: (dir: string) => void;
-  onAddDir: () => void;
   onOpenFile: (f: OpenFile) => void;
   onRefreshDiffs: () => void;
   onClose: () => void;
@@ -221,50 +154,17 @@ export function FilePanel({
   session,
   diffs,
   pulse,
-  focusSearch,
-  workspaces,
-  onSwitchDir,
-  onAddDir,
   onOpenFile,
   onRefreshDiffs,
   onClose,
 }: PanelProps) {
-  const [tab, setTab] = useState<"tree" | "changes" | "plans" | "search">("tree");
+  const [tab, setTab] = useState<"tree" | "changes">("tree");
   const [version, setVersion] = useState(0);
   const [entries, setEntries] = useState<Entry[] | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [plans, setPlans] = useState<PlanEntry[] | null>(null);
-  const [planErr, setPlanErr] = useState<string | null>(null);
-  const [pattern, setPattern] = useState("");
-  const [hits, setHits] = useState<FindMatch[] | null>(null);
-  const [searchErr, setSearchErr] = useState<string | null>(null);
-  const [searching, setSearching] = useState(false);
-  const [wsOpen, setWsOpen] = useState(false);
-  const wsBox = useRef<HTMLDivElement | null>(null);
-  const searchBox = useRef<HTMLInputElement | null>(null);
-  /** 内核 /find 没有 limit，宽模式一次能回几千条，靠序号丢掉迟到的旧结果 */
-  const searchSeq = useRef(0);
-
-  // 目录下拉的收起方式与顶栏分支一致：点外面或按 Esc
-  useEffect(() => {
-    if (!wsOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (wsBox.current && !wsBox.current.contains(e.target as Node)) setWsOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setWsOpen(false);
-    };
-    window.addEventListener("mousedown", onDown, true);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onDown, true);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [wsOpen]);
-
-  // 当前会话可能停在别的区的目录上，那个目录不一定在 projects 里，补一行保证能看见自己在哪
-  const wsList = workspaces.some((p) => samePath(p, root)) ? workspaces : [root, ...workspaces];
+  /** 整个工作区的未提交改动；与「当前会话改过什么」并排显示在同一页签里 */
+  const [git, setGit] = useState<GitStatus | null>(null);
 
   const wsDiffs = useMemo(
     () => diffs.filter((d) => relInRoot(root, d.file) !== null),
@@ -275,14 +175,18 @@ export function FilePanel({
     for (const d of wsDiffs) m.set(trimSlash(d.file), d);
     return m;
   }, [wsDiffs]);
-  const grouped = useMemo(() => groupHits(hits ?? [], SEARCH_ROWS), [hits]);
 
-  /** 技能写的计划就在工作区里，展示相对目录比"项目目录"四个字有用 */
-  const planWhere = (p: PlanEntry) => {
-    const rel = p.source === "project" ? relInRoot(root, p.path) : null;
-    if (rel) return rel.replace(/\/[^/]*$/, "");
-    return PLAN_SOURCE_CN[p.source] ?? p.source;
-  };
+  const repo = git?.repo ?? false;
+  const gitChanges = git?.changes ?? [];
+  const changedCount = wsDiffs.length + gitChanges.length;
+  const changesHint =
+    git === null
+      ? "读取中…"
+      : !session
+        ? "打开一个会话后显示它改过的文件"
+        : repo
+          ? "没有未提交的改动"
+          : "当前会话还没有文件改动";
 
   const loadRoot = useCallback(() => {
     let alive = true;
@@ -303,93 +207,45 @@ export function FilePanel({
     // 否则只会清空旧树、一直停在「读取中」
   }, [root]);
 
-  /** 上一次拉计划清单的时间，用来给 version 驱动的自动刷新限流 */
-  const plansAt = useRef(0);
+  /** 上一次读 git 状态的时间，用来给 version 驱动的刷新限流 */
+  const gitAt = useRef(0);
 
-  const loadPlans = useCallback(() => {
+  /** git status 比 diff 便宜得多，但仍然不跟着 version 每 0.7 秒跑一次 */
+  const loadGit = useCallback(() => {
     let alive = true;
-    plansAt.current = Date.now();
-    setPlanErr(null);
-    invoke<PlanEntry[]>("plans_list", { directory: root })
+    gitAt.current = Date.now();
+    workspaceGit
+      .status(root)
       .then((r) => {
-        if (alive) setPlans(r);
+        if (alive) setGit(r);
       })
-      .catch((e) => {
-        if (alive) setPlanErr(String(e));
+      // 没装 git、目录不可读之类都按「不是仓库」处理：这一段整块不出现，不留空面板
+      .catch(() => {
+        if (alive) setGit({ repo: false, changes: [] });
       });
     return () => {
       alive = false;
     };
   }, [root]);
 
+  // 换工作区立刻重读，角标不能停在上一个区的数字上
+  useEffect(() => loadGit(), [loadGit]);
+
   // 换工作区先清掉旧树，别让两层文件混在一起
   useEffect(() => {
     setEntries(null);
     setTruncated(false);
-    setPlans(null);
-    setHits(null);
-    setSearchErr(null);
+    setGit(null);
   }, [root]);
   useEffect(() => loadRoot(), [loadRoot, version]);
 
-  // 计划文件由 agent 增量写入；切页签/换区/换会话立刻拉，别空转
+  // version 在 agent 干活时每 0.7 秒就 +1，git status 压到最多 4 秒一次，且只在页签开着时排期
   useEffect(() => {
-    if (tab !== "plans") return;
-    return loadPlans();
-  }, [tab, loadPlans, root, session?.id]);
-
-  // version 在 agent 干活时每 0.7 秒就 +1，每次都重扫工作区太贵（Rust 侧要递归找 plans 目录），
-  // 所以这里压到最多 4 秒一次，且只在这个页签开着时才排期
-  useEffect(() => {
-    if (tab !== "plans" || !version) return;
-    const wait = Math.max(0, PLAN_REFRESH_MS - (Date.now() - plansAt.current));
-    const t = window.setTimeout(() => void loadPlans(), wait);
+    if (tab !== "changes" || !version) return;
+    const wait = Math.max(0, GIT_REFRESH_MS - (Date.now() - gitAt.current));
+    const t = window.setTimeout(() => void loadGit(), wait);
     return () => window.clearTimeout(t);
-  }, [tab, version, loadPlans]);
-
-  const runSearch = useCallback(
-    (p: string) => {
-      const pat = p.trim();
-      const id = ++searchSeq.current;
-      if (pat.length < 2) {
-        setHits(null);
-        setSearchErr(null);
-        setSearching(false);
-        return;
-      }
-      setSearching(true);
-      setSearchErr(null);
-      find
-        .text(pat, root)
-        .then((r) => {
-          if (searchSeq.current === id) setHits(r);
-        })
-        .catch((e) => {
-          if (searchSeq.current !== id) return;
-          setHits(null);
-          setSearchErr(String(e));
-        })
-        .finally(() => {
-          if (searchSeq.current === id) setSearching(false);
-        });
-    },
-    [root],
-  );
-
-  // 每敲一个字就打一次 ripgrep 没必要，停手 350ms 再查；只看当前页签
-  useEffect(() => {
-    if (tab !== "search") return;
-    const t = window.setTimeout(() => runSearch(pattern), 350);
-    return () => window.clearTimeout(t);
-  }, [tab, pattern, runSearch]);
-
-  // ⌘⇧F：切到搜索页签并把光标放进输入框（刚切过去时 input 还没挂载，等一帧）
-  useEffect(() => {
-    if (!focusSearch) return;
-    setTab("search");
-    const t = window.setTimeout(() => searchBox.current?.focus(), 0);
-    return () => window.clearTimeout(t);
-  }, [focusSearch]);
+  }, [tab, version, loadGit]);
 
   // 内核写完文件会连发多次 file.edited；收拢成一次刷新，新增文件不必手动点
   useEffect(() => {
@@ -400,6 +256,8 @@ export function FilePanel({
 
   function refresh() {
     setVersion((v) => v + 1);
+    // 手动刷新就直接重读，不等 version 那条 4 秒限流的排期
+    void loadGit();
     onRefreshDiffs();
   }
 
@@ -407,83 +265,6 @@ export function FilePanel({
     <aside className="files">
       <div className="fhead" data-tauri-drag-region="deep">
         <b>资源管理器</b>
-        <div className="fwsdrop" ref={wsBox}>
-          <button
-            type="button"
-            className={`fwsbtn ${wsOpen ? "open" : ""}`}
-            onClick={() => setWsOpen((o) => !o)}
-            title={`${root} · 点击切换工作区`}
-            aria-haspopup="menu"
-            aria-expanded={wsOpen}
-          >
-            <span className="fws">{baseName(root)}</span>
-            <svg className="chchev" viewBox="0 0 12 12" aria-hidden="true">
-              <path
-                d="M3 4.7l3 3 3-3"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-          </button>
-          {wsOpen && (
-            <div
-              className="fwsmenu"
-              role="menu"
-              aria-label="切换工作区"
-              onMouseDown={(e) => e.stopPropagation()}
-            >
-              <div className="fwsgroup">工作区</div>
-              {wsList.map((p) => {
-                const cur = samePath(p, root);
-                return (
-                  <button
-                    type="button"
-                    role="menuitem"
-                    key={p}
-                    className={`fwsrow ${cur ? "on" : ""}`}
-                    disabled={cur}
-                    onClick={() => {
-                      setWsOpen(false);
-                      if (!cur) onSwitchDir(p);
-                    }}
-                    title={p}
-                  >
-                    <span className="fwstx">
-                      <span className="lbl">{baseName(p)}</span>
-                      <span className="sub">{p}</span>
-                    </span>
-                    {cur && (
-                      <svg className="ck" viewBox="0 0 16 16" aria-hidden="true">
-                        <path
-                          d="M3.6 8.3l3 3 5.8-6.4"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.8"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        />
-                      </svg>
-                    )}
-                  </button>
-                );
-              })}
-              <button
-                type="button"
-                role="menuitem"
-                className="fwsadd"
-                onClick={() => {
-                  setWsOpen(false);
-                  onAddDir();
-                }}
-              >
-                ＋ 添加工作区…
-              </button>
-            </div>
-          )}
-        </div>
         <span className="grow" />
         <button className="ico-btn" onClick={refresh} title="刷新" aria-label="刷新文件列表">
           <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -514,96 +295,13 @@ export function FilePanel({
         <button className={tab === "tree" ? "on" : ""} onClick={() => setTab("tree")}>
           文件
         </button>
-        <button className={tab === "search" ? "on" : ""} onClick={() => setTab("search")}>
-          搜索
-        </button>
         <button className={tab === "changes" ? "on" : ""} onClick={() => setTab("changes")}>
           改动
-          {!!wsDiffs.length && <span className="cnt">{wsDiffs.length}</span>}
-        </button>
-        <button className={tab === "plans" ? "on" : ""} onClick={() => setTab("plans")}>
-          计划
-          {!!plans?.length && <span className="cnt">{plans.length}</span>}
+          {!!changedCount && <span className="cnt">{changedCount}</span>}
         </button>
       </div>
 
-      {tab === "search" ? (
-        <div className="ftree fsearch">
-          <div className="sbox">
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <circle cx="7" cy="7" r="4.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
-              <path
-                d="M10.4 10.4L13.6 13.6"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.3"
-                strokeLinecap="round"
-              />
-            </svg>
-            <input
-              ref={searchBox}
-              value={pattern}
-              onChange={(e) => setPattern(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") runSearch(pattern);
-              }}
-              placeholder="在工作区里搜索（正则，区分大小写）"
-              aria-label="工作区全文搜索"
-              spellCheck={false}
-            />
-          </div>
-          {searchErr ? (
-            <p className="fhint err">{searchErr}</p>
-          ) : searching ? (
-            <p className="fhint">搜索中…</p>
-          ) : pattern.trim().length < 2 ? (
-            <p className="fhint">至少两个字符；ignore 规则与内核一致</p>
-          ) : !hits?.length ? (
-            <p className="fhint">没有匹配</p>
-          ) : (
-            <>
-              <p className="fhint smeta">
-                {grouped.rows} / {hits.length} 处匹配 · {grouped.groups.length} 个文件
-              </p>
-              <ul className="slist">
-                {grouped.groups.map((g) => (
-                  <li key={g.path} className="sgroup">
-                    <div className="spath" title={`${trimSlash(root)}/${g.path}`}>
-                      <FileIcon />
-                      <b>{baseName(g.path)}</b>
-                      <span className="muted">{dirName(g.path)}</span>
-                    </div>
-                    {g.rows.map((r) => (
-                      <button
-                        key={`${g.path}:${r.line}`}
-                        className="srow"
-                        onClick={() =>
-                          onOpenFile({
-                            rel: g.path,
-                            abs: `${trimSlash(root)}/${g.path}`,
-                            tab: "preview",
-                            line: r.line,
-                          })
-                        }
-                      >
-                        <span className="slno">{r.line}</span>
-                        <span className="sltx">
-                          <HitLine row={r} />
-                        </span>
-                      </button>
-                    ))}
-                  </li>
-                ))}
-              </ul>
-              {grouped.truncated && (
-                <p className="fhint">
-                  结果过多，只列出前 {grouped.rows} 条；缩小范围或加上更具体的模式
-                </p>
-              )}
-            </>
-          )}
-        </div>
-      ) : tab === "tree" ? (
+      {tab === "tree" ? (
         <div className="ftree">
           {err ? (
             <p className="fhint err">{err}</p>
@@ -639,76 +337,75 @@ export function FilePanel({
             </div>
           )}
         </div>
-      ) : tab === "changes" ? (
-        <div className="ftree changes">
-          {!wsDiffs.length ? (
-            <p className="fhint">
-              {session ? "当前会话还没有文件改动" : "打开一个会话后显示它改过的文件"}
-            </p>
-          ) : (
-            <ul className="chlist">
-              {wsDiffs.map((d) => {
-                const rel = relInRoot(root, d.file) ?? "";
-                const dir = dirName(rel);
-                return (
-                  <li key={d.file}>
-                    <button
-                      className="chrow"
-                      onClick={() => onOpenFile({ rel, abs: d.file, tab: "diff" })}
-                      title={d.file}
-                    >
-                      <span className={`fx ${d.status ?? "modified"}`}>
-                        {FSTATUS_CN[d.status ?? "modified"] ?? "M"}
-                      </span>
-                      <span className="cinfo">
-                        <b>{baseName(d.file)}</b>
-                        {dir && <span>{dir}</span>}
-                      </span>
-                      <span className="cnts">
-                        {d.additions ? <span className="add">+{d.additions}</span> : null}
-                        {d.deletions ? <span className="del">-{d.deletions}</span> : null}
-                      </span>
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </div>
       ) : (
         <div className="ftree changes">
-          {planErr ? (
-            <p className="fhint err">{planErr}</p>
-          ) : plans === null ? (
-            <p className="fhint">读取中…</p>
-          ) : !plans.length ? (
-            <p className="fhint">
-              还没有计划。点输入区左下的「规划」开关让 agent 先出计划，那一轮讲完这里会自动存一份
-            </p>
+          {!wsDiffs.length && !gitChanges.length ? (
+            <p className="fhint">{changesHint}</p>
           ) : (
-            <ul className="chlist">
-              {plans.map((p) => (
-                <li key={p.path}>
-                  <button
-                    className="chrow"
-                    onClick={() =>
-                      // rel 保留 .md，给 highlight 认语言；标题仍用 planTitle 展示
-                      onOpenFile({ rel: p.name, abs: p.path, tab: "preview", plan: true })
-                    }
-                    title={p.path}
-                  >
-                    <FileIcon />
-                    <span className="cinfo">
-                      <b>{planLabel(p)}</b>
-                      <span>
-                        {planWhere(p)}
-                        {p.mtime ? ` · ${fmtWhen(p.mtime)}` : ""}
-                      </span>
-                    </span>
-                  </button>
-                </li>
-              ))}
-            </ul>
+            <>
+              {!!wsDiffs.length && (
+                <section>
+                  {repo && <p className="fsec">本次会话</p>}
+                  <ul className="chlist">
+                    {wsDiffs.map((d) => {
+                      const rel = relInRoot(root, d.file) ?? "";
+                      const dir = dirName(rel);
+                      return (
+                        <li key={d.file}>
+                          <button
+                            className="chrow"
+                            onClick={() => onOpenFile({ rel, abs: d.file, tab: "diff" })}
+                            title={d.file}
+                          >
+                            <span className={`fx ${d.status ?? "modified"}`}>
+                              {FSTATUS_CN[d.status ?? "modified"] ?? "M"}
+                            </span>
+                            <span className="cinfo">
+                              <b>{baseName(d.file)}</b>
+                              {dir && <span>{dir}</span>}
+                            </span>
+                            <span className="cnts">
+                              {d.additions ? <span className="add">+{d.additions}</span> : null}
+                              {d.deletions ? <span className="del">-{d.deletions}</span> : null}
+                            </span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </section>
+              )}
+              {repo && !!gitChanges.length && (
+                <section>
+                  <p className="fsec">工作区未提交</p>
+                  <ul className="chlist">
+                    {gitChanges.map((c) => {
+                      const abs = `${trimSlash(root)}/${c.path}`;
+                      return (
+                        <li key={`${c.path}:${c.index}${c.worktree}`}>
+                          <button
+                            className="chrow"
+                            onClick={() => onOpenFile({ rel: c.path, abs, tab: "preview" })}
+                            title={`${abs}${c.staged ? " · 已暂存" : ""}`}
+                          >
+                            <span className={`fx ${c.status === "untracked" ? "added" : c.status}`}>
+                              {FSTATUS_CN[c.status] ?? "M"}
+                            </span>
+                            <span className="cinfo">
+                              <b>{baseName(c.path)}</b>
+                              <span>
+                                {dirName(c.path)}
+                                {c.staged ? `${dirName(c.path) ? " · " : ""}已暂存` : ""}
+                              </span>
+                            </span>
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </section>
+              )}
+            </>
           )}
         </div>
       )}
@@ -967,6 +664,8 @@ type ViewerProps = {
   diffs: FileDiff[];
   pulse: number;
   onClose: () => void;
+  /** 还原成功后让外层重取 diff，否则「改动」页签还挂着刚被回滚掉的那一条 */
+  onRestored?: () => void;
 };
 /** 行号与 +/- 标记是界面装饰：Cmd+C 时按选中的行重建纯文本，别把它们带进剪贴板 */
 function cleanCopyText(root: HTMLElement): string | null {
@@ -988,13 +687,17 @@ function cleanCopyText(root: HTMLElement): string | null {
   }).join("\n");
 }
 
-export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: ViewerProps) {
+export function FileViewer({ root, file, startTab, diffs, pulse, onClose, onRestored }: ViewerProps) {
   const [tab, setTab] = useState<"preview" | "diff">(startTab);
   const [mdRaw, setMdRaw] = useState(false);
   const [data, setData] = useState<FileContent | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  /** 还原会直接覆盖磁盘上的文件，所以第一次点只把按钮变成确认态 */
+  const [askRestore, setAskRestore] = useState(false);
+  /** HEIC 这类系统 WebView 未必解得了的格式：解码失败就退回文字提示，别留个裂图标 */
+  const [imgFail, setImgFail] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
   const downOnBackdrop = useRef(false);
   /** pulse / 刷新按钮不走 effect cleanup，用序号丢掉过期回填 */
@@ -1022,6 +725,7 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
         // file.edited 后 mtime/size 未变就跳过，避免整文件重高亮
         const cur = dataRef.current;
         if (soft && cur && cur.mtime === r.mtime && cur.size === r.size) return;
+        setImgFail(false);
         setData(r);
       })
       .catch((e) => {
@@ -1043,6 +747,7 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
   useEffect(() => {
     setData(null);
     setErr(null);
+    setImgFail(false);
     load(false);
     return () => {
       reqId.current += 1;
@@ -1088,6 +793,30 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
     }
   }
 
+  /**
+   * 还原为改动前：内核的 diff 带了 before 全文，把它写回去就等于回滚这一个文件。
+   * status=added 表示改动前它根本不存在，这种情况还原就是删除；
+   * 没有 before 字段（二进制、只给了统计）时不给入口。
+   */
+  const canRestore = !!diff && (diff.status === "added" || typeof diff.before === "string");
+
+  async function doRestore() {
+    if (!diff) return;
+    setAskRestore(false);
+    setErr(null);
+    setNote(null);
+    const wipe = diff.status === "added";
+    try {
+      const msg = await restoreFile(file.rel, wipe ? null : (diff.before ?? ""), root);
+      setNote(msg);
+      load(false);
+      onRestored?.();
+      window.setTimeout(() => setNote(null), 3200);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
   // 搜索跳过来的一律看源码：Markdown 渲染后的 DOM 没有行号可对
   const markdown =
     tab === "preview" && isMd(file.rel) && !!data && !data.binary && data.content !== null && !file.line;
@@ -1120,6 +849,26 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
           </div>
           <div className="row fvacts">
             {note && <span className="muted small">{note}</span>}
+            {tab === "diff" && canRestore && (
+              <button
+                className={`restorebtn ${askRestore ? "ask" : ""}`}
+                onClick={() => (askRestore ? void doRestore() : setAskRestore(true))}
+                onBlur={() => setAskRestore(false)}
+                title={
+                  diff?.status === "added"
+                    ? "这份文件是这一轮新建的，还原等于删掉它"
+                    : "把这个文件写回本轮改动之前的内容"
+                }
+              >
+                {askRestore
+                  ? diff?.status === "added"
+                    ? "确认删除？"
+                    : "确认还原？"
+                  : diff?.status === "added"
+                    ? "删除此文件"
+                    : "还原为改动前"}
+              </button>
+            )}
             {markdown && (
               <button
                 className={`ico-btn ${mdRaw ? "on" : ""}`}
@@ -1237,6 +986,20 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
               <p className="fhint err">{err}</p>
             ) : !data ? (
               <p className="fhint">读取中…</p>
+            ) : data.dataUrl && !imgFail ? (
+              <div className="fvimg">
+                <img
+                  src={data.dataUrl}
+                  alt={baseName(file.rel)}
+                  onError={() => setImgFail(true)}
+                />
+              </div>
+            ) : data.mime ? (
+              <p className="fhint">
+                {imgFail
+                  ? "这张图的格式系统解不了，可以「在访达中显示」用系统预览打开。"
+                  : `图片太大（${fmtSize(data.size)}），不在预览里打开。`}
+              </p>
             ) : data.binary ? (
               <p className="fhint">这是二进制文件（{fmtSize(data.size)}），不做文本预览。</p>
             ) : data.content === null ? (
@@ -1262,9 +1025,12 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose }: View
 
 /** Shiki 完全按需加载；失败或超大文件就退回纯文本，不影响预览本身 */
 function useHighlighted(text: string, rel: string, enabled: boolean) {
+  // 高亮结果是逐 token 的具体颜色，切主题必须重算，否则深色底上还是浅色语法色
+  const theme = useResolvedTheme();
   const [state, setState] = useState<{
     text: string;
     rel: string;
+    theme: ResolvedTheme;
     tokens: ThemedToken[][] | null;
   } | null>(null);
 
@@ -1272,20 +1038,22 @@ function useHighlighted(text: string, rel: string, enabled: boolean) {
     if (!enabled) return;
     let alive = true;
     import("./highlight")
-      .then((m) => m.highlight(text, rel))
+      .then((m) => m.highlight(text, rel, theme))
       .then((tokens) => {
-        if (alive) setState({ text, rel, tokens });
+        if (alive) setState({ text, rel, theme, tokens });
       })
       .catch((e) => {
         console.warn("语法高亮失败，退回纯文本", e);
-        if (alive) setState({ text, rel, tokens: null });
+        if (alive) setState({ text, rel, theme, tokens: null });
       });
     return () => {
       alive = false;
     };
-  }, [text, rel, enabled]);
+  }, [text, rel, enabled, theme]);
 
-  return enabled && state && state.text === text && state.rel === rel ? state.tokens : null;
+  return enabled && state && state.text === text && state.rel === rel && state.theme === theme
+    ? state.tokens
+    : null;
 }
 
 function tokenStyle(t: ThemedToken): React.CSSProperties | undefined {

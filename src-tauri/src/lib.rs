@@ -1,14 +1,17 @@
 mod api;
 mod error;
+mod export;
 mod files;
 mod git;
 mod kernel;
+mod mcp;
 mod ocr;
 mod providers;
 mod secrets;
 mod settings;
 mod skills;
 mod sleep;
+mod tray;
 mod trust;
 
 use error::Error;
@@ -29,6 +32,7 @@ fn settings_save(app: tauri::AppHandle, mut next: Settings) -> Result<Settings, 
     next.project_dir = next.project_dir.or(current.project_dir);
     next.projects = next.projects.or(current.projects);
     next.keep_awake = next.keep_awake.or(current.keep_awake);
+    next.close_to_tray = next.close_to_tray.or(current.close_to_tray);
     next.save(&app)?;
     // 切区不再重启内核，serve 的 cwd 白名单这一趟没人写；下次冷启动要能直接认这个目录，
     // 所以在这里补登记。trust_folder 只增不删，重复调用无副作用。
@@ -66,6 +70,7 @@ struct EnvCheck {
     projects: Vec<String>,
     kernel_home: String,
     keep_awake: bool,
+    close_to_tray: bool,
 }
 
 #[tauri::command]
@@ -97,6 +102,7 @@ fn env_check(app: tauri::AppHandle) -> Result<EnvCheck, Error> {
         projects,
         kernel_home: home.display().to_string(),
         keep_awake: settings.keep_awake.unwrap_or(false),
+        close_to_tray: settings.close_to_tray.unwrap_or(false),
     })
 }
 
@@ -164,6 +170,22 @@ async fn providers_fetch_models(
     providers::fetch_models(&base_url, &api_key).await
 }
 
+/// MCP 服务器：与第三方模型同一份全局配置，只读写 `mcp` 段，内容原样存原始 JSON
+#[tauri::command]
+fn mcp_list(app: tauri::AppHandle) -> Result<Vec<mcp::McpEntry>, Error> {
+    mcp::list(&app)
+}
+
+#[tauri::command]
+fn mcp_save(app: tauri::AppHandle, name: String, raw: String) -> Result<Vec<mcp::McpEntry>, Error> {
+    mcp::save(&app, &name, &raw)
+}
+
+#[tauri::command]
+fn mcp_remove(app: tauri::AppHandle, name: String) -> Result<Vec<mcp::McpEntry>, Error> {
+    mcp::remove(&app, &name)
+}
+
 #[tauri::command]
 async fn kernel_start(app: tauri::AppHandle, kernel: State<'_, Arc<Kernel>>) -> Result<Status, Error> {
     let r = kernel.start(&app).await;
@@ -215,8 +237,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // macOS 首次会弹授权；未签名 dev 构建可能不显示，release 构建正常
+        .plugin(tauri_plugin_notification::init())
         .manage(Arc::new(Kernel::new()))
         .manage(WakeLock::default())
+        .on_window_event(tray::on_window_event)
         .invoke_handler(tauri::generate_handler![
             settings_save,
             env_check,
@@ -227,6 +252,10 @@ pub fn run() {
             providers_save,
             providers_remove,
             providers_fetch_models,
+            mcp_list,
+            mcp_save,
+            mcp_remove,
+            export::export_write,
             kernel_start,
             kernel_stop,
             kernel_status,
@@ -235,11 +264,13 @@ pub fn run() {
             ocr::ocr_image,
             files::files_list,
             files::file_read,
+            files::file_restore,
             files::plans_list,
             files::plan_read,
             files::plan_save,
             git::git_branches,
             git::git_switch,
+            git::git_status,
             skills::skills_managed,
             skills::skill_install_github,
             skills::skill_update_github,
@@ -248,6 +279,10 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             Kernel::spawn_watch(handle.clone());
+            // 托盘装不上不该拦着应用启动：拿不到图标时条目不出现，功能照旧
+            if let Err(e) = tray::init(&handle) {
+                eprintln!("[tray] 托盘初始化失败：{e}");
+            }
             tauri::async_runtime::spawn(async move {
                 let kernel: Arc<Kernel> = handle.state::<Arc<Kernel>>().inner().clone();
                 kernel.adopt(&handle).await;

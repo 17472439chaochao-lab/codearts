@@ -1253,7 +1253,8 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           if (mode === "error") throw new Error("模拟 OCR 失败");
           return window.__ocrText ?? "预览台 OCR：这是从截图里识别出的文字";
         }
-        if (cmd === "plugin:app|version") return "0.1.3";
+        // 与 package.json 的 version 保持一致：截图会带上这个号
+        if (cmd === "plugin:app|version") return "0.1.4";
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;
         if (cmd === "settings_save") {

@@ -10,14 +10,19 @@ import {
   customProviders,
   kernelBusy,
   mcp,
+  mcpAdmin,
   normalizeProviders,
   reloadInstance,
   skills,
   type CustomProvider,
   type EnvCheck,
+  type McpServer,
   type SkillInfo,
   type V1Skill,
 } from "./kernelApi";
+import { setThemeMode, useThemeMode, type ThemeMode } from "./theme";
+import { setNotifyPrefs, useNotifyPrefs, type NotifyPrefs } from "./notify";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import "./App.css";
 
 export type KernelStatus = {
@@ -630,7 +635,30 @@ function Settings({
                 />
                 任务运行时阻止电脑休眠
               </label>
+              <label className="awake">
+                <input
+                  type="checkbox"
+                  checked={!!check?.closeToTray}
+                  onChange={async (e) => {
+                    const on = e.target.checked;
+                    if (await run(() => invoke("settings_save", { next: { closeToTray: on } }))) {
+                      await onChanged();
+                    }
+                  }}
+                />
+                关闭时最小化到托盘
+              </label>
             </>
+          )}
+
+          {tab === "mcp" && (
+            <McpSettings
+              healthy={!!status?.healthy}
+              onRestart={async () => {
+                await onStop();
+                await onStart();
+              }}
+            />
           )}
 
           {tab === "model" && (
@@ -744,6 +772,10 @@ function Settings({
             </>
           )}
 
+          {tab === "theme" && <Appearance />}
+
+          {tab === "notify" && <NotifySettings />}
+
           {tab === "about" && <About check={check} status={status} />}
         </div>
       </div>
@@ -751,7 +783,264 @@ function Settings({
   );
 }
 
+/**
+ * MCP 服务器：壳子只存不解释。内核的 mcp 段按传输方式（stdio / sse / http）字段不同，
+ * 一旦壳子按自己理解的 schema 重建条目，就会把用户写好的其它字段悄悄抹掉，
+ * 所以这里一律当「名称 + 一段原始 JSON」来处理。
+ */
+function McpSettings({
+  healthy,
+  onRestart,
+}: {
+  healthy: boolean;
+  onRestart: () => Promise<void>;
+}) {
+  const [items, setItems] = useState<McpServer[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [name, setName] = useState("");
+  const [raw, setRaw] = useState(EXAMPLE_MCP);
+  /** 正在改的是哪个已有条目；空串表示新建 */
+  const [editing, setEditing] = useState<string | null>(null);
+
+  const reload = useCallback(() => {
+    mcpAdmin
+      .list()
+      .then((list) => {
+        setItems(list);
+        setErr(null);
+      })
+      .catch((e) => {
+        setItems([]);
+        setErr(String(e));
+      });
+  }, []);
+
+  useEffect(() => reload(), [reload]);
+
+  async function submit() {
+    setBusy(true);
+    setErr(null);
+    setNote(null);
+    try {
+      setItems(await mcpAdmin.save(name, raw));
+      setNote(`已保存 ${name.trim()}，重启内核后生效`);
+      setEditing(null);
+      setName("");
+      setRaw(EXAMPLE_MCP);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function drop(target: string) {
+    setBusy(true);
+    setErr(null);
+    try {
+      setItems(await mcpAdmin.remove(target));
+      setNote(`已删除 ${target}，重启内核后生效`);
+      if (editing === target) {
+        setEditing(null);
+        setName("");
+        setRaw(EXAMPLE_MCP);
+      }
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function edit(s: McpServer) {
+    setEditing(s.name);
+    setName(s.name);
+    setRaw(JSON.stringify(s.config, null, 2));
+    setNote(null);
+  }
+
+  return (
+    <>
+      {healthy ? null : (
+        <p className="hint">内核未运行，改动会在下次启动时生效。</p>
+      )}
+
+      {items === null ? (
+        <p className="hint">读取中…</p>
+      ) : !items.length ? (
+        <p className="hint">还没有配置任何 MCP 服务器</p>
+      ) : (
+        <ul className="mcplist">
+          {items.map((s) => (
+            <li key={s.name} className={editing === s.name ? "on" : ""}>
+              <div className="mcprow">
+                <b>{s.name}</b>
+                <span className="muted small">{mcpSummary(s.config)}</span>
+                <span className="grow" />
+                <button className="link" onClick={() => edit(s)} disabled={busy}>
+                  编辑
+                </button>
+                <button className="link danger" onClick={() => void drop(s.name)} disabled={busy}>
+                  删除
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <h3>{editing ? `编辑 ${editing}` : "新增服务器"}</h3>
+      <input
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="服务器名，如 filesystem"
+        spellCheck={false}
+        disabled={!!editing}
+      />
+      <textarea
+        className="mcpjson"
+        value={raw}
+        onChange={(e) => setRaw(e.target.value)}
+        spellCheck={false}
+        rows={10}
+        aria-label="MCP 配置 JSON"
+      />
+      <div className="row">
+        <button className="primary" onClick={() => void submit()} disabled={busy || !name.trim()}>
+          {busy ? "保存中…" : "保存"}
+        </button>
+        {editing && (
+          <button
+            onClick={() => {
+              setEditing(null);
+              setName("");
+              setRaw(EXAMPLE_MCP);
+            }}
+          >
+            取消编辑
+          </button>
+        )}
+        <span className="grow" />
+        <button onClick={() => void onRestart()} disabled={!healthy}>
+          重启内核使其生效
+        </button>
+      </div>
+      {note && <p className="hint">{note}</p>}
+      {err && <pre className="detail err">{err}</pre>}
+    </>
+  );
+}
+
+/** 一段 JSON 只用一行说清它是什么传输方式、跑什么命令 */
+function mcpSummary(config: unknown): string {
+  if (!config || typeof config !== "object") return "";
+  const c = config as Record<string, unknown>;
+  const type = typeof c.type === "string" ? c.type : "";
+  const target =
+    typeof c.url === "string"
+      ? c.url
+      : typeof c.command === "string"
+        ? [c.command, ...(Array.isArray(c.args) ? c.args.map(String) : [])].join(" ")
+        : "";
+  return [type, target].filter(Boolean).join(" · ").slice(0, 120);
+}
+
+const EXAMPLE_MCP = `{
+  "type": "stdio",
+  "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+}`;
+
+/** 外观：三选一的主题开关，改动立刻生效并存到本地 */
+function Appearance() {
+  const mode = useThemeMode();
+  const opts: { id: ThemeMode; label: string; desc: string }[] = [
+    { id: "system", label: "跟随系统", desc: "macOS 切换外观时自动跟随" },
+    { id: "light", label: "浅色", desc: "始终浅色" },
+    { id: "dark", label: "深色", desc: "始终深色" },
+  ];
+  return (
+    <>
+      <div className="themerow">
+        {opts.map((o) => (
+          <button
+            key={o.id}
+            className={`themecard ${mode === o.id ? "on" : ""}`}
+            onClick={() => setThemeMode(o.id)}
+            aria-pressed={mode === o.id}
+          >
+            <b>{o.label}</b>
+            <span>{o.desc}</span>
+          </button>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/** 通知：会话跑完要不要弹、什么条件下弹。改完立刻生效，存在本地 */
+function NotifySettings() {
+  const p = useNotifyPrefs();
+  const [note, setNote] = useState<string | null>(null);
+  const rows: { key: keyof NotifyPrefs; label: string }[] = [
+    { key: "enabled", label: "会话完成时弹出通知" },
+    { key: "onlyWhenAway", label: "仅当窗口不在前台时提醒" },
+    { key: "subagents", label: "子任务会话完成也提醒" },
+    { key: "sound", label: "声音提醒" },
+  ];
+
+  function toggle(key: keyof NotifyPrefs, on: boolean) {
+    const next: Partial<NotifyPrefs> = {};
+    next[key] = on;
+    setNotifyPrefs(next);
+  }
+
+  async function test() {
+    try {
+      const ok = (await isPermissionGranted()) || (await requestPermission()) === "granted";
+      if (!ok) {
+        setNote("系统没给通知权限，需要到「系统设置 → 通知」里放行");
+        return;
+      }
+      sendNotification({
+        title: "CodeArts · 测试通知",
+        body: "能看到这条，说明通知是通的",
+        ...(p.sound ? { sound: "Ping" } : {}),
+      });
+      setNote("已发送");
+    } catch (e) {
+      setNote(`发不出去：${String(e)}`);
+    }
+  }
+
+  return (
+    <>
+      {rows.map((r) => (
+        <label className="awake" key={r.key}>
+          <input
+            type="checkbox"
+            checked={p[r.key]}
+            // 总开关关掉之后，下面几项留着也没意义，直接禁用免得看着困惑
+            disabled={r.key !== "enabled" && !p.enabled}
+            onChange={(e) => toggle(r.key, e.target.checked)}
+          />
+          {r.label}
+        </label>
+      ))}
+      <div className="row notifoot">
+        <button onClick={() => void test()} disabled={!p.enabled}>
+          发送测试通知
+        </button>
+        {note && <span className="muted small">{note}</span>}
+      </div>
+    </>
+  );
+}
+
 type ManagedSkill = {
+
   name: string;
   /** 原样回显的来源，如 foo/bar/skills/x@v1 */
   source: string;
@@ -1536,8 +1825,11 @@ function ModelSettings({
 const TABS: { id: Tab; label: string }[] = [
   { id: "kernel", label: "内核" },
   { id: "model", label: "模型" },
+  { id: "mcp", label: "MCP" },
   { id: "cred", label: "华为云凭据" },
-  { id: "caps", label: "技能与 MCP" },
+  { id: "caps", label: "技能" },
+  { id: "theme", label: "外观" },
+  { id: "notify", label: "通知" },
   { id: "about", label: "关于" },
 ];
 
@@ -1628,6 +1920,6 @@ type Caps = {
 /** credentials_status 的返回：只有有无与 AK 尾号，SK 明文不出 Rust */
 type CredStatus = { saved: boolean; inCliEnv: boolean; akMask: string | null };
 
-/** 设置面板左侧菜单的五页 */
-type Tab = "kernel" | "model" | "cred" | "caps" | "about";
+/** 设置面板左侧菜单的八页 */
+type Tab = "kernel" | "model" | "mcp" | "cred" | "caps" | "theme" | "notify" | "about";
 

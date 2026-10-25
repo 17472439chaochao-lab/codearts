@@ -42,6 +42,9 @@ impl WakeLock {
         true
     }
 
+    /// 只在测试里用：生产路径靠 hold/release 的返回值判断状态，
+    /// 保留这个方法是为了让幂等性可以被断言，所以不编进非测试构建。
+    #[cfg(test)]
     pub fn held(&self) -> bool {
         self.child
             .lock()

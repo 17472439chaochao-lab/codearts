@@ -13,11 +13,18 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   agents,
   api,
   commands,
+  exportMarkdown,
   normalizeProviders,
   permissionConfig,
   permissions,
@@ -45,6 +52,8 @@ import {
 import { APP_TITLE, useAppVersion, type KernelStatus } from "./App";
 import { FilePanel, FileViewer, QuickOpen, relInRoot, type OpenFile } from "./Files";
 import { BranchPicker, type GitState } from "./GitBranch";
+import { exportName, sessionMarkdown } from "./sessionExport";
+import { getNotifyPrefs } from "./notify";
 
 type Props = {
   projectDir: string;
@@ -136,6 +145,8 @@ const AGENT_KEY = "codearts.agent";
 const FILES_KEY = "codearts.filesPanel";
 /** 每个工作区默认露出的会话条数；「加载更多」按同样步长展开，「收起」回到这个数。工作区本身不再折叠 */
 const SIDE_PAGE = 3;
+/** 置顶的会话 id（localStorage）。置顶排在各自工作区的最前面，跨工作区共用一份 */
+const PIN_KEY = "codearts.pins";
 
 /**
  * 自绘滚动条：平时完全透明，滚动时浮出、停手 900ms 后渐隐（与正文区 .threadbar 同一观感）。
@@ -377,6 +388,18 @@ export default function Chat({
 
   const [list, setList] = useState<Session[]>([]);
   const [active, setActive] = useState<string | null>(null);
+  /** 侧栏过滤框：按标题和会话 id 过滤，输入时临时展开所有匹配（不受 SIDE_PAGE 限制） */
+  const [query, setQuery] = useState("");
+  /** 置顶集合：置顶的会话在各自工作区里排最前 */
+  const [pins, setPins] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(PIN_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  });
   /** 每个工作区已展开的会话条数；缺省按 SIDE_PAGE（工作区本身不再折叠） */
   const [sessShown, setSessShown] = useState<Record<string, number>>({});
   /** 异步回填对比用：listener / fetch 完成时 active 可能已变 */
@@ -495,8 +518,6 @@ export default function Chat({
   const [sessionDiffs, setSessionDiffs] = useState<FileDiff[]>([]);
   /** ⌘P 快捷打开浮层 */
   const [quickOpen, setQuickOpen] = useState(false);
-  /** 递增一次 = 让文件栏切到搜索页签并聚焦输入框（⌘⇧F） */
-  const [searchTick, setSearchTick] = useState(0);
   /** 当前工作区的 Git 分支；内核 /vcs 在非 git 目录回空对象，那时不显示 */
   const [branch, setBranch] = useState<VcsInfo | null>(null);
   /** 分支列表 / 游离 HEAD / 未提交改动数，由壳侧的 git 命令读取 */
@@ -535,6 +556,42 @@ export default function Chat({
   }, [dir, wsKey]);
   const reloadListRef = useRef(reloadList);
   reloadListRef.current = reloadList;
+  /** 通知里要写会话标题：监听器是常驻闭包，取值走 ref */
+  const listRef = useRef(list);
+  listRef.current = list;
+
+  /**
+   * 后台会话跑完给一条 macOS 通知：多工作区切走之后，不提示就只能靠记性等结果。
+   * 弹不弹由「设置 → 通知」里的偏好决定（总开关、只在窗口不在前台时提醒、
+   * 子任务是否也提醒、是否带提示音）。
+   * 系统权限只主动申请一次；之后每次都用 isPermissionGranted 复查——
+   * 用户中途在系统设置里打开了权限，下一次就能正常弹出来。
+   */
+  const askedPermission = useRef(false);
+  const notifyDone = useCallback(async (sid: string) => {
+    const prefs = getNotifyPrefs();
+    if (!prefs.enabled) return;
+    if (kidIds.current.has(sid) && !prefs.subagents) return;
+    if (prefs.onlyWhenAway && sid === activeRef.current && document.hasFocus()) return;
+    try {
+      let ok = await isPermissionGranted();
+      if (!ok && !askedPermission.current) {
+        askedPermission.current = true;
+        ok = (await requestPermission()) === "granted";
+      }
+      if (!ok) return;
+      const title = listRef.current.find((s) => s.id === sid)?.title || "会话";
+      sendNotification({
+        title: "CodeArts · 会话已完成",
+        body: title,
+        ...(prefs.sound ? { sound: "Ping" } : {}),
+      });
+    } catch {
+      // 没有通知权限或不是签名构建：静默跳过，不打扰主流程
+    }
+  }, []);
+  const notifyRef = useRef(notifyDone);
+  notifyRef.current = notifyDone;
 
   // 内核不在线时不发：api_request 的 ensure_running 会顺手再 start()，
   // 两个启动互相顶掉 boot 代数，结果报"内核启动被取消"
@@ -682,19 +739,14 @@ export default function Chat({
     setToast(st.current ? `已切到分支 ${st.current}` : `已切到游离 HEAD ${st.head ?? ""}`.trim());
   }
 
-  /** ⌘P 快捷打开 / ⌘⇧F 全文搜索；内核没起来时不接管，免得按一下就把它拉起来 */
+  /** ⌘P 快捷打开；内核没起来时不接管，免得按一下就把它拉起来 */
   useEffect(() => {
     if (!live) return;
     const onKey = (e: globalThis.KeyboardEvent) => {
       if (!e.metaKey || e.altKey || e.isComposing) return;
-      const k = e.key.toLowerCase();
-      if (k === "p" && !e.shiftKey) {
+      if (e.key.toLowerCase() === "p" && !e.shiftKey) {
         e.preventDefault();
         setQuickOpen((v) => !v);
-      } else if (k === "f" && e.shiftKey) {
-        e.preventDefault();
-        showFiles();
-        setSearchTick((t) => t + 1);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -1263,6 +1315,9 @@ export default function Chat({
               })
               .catch(() => {});
             reloadDiffsRef.current();
+          } else if (sid) {
+            // 不是当前会话（切走了或在别的区）：跑完给一条系统通知，别让人干等
+            void notifyRef.current(sid);
           }
           break;
         case "session.error":
@@ -1727,6 +1782,40 @@ export default function Chat({
     );
   }
 
+  /** 置顶集合存在本地：置顶是"我怎么看这个列表"的偏好，不该写进内核的会话数据 */
+  function togglePin(id: string) {
+    setPins((cur) => {
+      const next = cur.includes(id) ? cur.filter((x) => x !== id) : [id, ...cur];
+      try {
+        localStorage.setItem(PIN_KEY, JSON.stringify(next));
+      } catch {
+        // 存不下只影响下次启动，本次排序照旧
+      }
+      return next;
+    });
+  }
+
+  /**
+   * 导出 Markdown：内容是壳侧按消息拼的（内核没有导出接口），
+   * 路径交给系统保存对话框，写盘由 Rust 侧负责（绝对路径 + 8MB 上限）。
+   */
+  async function exportSession(id: string) {
+    try {
+      const where = dirOf(id);
+      const s = list.find((x) => x.id === id) ?? (await sessions.get(id, where));
+      const ms = await sessions.messages(id, s.directory ?? where);
+      const path = await saveDialog({
+        defaultPath: exportName(s.title, s.time?.created),
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (!path) return;
+      const out = await exportMarkdown(path, sessionMarkdown(s, ms));
+      setToast(`已导出到 ${out}`);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
   /** 分叉 = 复制整段历史另开一条，之后的改动不回头影响原会话 */
   async function forkSession(id: string) {
     try {
@@ -1934,8 +2023,43 @@ export default function Chat({
     }
   }
 
-  const ofWs = (p: string) => list.filter((s) => sameDir(s.directory, p));
+  /**
+   * 某个工作区要显示哪些会话：先按过滤词筛，再把置顶的按置顶顺序提到前面，
+   * 其余保持 `list` 里的时间倒序（sort 是稳定的）。
+   */
+  const kw = query.trim().toLowerCase();
+  const ofWs = (p: string) => {
+    const items = list.filter((s) => sameDir(s.directory, p));
+    const hit = kw
+      ? items.filter((s) => `${s.title ?? ""} ${s.id}`.toLowerCase().includes(kw))
+      : items;
+    const rank = (id: string) => {
+      const i = pins.indexOf(id);
+      return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+    };
+    return [...hit].sort((a, b) => rank(a.id) - rank(b.id));
+  };
   const turns = msgs.filter((m) => m.info.role === "user");
+  /** 本会话累计用量：token / 缓存 / 耗时都按助手消息累加，挂在会话末尾 */
+  const spend = msgs.reduce(
+    (acc, m) => {
+      const i = m.info;
+      if (i.role !== "assistant") return acc;
+      if (typeof i.cost === "number") acc.cost += i.cost;
+      const t = (i.tokens ?? {}) as Record<string, unknown>;
+      const n = (x: unknown) => (typeof x === "number" ? x : 0);
+      acc.in += n(t.input);
+      acc.out += n(t.output);
+      acc.reasoning += n(t.reasoning);
+      const c = (t.cache ?? {}) as Record<string, unknown>;
+      acc.cache += n(c.read) + n(c.write);
+      if (i.time?.completed) acc.ms += Math.max(0, i.time.completed - i.time.created);
+      return acc;
+    },
+    { cost: 0, in: 0, out: 0, reasoning: 0, cache: 0, ms: 0 },
+  );
+  const toolCalls = msgs.reduce((n, m) => n + m.parts.filter((p) => p.type === "tool").length, 0);
+
   const lastRea = lastReasoning(msgs);
   /** 每轮小结的底账：切轮、数步、给每步拉一行摘要，详见 turnsOf */
   const { stat: turnStat, owner: turnOf } = turnsOf(msgs, busy);
@@ -2052,16 +2176,6 @@ export default function Chat({
     });
   }
 
-  /** ⌘⇧F 要用：展开文件栏并记住，别只改这一次渲染的状态 */
-  function showFiles() {
-    setFilesOpen(true);
-    try {
-      localStorage.setItem(FILES_KEY, "1");
-    } catch {
-      // 同上
-    }
-  }
-
   /** 文件大窗只读它那个区的文件（root 已跟着会话走）；越界的仍然拦掉。计划文件由 files.rs 单独限定根目录 */
   function openWorkspaceFile(f: OpenFile) {
     if (!f.plan && relInRoot(wsDir, f.abs) === null) {
@@ -2130,7 +2244,9 @@ export default function Chat({
     const onActive = id === active && !readOnly;
     const lastUser = [...msgs].reverse().find((m) => m.info.role === "user")?.info.id;
     const canWrite = onActive && !busy;
+    const url = s?.share?.url;
     return [
+      { label: pins.includes(id) ? "取消置顶" : "置顶会话", run: () => togglePin(id) },
       ...(cur ? [] : [{ label: "切到该工作区", run: () => switchTo(p) }]),
       ...(onActive && s?.revert
         ? [{ label: "恢复撤销的内容", run: () => void redoUndo() }]
@@ -2138,9 +2254,15 @@ export default function Chat({
           ? [{ label: "撤销最后一轮", run: () => void revertTo(lastUser) }]
           : []),
       ...(canWrite ? [{ label: "生成 / 更新 AGENTS.md", run: () => void initAgentsMd() }] : []),
+      { label: "导出为 Markdown…", run: () => void exportSession(id) },
       { label: "分叉为新会话", run: () => void forkSession(id) },
-      ...(s?.share
-        ? [{ label: "取消公开发布", run: () => void doUnshare(id) }]
+      // 已发布的会话把外链摊出来：复制链接 / 直接打开，省得再点一次"发布"才发现早就发过了
+      ...(url
+        ? [
+            { label: "复制分享链接", run: () => void copy(url) },
+            { label: "在浏览器打开分享页", run: () => void openUrl(url).catch((e) => setErr(String(e))) },
+            { label: "取消公开发布", run: () => void doUnshare(id) },
+          ]
         : [{ label: "公开发布到公网…", danger: true, run: () => setShareAsk(id) }]),
       { label: "删除会话", danger: true, run: () => void removeSession(id) },
     ];
@@ -2170,6 +2292,34 @@ export default function Chat({
             + 新建会话
           </button>
         </div>
+        {/* 会话多了以后靠着时间翻很不方便；过滤只在本地跑，不打扰内核 */}
+        <div className="sessfind">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="7" cy="7" r="4.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
+            <path
+              d="M10.4 10.4L13.6 13.6"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.3"
+              strokeLinecap="round"
+            />
+          </svg>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setQuery("");
+            }}
+            placeholder="搜索会话"
+            aria-label="按标题搜索会话"
+            spellCheck={false}
+          />
+          {query && (
+            <button className="x" onClick={() => setQuery("")} title="清空" aria-label="清空搜索">
+              ×
+            </button>
+          )}
+        </div>
         <div className="wsbox">
           <header>
             <span className="muted small">工作区</span>
@@ -2191,7 +2341,8 @@ export default function Chat({
               {projects.map((p) => {
                 const cur = sameDir(p, projectDir);
                 const items = ofWs(p);
-                const cap = sessShown[p] ?? SIDE_PAGE;
+                // 搜索时把命中的全摊开：翻"加载更多"去找一条匹配结果是折磨
+                const cap = kw ? items.length : (sessShown[p] ?? SIDE_PAGE);
                 const head = items.slice(0, cap);
                 // 当前打开的那条如果落在折叠区，单独补一行，不必把中间全部摊开
                 const pinned = head.some((s) => s.id === active)
@@ -2242,6 +2393,11 @@ export default function Chat({
                             onClick={() => openSession(s.id)}
                             title={s.parentID ? `子任务会话 · ${s.id}` : s.id}
                           >
+                            {pins.includes(s.id) && (
+                              <span className="pin" aria-label="已置顶" title="已置顶">
+                                ★
+                              </span>
+                            )}
                             {s.parentID ? `↳ ${s.title || s.id}` : s.title || s.id}
                           </button>
                           <button
@@ -2282,7 +2438,9 @@ export default function Chat({
                           )}
                         </li>
                       )}
-                      {!items.length && <li className="muted pad">暂无会话</li>}
+                      {!items.length && (
+                        <li className="muted pad">{kw ? "没有匹配的会话" : "暂无会话"}</li>
+                      )}
                     </ul>
                   </li>
                 );
@@ -2313,6 +2471,17 @@ export default function Chat({
           <span className="muted">
             {live ? `内核在线 · ${status?.version}` : "内核未运行"}
           </span>
+          {activeSess?.share?.url && (
+            <button
+              className="sharechip"
+              onClick={() =>
+                void openUrl(activeSess.share!.url).catch((e) => setErr(String(e)))
+              }
+              title={`已公开发布到公网：${activeSess.share.url}（点击在浏览器打开）`}
+            >
+              已发布
+            </button>
+          )}
           {(gitState?.repo || branch?.branch) && (
             <BranchPicker
               dir={wsDir}
@@ -2444,6 +2613,8 @@ export default function Chat({
                 : isLast && todos.length
                   ? todos
                   : st?.todos;
+              // 用量挂在说话人这一行右端：每步少一整行，长会话能省出一屏
+              const u = m.info.role === "assistant" ? usage(m.info) : "";
               return (
                 <Fragment key={m.info.id}>
                   <article
@@ -2451,7 +2622,14 @@ export default function Chat({
                     className={`msg ${m.info.role}`}
                     onContextMenu={(e) => openMenu(e, msgMenu(m))}
                   >
-                    <header>{label(m.info)}</header>
+                    <header>
+                      <span>{label(m.info)}</span>
+                      {u && (
+                        <span className="umeta" title={u}>
+                          {u}
+                        </span>
+                      )}
+                    </header>
                     {m.info.error && (
                       <p className="error inline">
                         {m.info.error.data?.message ?? m.info.error.name}
@@ -2467,9 +2645,6 @@ export default function Chat({
                         kid={kidOf(p)}
                       />
                     ))}
-                    {m.info.role === "assistant" && usage(m.info) && (
-                      <footer className="muted small">{usage(m.info)}</footer>
-                    )}
                   </article>
                   {st && (
                     <>
@@ -2500,6 +2675,24 @@ export default function Chat({
               />
             )}
             {!msgs.length && !busy && active && <p className="muted">等待内核回复…</p>}
+            {!!active && (spend.in > 0 || spend.out > 0 || spend.cost > 0) && (
+              <div className="sessstat">
+                <p>
+                  本次会话 · {turns.length} 轮 · {msgs.length} 条消息
+                  {toolCalls ? ` · ${toolCalls} 次工具调用` : ""}
+                </p>
+                <p>
+                  输入 {fmtNum(spend.in)} · 输出 {fmtNum(spend.out)}
+                  {spend.reasoning ? ` · 思考 ${fmtNum(spend.reasoning)}` : ""}
+                  {spend.cache ? ` · 缓存 ${fmtNum(spend.cache)}` : ""}
+                </p>
+                <p>
+                  合计 {fmtNum(spend.in + spend.out)} token
+                  {spend.cost > 0 ? ` · 成本 ${fmtNum(spend.cost, 4)}` : ""}
+                  {spend.ms > 1000 ? ` · 时长 ${fmtSpan(spend.ms / 1000)}` : ""}
+                </p>
+              </div>
+            )}
           </section>
 
           {busy && openTodos && <TodoFly todos={todos} pulse={editPulse} />}
@@ -2807,10 +3000,6 @@ export default function Chat({
           session={activeSess}
           diffs={sessionDiffs}
           pulse={editPulse}
-          focusSearch={searchTick}
-          workspaces={projects.length ? projects : [projectDir]}
-          onSwitchDir={(d) => switchTo(d)}
-          onAddDir={onAddDir}
           onOpenFile={openWorkspaceFile}
           onRefreshDiffs={reloadDiffs}
           onClose={toggleFiles}
@@ -2824,6 +3013,10 @@ export default function Chat({
           startTab={fileView.tab}
           diffs={sessionDiffs}
           pulse={editPulse}
+          onRestored={() => {
+            reloadDiffs();
+            setEditPulse((n) => n + 1);
+          }}
           onClose={() => setFileView(null)}
         />
       )}
@@ -3335,6 +3528,8 @@ function ReasoningFold({ part, autoOpen }: { part: Part; autoOpen: boolean }) {
   const [manual, setManual] = useState<boolean | null>(null);
   const open = manual ?? autoOpen;
   const secs = dur(part.time);
+  // 只带了时间戳、没留思考正文的空块不占地方
+  if (!part.text?.trim()) return null;
   return (
     <details className="fold" open={open}>
       <summary onClick={() => setManual(!open)}>
@@ -3480,8 +3675,11 @@ function StatusChip({ status }: { status: string }) {
 /** 改动清单里的状态字母（git 风格） */
 const FSTATUS_CN: Record<string, string> = { added: "A", deleted: "D", modified: "M" };
 
-const dur = (t?: { start?: number; end?: number }) =>
-  t?.start && t?.end && t.end >= t.start ? fmtSpan((t.end - t.start) / 1000) : "";
+const dur = (t?: { start?: number; end?: number }) => {
+  const ms = t?.start && t?.end && t.end >= t.start ? t.end - t.start : 0;
+  // 不到 0.1 秒的耗时对看的人没有信息量，只会在每步后面挂一串「0.0秒」
+  return ms >= 100 ? fmtSpan(ms / 1000) : "";
+};
 
 /** 这些工具的入参本身就写在标题行里，再摊一份 JSON 只会把正文挤成一堵墙 */
 const SELF_EXPLANATORY = new Set([

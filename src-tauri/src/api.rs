@@ -85,6 +85,23 @@ fn segment_prefix(path: &str, prefix: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// `/find` 的宽模式在大型工程里能回几千条匹配、几 MB JSON。全量读进内存再解析
+/// 只会让 WebView 卡死，所以给响应体一个上限，超了就直接报错让前端收窄条件。
+/// 只拦带 Content-Length 的响应：分块传输没有长度头，保持原样读完（内核的接口目前都带长度）。
+const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// 长度头缺失（分块传输）时不设限，交给内核自己控规模
+fn check_length(len: Option<u64>) -> Result<()> {
+    match len {
+        Some(n) if n > MAX_BODY_BYTES => Err(Error::Msg(format!(
+            "响应体约 {} MB，超过 {} MB 上限：请收窄检索条件",
+            n / 1024 / 1024,
+            MAX_BODY_BYTES / 1024 / 1024
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// 内核未注册的路由不会 404，而是回 TUI 的 SPA 兜底页（200 + text/html），
 /// 所以必须按 content-type 判定，否则前端会把 HTML 当 JSON 用。
 /// 非 2xx 一律当 IPC 错误，避免前端把 JSON 错误体当成成功。
@@ -96,6 +113,9 @@ async fn decode(resp: reqwest::Response) -> Result<Value> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    if let Some(len) = resp.content_length() {
+        check_length(Some(len))?;
+    }
     let bytes = resp.bytes().await?;
     if !status.is_success() {
         let body = String::from_utf8_lossy(&bytes);
@@ -311,6 +331,14 @@ mod tests {
         let bare: Value =
             serde_json::from_str(r#"{"type":"server.heartbeat","properties":{}}"#).unwrap();
         assert_eq!(unwrap_envelope(bare.clone()), bare);
+    }
+
+    #[test]
+    fn caps_oversized_bodies() {
+        assert!(check_length(None).is_ok(), "无长度头时保持原样");
+        assert!(check_length(Some(1024)).is_ok());
+        assert!(check_length(Some(MAX_BODY_BYTES)).is_ok(), "正好等于上限应放行");
+        assert!(check_length(Some(MAX_BODY_BYTES + 1)).is_err());
     }
 
     #[test]
