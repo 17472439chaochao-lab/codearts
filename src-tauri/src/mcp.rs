@@ -74,7 +74,7 @@ fn servers_of(root: &Value) -> &Map<String, Value> {
 
 static EMPTY: std::sync::OnceLock<Map<String, Value>> = std::sync::OnceLock::new();
 
-fn valid_name(name: &str) -> Result<String> {
+pub(crate) fn valid_name(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
         return Err(Error::Msg("MCP 服务器名不能为空".into()));

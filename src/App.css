@@ -367,8 +367,59 @@ svg {
   padding: 2px 6px;
 }
 
+/* 发送失败：输入区上方的整条提示，不再挤进底部控件行 */
+.errbar {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 8px 0 0;
+  padding: 7px 8px 7px 10px;
+  border: 1px solid var(--bd-f3c2c2);
+  border-radius: 8px;
+  background: var(--bg-fdecec);
+  color: var(--fg-8a1c1c);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.errbar > svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+}
+
+.errbar .grow {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.errbar .x {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin: -1px -2px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 15px;
+  line-height: 18px;
+  opacity: 0.55;
+}
+
+.errbar .x:hover {
+  background: var(--bg-fbe1e1);
+  opacity: 1;
+}
+
 /* 失败那一轮的原样重发，就着错误框排一行 */
-.error .retry {
+.error .retry,
+.errbar .retry {
+  flex: none;
+  align-self: center;
   display: inline-flex;
   align-items: center;
   gap: 3px;
@@ -382,11 +433,13 @@ svg {
   vertical-align: 1px;
 }
 
-.error .retry:hover {
+.error .retry:hover,
+.errbar .retry:hover {
   background: var(--bg-fbe1e1);
 }
 
-.error .retry svg {
+.error .retry svg,
+.errbar .retry svg {
   width: 11px;
   height: 11px;
 }
@@ -491,8 +544,9 @@ code {
 /* 自绘的窗口标题：红绿灯右边就是它 */
 .wtitle {
   padding-left: 78px;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
   color: var(--fg);
   opacity: 0.72;
   user-select: none;
@@ -500,7 +554,7 @@ code {
 
 /* 标题右侧的版本号小字 */
 .wver {
-  margin-left: 8px;
+  margin-left: 6px;
   font-size: 11px;
   color: var(--muted);
   user-select: none;
@@ -2390,43 +2444,188 @@ code {
   color: var(--muted);
 }
 
-/* 工具卡标题行：工具名 + 一行摘要 + 状态，收起时也要看得出这步在干什么 */
-.fold.tool > summary {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
+/* 工具执行分组：一轮里连续的工具/思考合成一张卡，收起只报次数。
+   卡片有边框，和正文、折叠块拉开层级；展开后每步一行 */
+.toolrun {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin: 8px 0;
+  background: var(--bg-fbfbfc);
+  overflow: hidden;
 }
 
-.fold.tool > summary b {
+.toolrun > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.toolrun > summary::-webkit-details-marker {
+  display: none;
+}
+
+.toolrun > summary:hover {
+  background: var(--bg-f4f6fa);
+}
+
+.tgchev {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  background: var(--bg-f4f6fa);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.tgchev svg {
+  width: 11px;
+  height: 11px;
+  transition: transform 0.12s ease;
+}
+
+.toolrun[open] .tgchev svg {
+  transform: rotate(90deg);
+}
+
+.tgtitle {
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.toolrun .pulse {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-b26a00);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+.tglist {
+  position: relative;
+  list-style: none;
+  margin: 0;
+  padding: 0 10px 7px 10px;
+}
+
+.tgrow {
+  position: relative;
+}
+
+.tgr > summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+  white-space: nowrap;
+}
+
+.tgr > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tgr > summary:hover,
+.tgr[open] > summary {
+  background: var(--bg-f4f6fa);
+}
+
+.tgicon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--fg-17a34a);
+}
+
+.tgrow.tg-running .tgicon,
+.tgrow.tg-pending .tgicon {
+  color: var(--fg-b26a00);
+}
+
+.tgrow.tg-error .tgicon {
+  color: var(--fg-8a1c1c);
+}
+
+.tgrow.tg-running .tgicon.spin {
+  animation: tgspin 1s linear infinite;
+}
+
+@keyframes tgspin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.tglabel {
   flex: none;
   font-weight: 500;
   color: var(--fg);
 }
 
-.fold.tool > summary .arg {
+.tgverb {
+  flex: none;
+  font-size: 11px;
+}
+
+.tgverb.tg-running,
+.tgverb.tg-pending {
+  color: var(--fg-b26a00);
+}
+
+.tgverb.tg-error {
+  color: var(--fg-8a1c1c);
+}
+
+.tgverb.tg-completed {
+  color: var(--fg-17a34a);
+}
+
+.tgsep {
+  flex: none;
+  opacity: 0.45;
+}
+
+.tgpreview {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--muted);
 }
 
-.fold.tool > summary .st {
-  flex: none;
-  font-size: 11px;
+.tgpreview.mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 11.5px;
 }
 
-.fold.tool > summary .st.running,
-.fold.tool > summary .st.pending {
-  color: var(--fg-b26a00);
+.tgbody {
+  padding: 4px 6px 7px 29px;
 }
 
-.fold.tool > summary .st.error {
-  color: var(--fg-8a1c1c);
+.tgbody > *:first-child {
+  margin-top: 3px;
 }
 
-.fold.tool > summary .st.completed {
-  color: var(--fg-17a34a);
+/* 每步消息的锚点：TurnSum 点一行仍能滚到对应位置，又不占高度 */
+.anchor {
+  display: block;
+  height: 0;
+  scroll-margin-top: 14px;
 }
 
 .code {
@@ -2679,9 +2878,11 @@ button.primary {
   background: var(--bg-f3f7ff);
 }
 
-/* 待答区自己滚：两三个问题一叠就是几百像素，不设上限会把上面的对话整块挤出窗口 */
-.pending {
-  max-height: 45vh;
+/* 待答区自己滚：卡片叠起来时按窗口高度给足空间（至少能放下两张常见卡片），
+   放不下才滚，别一上来就把第二张卡的动作行截在可视区外。
+   只作用于输入区，避免又碰到工具状态/OCR 角标的 .pending */
+.composer > .pending {
+  max-height: clamp(220px, calc(100vh - 300px), 620px);
   overflow: auto;
 }
 
@@ -2720,12 +2921,21 @@ button.primary {
 }
 
 /* 提交/不回答这一行钉在卡片底部，滚多远都不会看不见；压住下面的选项时靠这条分隔线说明是钉住的 */
-.ask.q .row {
+.ask.q .qfoot {
   position: sticky;
   bottom: 0;
   background: var(--bg-f3f7ff);
-  padding: 8px 0 2px;
+  padding: 0 0 2px;
+  margin-top: 8px;
   border-top: 1px solid var(--bd-dbe6f8);
+}
+
+/* 提示文字另起一行：和按钮同排时窗口一窄就被挤成两行 */
+.asknote {
+  margin: 5px 0 0;
+  text-align: right;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .ask.q .qone {
@@ -3037,88 +3247,128 @@ button.primary {
   color: var(--muted);
 }
 
-.kidlog li .st.running,
-.kidlog li .st.pending {
+.kidlog li .st.st-running,
+.kidlog li .st.st-pending {
   color: var(--fg-b26a00);
 }
 
-.kidlog li .st.error {
+.kidlog li .st.st-error {
   color: var(--fg-8a1c1c);
 }
 
-.kidlog li .st.completed {
+.kidlog li .st.st-completed {
   color: var(--fg-17a34a);
 }
 
 /* todowrite 的清单：状态靠符号 + 颜色双通道，只有高优才打标签，别把整行染成花脸 */
 .todo {
   margin: 6px 0;
-  padding: 6px 9px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--bg-ffffff);
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--bg-fbfbfc);
+}
+
+.todo > p {
+  margin: 0 0 2px;
 }
 
 .todoRows {
   list-style: none;
-  margin: 2px 0 0;
+  margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 1px;
 }
 
 .todoRows li {
   display: flex;
-  align-items: baseline;
-  gap: 7px;
-  font-size: 12px;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  line-height: 19px;
 }
 
-.todoRows .mk {
+.todoRows li:hover {
+  background: var(--tint-ink);
+}
+
+.todoRows .tmark {
   flex: none;
-  width: 13px;
-  text-align: center;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 19px;
   color: var(--muted);
+}
+
+.todoRows .tmark svg {
+  display: block;
+  width: 14px;
+  height: 14px;
 }
 
 .todoRows .tx {
   flex: 1;
   min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.todoRows .tmeta {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 1px;
+}
+
+.todoRows .pri {
+  flex: none;
+  height: 17px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 17px;
+  color: var(--fg-8a5a00);
+  background: var(--bg-fff3d6);
 }
 
 .todoRows .st-cn {
   flex: none;
-}
-
-.todoRows .tag {
-  flex: none;
   font-size: 11px;
-  color: var(--fg-8a5a00);
-  background: var(--bg-fff3d6);
-  border-radius: 999px;
-  padding: 0 6px;
-}
-
-.todoRows li.in_progress .mk {
-  color: var(--link);
-}
-
-.todoRows li.in_progress .tx {
-  font-weight: 500;
-}
-
-.todoRows li.completed .mk {
-  color: var(--fg-17a34a);
-}
-
-.todoRows li.completed .tx,
-.todoRows li.cancelled .tx {
+  line-height: 17px;
+  white-space: nowrap;
   color: var(--muted);
 }
 
-.todoRows li.cancelled .mk {
-  color: var(--fg-8a1c1c);
+/* 用 data-status 而不是 class：.pending 在待决区另有全局样式（max-height + overflow） */
+.todoRows li[data-status="in_progress"] .tmark {
+  color: var(--accent);
+}
+
+.todoRows li[data-status="in_progress"] .tx {
+  font-weight: 500;
+}
+
+.todoRows li[data-status="in_progress"] .st-cn {
+  color: var(--link);
+}
+
+.todoRows li[data-status="completed"] .tmark {
+  color: var(--fg-17a34a);
+}
+
+.todoRows li[data-status="completed"] .tx,
+.todoRows li[data-status="cancelled"] .tx {
+  color: var(--muted);
+}
+
+.todoRows li[data-status="cancelled"] .tmark {
+  color: var(--fg-a8a8af);
 }
 
 .kids .link {
@@ -3200,6 +3450,16 @@ button.primary {
   max-height: 88vh;
   padding: 0;
   overflow: hidden;
+}
+
+/* 口令这类单列表单：窄一点，按钮和输入框不用拉满 */
+.panel.narrow {
+  width: 380px;
+  padding: 18px 20px;
+}
+
+.panel.narrow .row {
+  justify-content: flex-end;
 }
 
 .tabs {
@@ -3345,8 +3605,8 @@ button.primary {
 }
 
 /*
- * 每轮对话的小结胶囊：挂在该轮末尾、随线程滚动，收起就一行
- *「✓ 步骤 N / N · 清单 x/y · F 个文件已修改 +a -d」，展开看清单和逐文件改动。
+ * 每轮对话的改动小结：挂在该轮末尾、随线程滚动，收起就一行
+ *「✓ F 个文件已修改 +a -d」，展开看逐文件改动。
  */
 .turnsum {
   width: fit-content;
@@ -3389,16 +3649,21 @@ button.primary {
 }
 
 /*
- * 轮末待办：和步骤胶囊分开，收在这一轮最底部一行。
+ * 轮末待办：收在这一轮最底部一行。
  * 跑着的时候由 .todofly 悬浮显示，结束后才落到这里。
  */
 .turnTodo {
   width: fit-content;
   max-width: 100%;
   margin: 2px 0 12px;
-  padding: 3px 10px;
+  padding: 3px 11px;
   border-radius: 999px;
   background: var(--bg-ffffff);
+  transition: border-color 0.16s ease;
+}
+
+.turnTodo:hover {
+  border-color: var(--line-soft);
 }
 
 .turnsum + .turnTodo {
@@ -3408,7 +3673,7 @@ button.primary {
 .turnTodo > summary {
   display: flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
 }
 
 .turnTodo > summary .ck {
@@ -3421,14 +3686,22 @@ button.primary {
   color: var(--muted);
 }
 
+.turnTodo > summary .ttnow {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .turnTodo[open] {
+  padding: 9px 12px 10px;
   border-radius: 10px;
 }
 
 .turnTodo .todoRows {
   max-height: 30vh;
   overflow: auto;
-  margin: 7px 0 1px;
+  margin: 6px -4px 0;
+  padding: 0 4px;
 }
 
 /* 轮末待办夹在胶囊和下一轮之间，补回被邻接选择器断掉的分隔线 */
@@ -3442,29 +3715,29 @@ button.primary {
   top: 10px;
   right: 34px;
   z-index: 6;
-  width: min(320px, 42vw);
-  max-height: 38vh;
+  width: min(340px, 44vw);
+  max-height: 42vh;
   display: flex;
   flex-direction: column;
-  padding: 6px 10px 8px;
+  padding: 9px 10px 8px;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--surface-float);
-  box-shadow: 0 8px 28px rgba(20, 20, 30, 0.12);
-  backdrop-filter: blur(8px);
+  box-shadow: 0 10px 32px rgba(20, 20, 30, 0.14), 0 1px 2px rgba(20, 20, 30, 0.06);
+  backdrop-filter: blur(10px);
 }
 
 .todofly.folded {
   width: auto;
-  padding: 4px 10px;
+  padding: 5px 11px;
 }
 
 .tfhead {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   width: 100%;
-  padding: 0;
+  padding: 0 0 0 1px;
   border: 0;
   background: none;
   font: inherit;
@@ -3475,16 +3748,19 @@ button.primary {
 }
 
 .tfhead b {
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: 0.2px;
 }
 
 .tfprog {
   flex: none;
-  padding: 0 6px;
+  padding: 0 7px;
+  height: 18px;
   border-radius: 999px;
   background: var(--bg-eef3fd);
   color: var(--link);
   font-size: 11px;
+  line-height: 18px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -3492,13 +3768,17 @@ button.primary {
   flex: none;
   display: grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
-  margin: -4px -6px -4px 0;
+  width: 20px;
+  height: 20px;
+  margin: -3px -4px -3px 0;
   border-radius: 6px;
   color: var(--muted);
-  font-size: 16px;
-  line-height: 1;
+}
+
+.tfchev svg {
+  width: 13px;
+  height: 13px;
+  display: block;
 }
 
 .tfhead:hover .tfchev {
@@ -3506,67 +3786,53 @@ button.primary {
   color: var(--fg);
 }
 
+.tfbar {
+  height: 3px;
+  margin: 8px 1px 2px;
+  border-radius: 999px;
+  background: var(--bg-ececf0);
+  overflow: hidden;
+}
+
+.tfbar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
 .todofly .todoRows {
-  max-height: 32vh;
+  flex: 1;
+  min-height: 0;
+  max-height: none;
   overflow: auto;
-  margin-top: 6px;
+  overscroll-behavior: contain;
+  margin: 4px -5px 0;
+  padding: 0 5px;
+}
+
+.todofly .todoRows::-webkit-scrollbar,
+.turnTodo .todoRows::-webkit-scrollbar,
+.todo .todoRows::-webkit-scrollbar {
+  width: 7px;
+}
+
+.todofly .todoRows::-webkit-scrollbar-thumb,
+.turnTodo .todoRows::-webkit-scrollbar-thumb,
+.todo .todoRows::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--thumb);
+}
+
+.todofly .todoRows::-webkit-scrollbar-thumb:hover,
+.turnTodo .todoRows::-webkit-scrollbar-thumb:hover,
+.todo .todoRows::-webkit-scrollbar-thumb:hover {
+  background: var(--thumb-hover);
 }
 
 .todofly .pulse-dot {
   animation: filepulse 1.4s ease-out infinite;
-}
-
-/* 展开后的步骤清单：每步一行摘要，整行可点跳回那条消息 */
-.steplist {
-  list-style: none;
-  margin: 7px 0 1px;
-  padding: 0;
-  max-height: 30vh;
-  overflow: auto;
-}
-
-.steplist li {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 1px 0;
-  font-size: 12px;
-}
-
-.steplist .no {
-  flex: none;
-  min-width: 14px;
-  text-align: right;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-
-.steplist .tx {
-  flex: 1;
-  min-width: 0;
-  padding: 1px 5px;
-  border: 0;
-  border-radius: 6px;
-  background: none;
-  font: inherit;
-  color: var(--fg);
-  text-align: left;
-  cursor: pointer;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.steplist .tx:hover {
-  background: var(--bg-ececf0);
-}
-
-.steplist li.now .tx {
-  font-weight: 500;
-}
-
-.steplist .pulse-dot {
-  flex: none;
 }
 
 /* 跑着的这轮：小点持续呼吸；每次 file.edited 重挂 key，节奏跟着改动走 */

@@ -16,11 +16,11 @@ const ITEM_QUIT: &str = "quit";
 /// 装托盘图标。菜单只有两项：把窗口要回来，或者真正退出（退出才收内核）。
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, ITEM_SHOW, "显示主窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, ITEM_QUIT, "退出 CodeArts Desktop", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, ITEM_QUIT, "退出 CodeArts Cli Desktop", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip("CodeArts Desktop")
+        .tooltip("CodeArts Cli Desktop")
         .menu(&menu)
         // 左键直接亮窗口，右键才出菜单：托盘常驻状态下这是最省事的分工
         .show_menu_on_left_click(false)
@@ -51,13 +51,13 @@ pub fn init(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// 把主窗口要回来。菜单项和左键点击都走这里。
+/// 把主窗口要回来。菜单项、左键点击和 macOS 的 Dock 唤醒都走这里。
 ///
 /// 刻意不在托盘回调里直接 show()+set_focus()：那段代码跑在状态栏图标的 mouseUp
 /// 处理当中，此时发起的 activate 有可能随这一轮点击的收尾一起被撤销，表现出来
 /// 就是"点了图标窗口不回来"。先让出当前 runloop，再由主线程执行显示，
 /// 时序上等价于"点击已经处理完之后再去激活应用"。
-fn reveal(app: &AppHandle) {
+pub fn reveal(app: &AppHandle) {
     let handle = app.clone();
     std::thread::spawn(move || {
         let inner = handle.clone();

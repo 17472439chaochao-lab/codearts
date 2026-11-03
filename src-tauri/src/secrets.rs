@@ -51,7 +51,7 @@ fn store_dir() -> Result<PathBuf> {
         .msg("无法解析 HOME")?;
     let dir = PathBuf::from(home)
         .join("Library/Application Support")
-        .join("com.wuchengchao.codeartsdesktop")
+        .join(crate::settings::APP_ID)
         .join("secrets");
     fs::create_dir_all(&dir).msg(format!("无法创建 {}", dir.display()))?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;

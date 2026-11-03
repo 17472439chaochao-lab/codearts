@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { structuredPatch, type StructuredPatchHunk } from "diff";
@@ -149,7 +149,8 @@ type PanelProps = {
   onClose: () => void;
 };
 
-export function FilePanel({
+/** 资源管理器自己持有目录与改动数据；外壳时间线流式刷新时不必跟着整块重渲染 */
+export const FilePanel = memo(function FilePanel({
   root,
   session,
   diffs,
@@ -411,7 +412,7 @@ export function FilePanel({
       )}
     </aside>
   );
-}
+});
 
 function DirNode({
   root,
@@ -542,7 +543,7 @@ type QuickProps = {
 };
 
 /** ⌘P 快捷打开：模糊匹配、ignore 规则全交给内核的 ripgrep 索引，壳不自己遍历目录 */
-export function QuickOpen({ root, onClose, onPick }: QuickProps) {
+export const QuickOpen = memo(function QuickOpen({ root, onClose, onPick }: QuickProps) {
   const [q, setQ] = useState("");
   const [rows, setRows] = useState<string[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -655,7 +656,7 @@ export function QuickOpen({ root, onClose, onPick }: QuickProps) {
       </div>
     </div>
   );
-}
+});
 
 type ViewerProps = {
   root: string;
@@ -687,7 +688,15 @@ function cleanCopyText(root: HTMLElement): string | null {
   }).join("\n");
 }
 
-export function FileViewer({ root, file, startTab, diffs, pulse, onClose, onRestored }: ViewerProps) {
+export const FileViewer = memo(function FileViewer({
+  root,
+  file,
+  startTab,
+  diffs,
+  pulse,
+  onClose,
+  onRestored,
+}: ViewerProps) {
   const [tab, setTab] = useState<"preview" | "diff">(startTab);
   const [mdRaw, setMdRaw] = useState(false);
   const [data, setData] = useState<FileContent | null>(null);
@@ -848,7 +857,6 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose, onRest
             </span>
           </div>
           <div className="row fvacts">
-            {note && <span className="muted small">{note}</span>}
             {tab === "diff" && canRestore && (
               <button
                 className={`restorebtn ${askRestore ? "ask" : ""}`}
@@ -962,6 +970,8 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose, onRest
           </div>
         </header>
 
+        {note && <p className="fhint">{note}</p>}
+
         <div className="fvtabs">
           <button className={tab === "preview" ? "on" : ""} onClick={() => setTab("preview")}>
             预览
@@ -1021,7 +1031,7 @@ export function FileViewer({ root, file, startTab, diffs, pulse, onClose, onRest
       </div>
     </div>
   );
-}
+});
 
 /** Shiki 完全按需加载；失败或超大文件就退回纯文本，不影响预览本身 */
 function useHighlighted(text: string, rel: string, enabled: boolean) {

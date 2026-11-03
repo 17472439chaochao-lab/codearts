@@ -2,9 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import Chat, { ChipSelect, MODEL_KEY } from "./Chat";
+import Chat, { AGENT_KEY, ChipSelect, FILES_KEY, MODEL_KEY } from "./Chat";
 import {
   api,
   customProviders,
@@ -20,8 +20,13 @@ import {
   type SkillInfo,
   type V1Skill,
 } from "./kernelApi";
-import { setThemeMode, useThemeMode, type ThemeMode } from "./theme";
-import { setNotifyPrefs, useNotifyPrefs, type NotifyPrefs } from "./notify";
+import { getThemeMode, setThemeMode, useThemeMode, type ThemeMode } from "./theme";
+import {
+  getNotifyPrefs,
+  setNotifyPrefs,
+  useNotifyPrefs,
+  type NotifyPrefs,
+} from "./notify";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import "./App.css";
 
@@ -35,7 +40,7 @@ export type KernelStatus = {
 };
 
 /** 系统标题栏已经沉浸掉了，标题由壳自己画在左上角 */
-export const APP_TITLE = "CodeArts Desktop";
+export const APP_TITLE = "CodeArts Cli Desktop";
 
 /** 标题栏和关于页都要版本号，进程内取一次缓存住 */
 let appVersion: Promise<string | null> | null = null;
@@ -298,7 +303,7 @@ function Setup({
           <span className="wtitle">{APP_TITLE}</span>
           {ver ? <span className="wver">{ver}</span> : null}
         </div>
-        <h1>欢迎使用 CodeArts Desktop</h1>
+        <h1>欢迎使用 {APP_TITLE}</h1>
         <p className="hint">
           驱动本机已安装的码道 CLI（<code>codearts serve</code>）。
         </p>
@@ -776,6 +781,18 @@ function Settings({
 
           {tab === "notify" && <NotifySettings />}
 
+          {tab === "backup" && (
+            <BackupSettings
+              running={!!status?.healthy}
+              onChanged={onChanged}
+              onModelChange={onModelChange}
+              onRestart={async () => {
+                await onStop();
+                await onStart();
+              }}
+            />
+          )}
+
           {tab === "about" && <About check={check} status={status} />}
         </div>
       </div>
@@ -1005,11 +1022,11 @@ function NotifySettings() {
         return;
       }
       sendNotification({
-        title: "CodeArts · 测试通知",
+        title: `${APP_TITLE} · 测试通知`,
         body: "能看到这条，说明通知是通的",
         ...(p.sound ? { sound: "Ping" } : {}),
       });
-      setNote("已发送");
+      setNote(`已发送；没看到就检查「系统设置 → 通知 → ${APP_TITLE}」`);
     } catch (e) {
       setNote(`发不出去：${String(e)}`);
     }
@@ -1033,8 +1050,324 @@ function NotifySettings() {
         <button onClick={() => void test()} disabled={!p.enabled}>
           发送测试通知
         </button>
-        {note && <span className="muted small">{note}</span>}
       </div>
+      {note && <p className="hint">{note}</p>}
+    </>
+  );
+}
+
+/** settings_import 的返回：各类条目导入了多少、哪些要人工补 */
+type ImportReport = {
+  settings: boolean;
+  workspacesAdded: number;
+  workspacesSkipped: number;
+  providers: number;
+  providersSkipped: number;
+  keysMissing: number;
+  mcp: number;
+  mcpSkipped: number;
+  skills: number;
+  skillsSkipped: number;
+  credentials: boolean;
+  prefs: unknown;
+};
+
+/** 界面偏好散在 localStorage，导出时收成一份对象交给 Rust 一起写盘 */
+function collectPrefs() {
+  const read = (key: string) => {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  };
+  return {
+    theme: getThemeMode(),
+    notify: getNotifyPrefs(),
+    agent: read(AGENT_KEY),
+    model: read(MODEL_KEY),
+    filesPanel: read(FILES_KEY),
+  };
+}
+
+/** 恢复时只认合法取值：备份是用户能改的文本，坏值不该把界面带进奇怪状态 */
+function applyPrefs(raw: unknown) {
+  if (!raw || typeof raw !== "object") return;
+  const p = raw as Record<string, unknown>;
+  if (p.theme === "system" || p.theme === "light" || p.theme === "dark") {
+    setThemeMode(p.theme);
+  }
+  if (p.notify && typeof p.notify === "object") {
+    const n = p.notify as Record<string, unknown>;
+    const patch: Partial<NotifyPrefs> = {};
+    for (const key of ["enabled", "onlyWhenAway", "subagents", "sound"] as const) {
+      if (typeof n[key] === "boolean") patch[key] = n[key] as boolean;
+    }
+    setNotifyPrefs(patch);
+  }
+  const stored: [string, unknown][] = [
+    [AGENT_KEY, p.agent],
+    [MODEL_KEY, p.model],
+    [FILES_KEY, p.filesPanel],
+  ];
+  for (const [key, value] of stored) {
+    if (typeof value !== "string" || !value) continue;
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      // 存不下只影响下次启动
+    }
+  }
+}
+
+/**
+ * 设置备份：工作区、第三方模型、MCP 和界面偏好打成一个 JSON。
+ * 加密备份会带上 AK/SK 和模型密钥，导入时必须输对同一口令；不加密的备份不含凭据。
+ * 导入后模型/MCP 需要内核重启才生效，跑着的时候给一个重启按钮。
+ */
+function BackupSettings({
+  running,
+  onChanged,
+  onModelChange,
+  onRestart,
+}: {
+  running: boolean;
+  onChanged: () => Promise<void> | void;
+  onModelChange: () => void;
+  onRestart: () => Promise<void>;
+}) {
+  const [note, setNote] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [working, setWorking] = useState(false);
+  const [restart, setRestart] = useState(false);
+
+  // 导出先定加密方式再挑路径；导入遇到加密文件才要口令
+  const [exportOpen, setExportOpen] = useState(false);
+  const [encrypt, setEncrypt] = useState(true);
+  const [pass, setPass] = useState("");
+  const [pass2, setPass2] = useState("");
+  const [dlgErr, setDlgErr] = useState<string | null>(null);
+  const [askPath, setAskPath] = useState<string | null>(null);
+  const [importPass, setImportPass] = useState("");
+
+  function beginExport() {
+    setErr(null);
+    setNote(null);
+    setDlgErr(null);
+    setEncrypt(true);
+    setPass("");
+    setPass2("");
+    setExportOpen(true);
+  }
+
+  async function doExport() {
+    setDlgErr(null);
+    if (encrypt) {
+      if (pass.length < 6) {
+        setDlgErr("口令至少 6 位");
+        return;
+      }
+      if (pass !== pass2) {
+        setDlgErr("两次输入的口令不一致");
+        return;
+      }
+    }
+    const path = await saveDialog({
+      defaultPath: `CodeArts Desktop 设置 ${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path) return;
+    setWorking(true);
+    try {
+      const out = await invoke<string>("settings_export", {
+        path,
+        prefs: collectPrefs(),
+        passphrase: encrypt ? pass : null,
+      });
+      setExportOpen(false);
+      setPass("");
+      setPass2("");
+      setNote(`已导出到 ${out}`);
+    } catch (e) {
+      setDlgErr(String(e));
+    }
+    setWorking(false);
+  }
+
+  async function doImport() {
+    setErr(null);
+    setNote(null);
+    const path = await open({
+      multiple: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (typeof path !== "string") return;
+    setWorking(true);
+    try {
+      const encrypted = await invoke<boolean>("settings_backup_encrypted", { path });
+      if (encrypted) {
+        setDlgErr(null);
+        setImportPass("");
+        setAskPath(path);
+        setWorking(false);
+        return;
+      }
+      await runImport(path, null);
+    } catch (e) {
+      setErr(String(e));
+      setWorking(false);
+    }
+  }
+
+  async function runImport(path: string, passphrase: string | null) {
+    setWorking(true);
+    setErr(null);
+    try {
+      const r = await invoke<ImportReport>("settings_import", { path, passphrase });
+      applyPrefs(r.prefs);
+      await onChanged();
+      const bits: string[] = [];
+      if (r.credentials) bits.push("AK/SK");
+      if (r.workspacesAdded) bits.push(`${r.workspacesAdded} 个工作区`);
+      if (r.providers) bits.push(`${r.providers} 家提供商`);
+      if (r.mcp) bits.push(`${r.mcp} 个 MCP 服务器`);
+      if (r.skills) bits.push(`${r.skills} 个技能`);
+      let line = bits.length ? `已导入 ${bits.join("、")}` : "已导入";
+      if (r.workspacesSkipped) line += `；${r.workspacesSkipped} 个工作区目录不存在，已跳过`;
+      if (r.skillsSkipped) line += `；${r.skillsSkipped} 个技能已存在或无效，已跳过`;
+      if (r.keysMissing) line += `；${r.keysMissing} 家提供商还没有密钥，去「模型」页补上`;
+      setNote(line);
+      setAskPath(null);
+      setImportPass("");
+      if (r.providers || r.mcp || r.skills || r.credentials) {
+        onModelChange();
+        setRestart(running);
+      }
+    } catch (e) {
+      // 口令框里失败就留在框里重输，别把口令框关掉
+      if (passphrase !== null) setDlgErr(String(e));
+      else setErr(String(e));
+    }
+    setWorking(false);
+  }
+
+  function submitImport() {
+    if (!askPath || !importPass) return;
+    setDlgErr(null);
+    void runImport(askPath, importPass);
+  }
+
+  function cancelImport() {
+    setAskPath(null);
+    setImportPass("");
+    setDlgErr(null);
+  }
+
+  async function restartKernel() {
+    setWorking(true);
+    setErr(null);
+    try {
+      await onRestart();
+      setRestart(false);
+      setNote("内核已重启，导入的模型、MCP 和技能已生效");
+    } catch (e) {
+      setErr(String(e));
+    }
+    setWorking(false);
+  }
+
+  return (
+    <>
+      <div className="row">
+        <button className="primary" onClick={beginExport} disabled={working}>
+          导出设置
+        </button>
+        <button onClick={() => void doImport()} disabled={working}>
+          导入设置
+        </button>
+      </div>
+      <p className="hint">不加密的备份不含 AK/SK 和模型密钥；已装技能会一起备份。</p>
+      {restart && (
+        <div className="row">
+          <button onClick={() => void restartKernel()} disabled={working}>
+            重启内核使配置生效
+          </button>
+        </div>
+      )}
+      {note && <p className="hint">{note}</p>}
+      {err && <pre className="error inline">{err}</pre>}
+
+      {exportOpen && (
+        <div className="modal" onClick={() => !working && setExportOpen(false)}>
+          <div className="panel narrow" onClick={(e) => e.stopPropagation()}>
+            <h2>导出设置</h2>
+            <label className="awake">
+              <input
+                type="checkbox"
+                checked={encrypt}
+                onChange={(e) => setEncrypt(e.target.checked)}
+              />
+              加密备份（包含 AK/SK 和模型密钥）
+            </label>
+            {encrypt && (
+              <>
+                <input
+                  type="password"
+                  autoFocus
+                  placeholder="口令（至少 6 位）"
+                  value={pass}
+                  onChange={(e) => setPass(e.target.value)}
+                />
+                <input
+                  type="password"
+                  placeholder="再输一次口令"
+                  value={pass2}
+                  onChange={(e) => setPass2(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void doExport();
+                  }}
+                />
+              </>
+            )}
+            {dlgErr && <pre className="error inline">{dlgErr}</pre>}
+            <div className="row">
+              <button className="primary" onClick={() => void doExport()} disabled={working}>
+                导出
+              </button>
+              <button onClick={() => setExportOpen(false)} disabled={working}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {askPath && (
+        <div className="modal" onClick={() => !working && cancelImport()}>
+          <div className="panel narrow" onClick={(e) => e.stopPropagation()}>
+            <h2>输入备份口令</h2>
+            <input
+              type="password"
+              autoFocus
+              placeholder="口令"
+              value={importPass}
+              onChange={(e) => setImportPass(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitImport();
+              }}
+            />
+            {dlgErr && <pre className="error inline">{dlgErr}</pre>}
+            <div className="row">
+              <button className="primary" onClick={submitImport} disabled={working || !importPass}>
+                导入
+              </button>
+              <button onClick={cancelImport} disabled={working}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -1830,6 +2163,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "caps", label: "技能" },
   { id: "theme", label: "外观" },
   { id: "notify", label: "通知" },
+  { id: "backup", label: "备份" },
   { id: "about", label: "关于" },
 ];
 
@@ -1874,7 +2208,7 @@ function About({ check, status }: { check: EnvCheck | null; status: KernelStatus
     <>
       <dl className="about">
         <dt>应用</dt>
-        <dd>CodeArts Desktop{ver ? ` ${ver}` : ""} · 本机开发版</dd>
+        <dd>{APP_TITLE}{ver ? ` ${ver}` : ""} · 本机开发版</dd>
         <dt>内核</dt>
         <dd className="path">
           {check?.kernelBin ?? "未检测到"}
@@ -1890,13 +2224,7 @@ function About({ check, status }: { check: EnvCheck | null; status: KernelStatus
         </dd>
       </dl>
 
-      <h3>为什么做这个壳</h3>
-      <p className="hint">
-        官方码道桌面端只发 Apple Silicon 包，Intel Mac 装不上；CLI 的 TUI 又不适合长时间挂着多会话。
-        于是把 <code>codearts serve</code> 当内核，外面套一层本地壳：Rust 侧只负责起停进程、注入凭据、
-        代理 HTTP 与 SSE，界面做聊天、多工作区和命令面板。所有能力都来自内核本身，
-        不逆向私有协议，也不另接一套模型服务。
-      </p>
+      <p className="hint">CodeArts Cli 的桌面端。</p>
 
       <h3>技术栈</h3>
       <ul className="stack">
@@ -1920,6 +2248,15 @@ type Caps = {
 /** credentials_status 的返回：只有有无与 AK 尾号，SK 明文不出 Rust */
 type CredStatus = { saved: boolean; inCliEnv: boolean; akMask: string | null };
 
-/** 设置面板左侧菜单的八页 */
-type Tab = "kernel" | "model" | "mcp" | "cred" | "caps" | "theme" | "notify" | "about";
+/** 设置面板左侧菜单的九页 */
+type Tab =
+  | "kernel"
+  | "model"
+  | "mcp"
+  | "cred"
+  | "caps"
+  | "theme"
+  | "notify"
+  | "backup"
+  | "about";
 

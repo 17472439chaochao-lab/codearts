@@ -21,6 +21,7 @@
     /preview-setup.html?state=todo 内核在线，会话里有一张 todowrite 卡 + 轮末小结胶囊带清单进度
       window.__advance(900) 会连发 5 帧 todo.updated，看胶囊里的清单一路走到全部完成
     /preview-setup.html?state=stream 内核在线，一条会话里凑齐 agent/subtask/patch/retry/compaction 各类 part
+    /preview-setup.html?state=tools 内核在线，一轮 10 步思考/工具交替，验证「执行工具 N 次」分组
       window.__live(900) 把新接入的事件连着放一遍：busy→retry 状态、压缩提示、新版本提示、
       危险命令横幅、file.edited 脉冲（跑着的胶囊小点跟着跳），最后回 idle；
       展开胶囊能看到每一步一行摘要（跑着的那步实时变成"执行 xx · yy"），点一行跳回那条消息
@@ -32,7 +33,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>CodeArts Desktop · 首屏预览</title>
+    <title>CodeArts Cli Desktop · 首屏预览</title>
   </head>
   <body>
     <div id="root"></div>
@@ -43,13 +44,21 @@
       const state = new URLSearchParams(location.search).get("state") ?? "fresh";
       // vision=1 把 mock 模型标成能看图，验证「直接发图」分支
       window.__vision = new URLSearchParams(location.search).get("vision") === "1";
+      // encrypted=1 把备份文件模拟成口令加密的，验证导入口令框
+      window.__encrypted = new URLSearchParams(location.search).get("encrypted") === "1";
       // 用假路径，别把开发机的工作目录写进预览台
       const kernelBin = "/Users/you/.codeartsdoer/installers/bin/codearts";
       const projectDir = "/Users/you/work/demo";
       const otherDir = "/Users/you/work/other";
       const installed = state !== "fresh" && state !== "cli";
       const hasCredentials = state !== "fresh" && state !== "dir";
-      const hasDir = state === "ready" || state === "task" || state === "ask" || state === "todo" || state === "stream";
+      const hasDir =
+        state === "ready" ||
+        state === "task" ||
+        state === "ask" ||
+        state === "todo" ||
+        state === "stream" ||
+        state === "tools";
       // task / ask / todo / stream 场景要的是内核在线：Chat 只在 healthy 时才发请求、才接事件流
       const healthy = state !== "fresh" && state !== "cli" && state !== "dir";
       const now = Date.now();
@@ -149,7 +158,9 @@
               ? "按方案改并同步清单"
               : state === "stream"
                 ? "改动汇总与自动重试"
-                : "示例会话 A";
+                : state === "tools"
+                  ? "登录流程梳理"
+                  : "示例会话 A";
       const deleted = new Set();
       /** 会话生命周期：撤销锚点、已发布、被单独删掉的消息 id，都留在内存里让列表跟着走 */
       let revAnchor = null;
@@ -816,6 +827,209 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
         },
       ];
 
+      /** tools 场景：一轮里多步思考和工具交替，验证整轮「执行工具 N 次」分组与逐行展开 */
+      const toolSteps = [
+        {
+          think: "先定位登录入口，别在模板里瞎改。",
+          tool: "bash",
+          input: { command: 'cd /Users/you/work/demo && rg -n "login|signin" -g "*.ts" app/' },
+          title: "搜索登录相关代码",
+          preview: "app/Http/Controllers/AuthController.ts:42:  async login(req: Request) {",
+        },
+        {
+          think: "入口找到了，读一下控制器实现。",
+          tool: "read",
+          input: { filePath: "/Users/you/work/demo/app/Http/Controllers/AuthController.ts" },
+          title: "AuthController.ts",
+          preview: "export class AuthController { … }",
+        },
+        {
+          think: "再看看会话是怎么签发的。",
+          tool: "grep",
+          input: { pattern: "remember_token|sessionID" },
+          title: "remember_token|sessionID",
+          preview: "app/Services/Auth/LoginService.ts:88",
+        },
+        {
+          think: "确认当前工作区状态。",
+          tool: "bash",
+          input: { command: "cd /Users/you/work/demo && git status --short" },
+          title: "查看工作区状态",
+          preview: " M resources/views/auth/login.blade.php",
+        },
+        {
+          think: "模板里把版本号写死了，改成运行时注入。",
+          tool: "edit",
+          input: { filePath: "/Users/you/work/demo/resources/views/auth/login.blade.php" },
+          title: "login.blade.php",
+          preview: "1 file changed",
+        },
+        {
+          think: "检查登录服务的错误分支。",
+          tool: "read",
+          input: { filePath: "/Users/you/work/demo/app/Services/Auth/LoginService.ts" },
+          title: "LoginService.ts",
+          preview: "export async function issueToken(user: User) { … }",
+        },
+        {
+          think: "跑一遍构建看看有没有连带影响。",
+          tool: "bash",
+          input: { command: "cd /Users/you/work/demo && npm run build" },
+          title: "构建前端",
+          preview: "vite v8.3.4 building for production... ✓ built in 4.12s",
+        },
+        {
+          think: "对照官方文档确认记住登录的字段。",
+          tool: "webfetch",
+          input: { url: "https://docs.example.com/auth/session" },
+          title: "https://docs.example.com/auth/session",
+          preview: "会话有效期默认 7 天，可通过 remember 延长。",
+        },
+        {
+          think: "把会话时长常量挪到配置里。",
+          tool: "edit",
+          input: { filePath: "/Users/you/work/demo/config/auth.ts" },
+          title: "auth.ts",
+          preview: "1 file changed",
+        },
+        {
+          think: "最后补一行变更日志。",
+          tool: "write",
+          input: { filePath: "/Users/you/work/demo/CHANGELOG.md" },
+          title: "CHANGELOG.md",
+          preview: "written",
+        },
+        {
+          think: "文档里没写清楚，搜一下工具。",
+          tool: "tool_search",
+          input: { query: "网页抓取" },
+          title: "",
+          preview: "",
+        },
+        {
+          think: "用代理抓一下官方文档。",
+          tool: "tool_call",
+          input: {
+            id: "webfetch",
+            args: { url: "https://docs.cursor.com/models", format: "markdown" },
+          },
+          title: "",
+          preview: "",
+        },
+        {
+          think: "走代理调用网页抓取。",
+          tool: "invalid",
+          input: { tool: "webfetch" },
+          title: "Invalid Tool",
+          preview: "",
+          status: "error",
+          error: 'Built-in tool "webfetch" is not directly callable. Load its schema first via tool_describe.',
+        },
+      ];
+
+      const toolMsgs = [
+        {
+          info: {
+            id: "msg_tu1",
+            role: "user",
+            sessionID: PARENT,
+            time: { created: now - 900000 },
+            agent: "build",
+            summary: { diffs: [] },
+          },
+          parts: [
+            {
+              id: "prt_tu1",
+              type: "text",
+              sessionID: PARENT,
+              messageID: "msg_tu1",
+              text: "把登录流程梳理一遍，顺手修掉标题栏版本号写死的问题。",
+            },
+          ],
+        },
+        ...toolSteps.map((step, i) => {
+          const mid = `msg_ta${i + 1}`;
+          const start = now - 880000 + i * 20000;
+          return {
+            info: {
+              id: mid,
+              role: "assistant",
+              sessionID: PARENT,
+              time: { created: start, completed: start + 16000 },
+              agent: "build",
+              modelID: "deepseek-v3",
+              providerID: "huawei",
+              cost: 0.006,
+              tokens: { input: 18000, output: 700, reasoning: 260, total: 18960 },
+            },
+            parts: [
+              { id: `prt_ts${i}`, type: "step-start", sessionID: PARENT, messageID: mid },
+              {
+                id: `prt_tr${i}`,
+                type: "reasoning",
+                text: step.think,
+                sessionID: PARENT,
+                messageID: mid,
+                time: { start, end: start + 4000 },
+              },
+              {
+                id: `prt_tt${i}`,
+                type: "tool",
+                sessionID: PARENT,
+                messageID: mid,
+                callID: `call_t${i}`,
+                tool: step.tool,
+                state: {
+                  status: step.status ?? "completed",
+                  input: step.input,
+                  title: step.title,
+                  output: step.preview,
+                  metadata: { preview: step.preview },
+                  ...(step.error ? { error: step.error } : {}),
+                  time: { start: start + 4000, end: start + 12000 },
+                },
+              },
+              // 中途插一句说明：执行步骤仍要收进同一张卡，正文单独留在卡外
+              ...(i === 4
+                ? [
+                    {
+                      id: `prt_tx${i}`,
+                      type: "text",
+                      sessionID: PARENT,
+                      messageID: mid,
+                      text: "模板改完了，接着看登录服务。",
+                    },
+                  ]
+                : []),
+              { id: `prt_tf${i}`, type: "step-finish", sessionID: PARENT, messageID: mid },
+            ],
+          };
+        }),
+        {
+          info: {
+            id: "msg_ta_end",
+            role: "assistant",
+            sessionID: PARENT,
+            time: { created: now - 660000, completed: now - 650000 },
+            agent: "build",
+            modelID: "deepseek-v3",
+            providerID: "huawei",
+            cost: 0.004,
+            tokens: { input: 22000, output: 900, reasoning: 120, total: 23020 },
+          },
+          parts: [
+            { id: "prt_te_s", type: "step-start", sessionID: PARENT, messageID: "msg_ta_end" },
+            {
+              id: "prt_te",
+              type: "text",
+              text: "登录流程已经梳理完：入口在 AuthController.login，会话由 LoginService 签发；标题栏的版本号改为从运行时注入，构建通过。",
+              sessionID: PARENT,
+              messageID: "msg_ta_end",
+            },
+          ],
+        },
+      ];
+
       // 子会话的历史：重开会话时靠 children + message 两个接口回灌，卡片不该是空的
       const kidMsgs = [
         {
@@ -1064,7 +1278,9 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
                     ? todoMsgs
                     : state === "stream"
                       ? richMsgs
-                      : [],
+                      : state === "tools"
+                        ? toolMsgs
+                        : [],
             );
           if (payload?.method === "GET" && /^\/session\/[^/]+\/message$/.test(path)) return [];
           if (payload?.method === "DELETE" && /^\/session\/[^/]+$/.test(path)) {
@@ -1236,6 +1452,48 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           }
           return null;
         }
+        // 保存/打开对话框：备份页要选文件；目录选择仍返回预览工作区
+        if (cmd === "plugin:dialog|open") {
+          const o = payload?.options ?? {};
+          return o.directory ? projectDir : "/Users/you/Desktop/CodeArts Desktop 设置.json";
+        }
+        if (cmd === "plugin:dialog|save")
+          return String(payload?.options?.defaultPath ?? "/Users/you/Desktop/设置.json");
+        if (cmd === "settings_export") {
+          window.__exported = {
+            path: payload?.path,
+            prefs: payload?.prefs,
+            passphrase: payload?.passphrase,
+          };
+          return payload?.path;
+        }
+        if (cmd === "settings_backup_encrypted") {
+          // ?encrypted=1 时模拟口令加密备份
+          return window.__encrypted ?? false;
+        }
+        if (cmd === "settings_import") {
+          window.__imported = { path: payload?.path, passphrase: payload?.passphrase };
+          if (window.__encrypted && payload?.passphrase !== "secret12") {
+            throw "口令不对，或备份已损坏";
+          }
+          return {
+            settings: true,
+            workspacesAdded: 1,
+            workspacesSkipped: 1,
+            providers: 2,
+            providersSkipped: 0,
+            keysMissing: 0,
+            mcp: 1,
+            mcpSkipped: 0,
+            skills: 2,
+            skillsSkipped: 1,
+            credentials: !!window.__encrypted,
+            prefs: {
+              theme: "dark",
+              notify: { enabled: true, onlyWhenAway: false, subagents: true, sound: true },
+            },
+          };
+        }
         if (cmd === "env_check")
           return {
             kernelInstalled: installed,
@@ -1254,7 +1512,7 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           return window.__ocrText ?? "预览台 OCR：这是从截图里识别出的文字";
         }
         // 与 package.json 的 version 保持一致：截图会带上这个号
-        if (cmd === "plugin:app|version") return "0.1.4";
+        if (cmd === "plugin:app|version") return "0.1.5";
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;
         if (cmd === "settings_save") {

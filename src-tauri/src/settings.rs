@@ -166,6 +166,11 @@ fn paths_same(a: &Path, b: &Path) -> bool {
 /// 码道 CLI 官方安装脚本的落地位置，相对各用户 HOME
 const KERNEL_REL_PATH: &str = ".codeartsdoer/installers/bin/codearts";
 
+/// 与 tauri.conf.json 里的 identifier 保持一致：配置目录、凭据目录都跟它走
+pub const APP_ID: &str = "com.readfly.codeartsdesktop";
+/// 0.1.5 之前的标识符，只在迁移老目录时用
+const LEGACY_APP_ID: &str = "com.wuchengchao.codeartsdesktop";
+
 fn config_path(app: &tauri::AppHandle) -> Result<PathBuf> {
     use tauri::Manager;
     let dir = app
@@ -173,6 +178,26 @@ fn config_path(app: &tauri::AppHandle) -> Result<PathBuf> {
         .app_config_dir()
         .msg("无法解析应用配置目录")?;
     Ok(dir.join("settings.json"))
+}
+
+/// 换标识符后 Tauri 会改用新的配置目录；新目录还不存在就把老目录整体搬过来，
+/// 工作区、凭据和内核端点都不用重配。只在启动时调一次。
+pub fn migrate_legacy(app: &tauri::AppHandle) -> Result<()> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_config_dir()
+        .msg("无法解析应用配置目录")?;
+    if dir.exists() {
+        return Ok(());
+    }
+    let Some(old) = dir.parent().map(|p| p.join(LEGACY_APP_ID)) else {
+        return Ok(());
+    };
+    if !old.is_dir() {
+        return Ok(());
+    }
+    std::fs::rename(&old, &dir).msg(format!("迁移配置目录失败：{}", old.display()))
 }
 
 /// mtime 读不到（文件不存在/被删）时返回 None，此时缓存一律不命中

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::error::{Error, MsgExt, Result};
+use crate::secrets;
 use crate::settings::Settings;
 
 /// 内核 `custom-model-loader` 读取的全局配置文件名，按顺序取第一个存在的。
@@ -181,7 +182,7 @@ fn to_view(id: &str, entry: &Value) -> ProviderView {
 
 pub const DEFAULT_NPM: &str = "@ai-sdk/openai-compatible";
 
-fn valid_id(id: &str) -> Result<()> {
+pub(crate) fn valid_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > 64 {
         return Err(Error::Msg("提供商标识不能为空且不超过 64 个字符".into()));
     }
@@ -223,11 +224,35 @@ pub fn save(app: &tauri::AppHandle, draft: ProviderDraft) -> Result<Vec<Provider
     if draft.models.is_empty() {
         return Err(Error::Msg("至少填一个模型".into()));
     }
+    // 内核会把配置里的明文密钥加密回写成只有本机能解的 enc:v3:，所以壳自己留一份明文，
+    // 口令加密备份才带得走。先落副本再写配置：配置写失败最多多一条副本，反过来会丢密钥。
+    if let Some(key) = draft.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        vault_store(&draft.id, key)?;
+    }
     let path = config_path(app)?;
     let mut root = read_root(&path)?;
     merge_draft(&mut root, &draft)?;
     write_root(&path, &root)?;
     list(app)
+}
+
+fn vault_account(id: &str) -> String {
+    format!("provider.{id}")
+}
+
+/// 加密备份用的模型密钥明文副本，与 AK/SK 同一个 0600 凭据目录
+pub(crate) fn vault_key(id: &str) -> Option<String> {
+    secrets::get(&vault_account(id)).ok().flatten()
+}
+
+pub(crate) fn vault_store(id: &str, key: &str) -> Result<()> {
+    secrets::set(&vault_account(id), key.trim())
+}
+
+fn vault_forget(id: &str) {
+    if let Err(e) = secrets::remove(&vault_account(id)) {
+        eprintln!("[providers] 清理密钥副本失败：{e}");
+    }
 }
 
 /// 把草稿并进全局配置的 provider 段。与盘上已有条目逐键合并：
@@ -349,6 +374,7 @@ pub fn remove(app: &tauri::AppHandle, id: &str) -> Result<Vec<ProviderView>> {
         return Err(Error::Msg(format!("配置里没有名为「{id}」的第三方提供商")));
     }
     write_root(&path, &root)?;
+    vault_forget(id);
     list(app)
 }
 

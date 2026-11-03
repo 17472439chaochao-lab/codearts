@@ -1,4 +1,5 @@
 mod api;
+mod backup;
 mod error;
 mod export;
 mod files;
@@ -142,6 +143,34 @@ fn mask_ak(ak: &str) -> String {
     format!("****{}", chars[chars.len() - 4..].iter().collect::<String>())
 }
 
+/// 设置备份：配置由 Rust 侧汇总，前端只把 localStorage 那部分偏好带进来。
+/// 给了口令就整份加密，并带上 AK/SK 和模型密钥；不给就是不含凭据的明文备份。
+#[tauri::command]
+fn settings_export(
+    app: tauri::AppHandle,
+    path: String,
+    prefs: Value,
+    passphrase: Option<String>,
+) -> Result<String, Error> {
+    backup::export(&app, &path, prefs, passphrase.as_deref())
+}
+
+/// 导入备份：工作区只并已存在的目录，模型和 MCP 与本地配置合并，凭据只从加密备份恢复
+#[tauri::command]
+fn settings_import(
+    app: tauri::AppHandle,
+    path: String,
+    passphrase: Option<String>,
+) -> Result<backup::ImportReport, Error> {
+    backup::import(&app, &path, passphrase.as_deref())
+}
+
+/// 选完文件先问一句是不是加密的，前端据此决定弹不弹口令框
+#[tauri::command]
+fn settings_backup_encrypted(path: String) -> Result<bool, Error> {
+    backup::is_encrypted(&path)
+}
+
 /// 第三方模型提供商：写进内核的全局配置，密钥只回显脱敏形态
 #[tauri::command]
 fn providers_list(app: tauri::AppHandle) -> Result<Vec<providers::ProviderView>, Error> {
@@ -248,6 +277,9 @@ pub fn run() {
             no_sleep_set,
             credentials_save,
             credentials_status,
+            settings_export,
+            settings_import,
+            settings_backup_encrypted,
             providers_list,
             providers_save,
             providers_remove,
@@ -278,6 +310,10 @@ pub fn run() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            // 标识符换过，老目录里的设置和凭据先搬过来，再让任何代码去读配置
+            if let Err(e) = settings::migrate_legacy(&handle) {
+                eprintln!("[settings] 老配置迁移失败：{e}");
+            }
             Kernel::spawn_watch(handle.clone());
             // 托盘装不上不该拦着应用启动：拿不到图标时条目不出现，功能照旧
             if let Err(e) = tray::init(&handle) {
@@ -291,8 +327,8 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("构建应用失败")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } => {
                 // 电源断言是同步子进程，先松手再走异步收尾，别留孤儿 caffeinate
                 app_handle.state::<WakeLock>().release();
                 // 退出前 dispose + 杀进程，不留孤儿内核
@@ -305,5 +341,13 @@ pub fn run() {
                 });
                 let _ = rx.recv_timeout(std::time::Duration::from_secs(6));
             }
+            // 窗口被收进托盘后没有可见窗口，点 Dock 图标走的是 applicationShouldHandleReopen，
+            // 不接这个事件窗口就永远回不来
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => tray::reveal(app_handle),
+            _ => {}
         });
 }

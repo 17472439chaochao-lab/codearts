@@ -88,7 +88,14 @@ fn segment_prefix(path: &str, prefix: &str) -> bool {
 /// `/find` 的宽模式在大型工程里能回几千条匹配、几 MB JSON。全量读进内存再解析
 /// 只会让 WebView 卡死，所以给响应体一个上限，超了就直接报错让前端收窄条件。
 /// 只拦带 Content-Length 的响应：分块传输没有长度头，保持原样读完（内核的接口目前都带长度）。
+/// **上限只用于检索接口**：会话消息、改动这类数据必须完整读回来，体积大只能慢，不能直接失败。
 const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
+
+fn has_body_limit(path: &str) -> bool {
+    // 前端把查询串一起传进来（/find?pattern=...），先切掉再比
+    let p = path.split('?').next().unwrap_or(path);
+    p == "/find" || p.starts_with("/find/")
+}
 
 /// 长度头缺失（分块传输）时不设限，交给内核自己控规模
 fn check_length(len: Option<u64>) -> Result<()> {
@@ -105,7 +112,7 @@ fn check_length(len: Option<u64>) -> Result<()> {
 /// 内核未注册的路由不会 404，而是回 TUI 的 SPA 兜底页（200 + text/html），
 /// 所以必须按 content-type 判定，否则前端会把 HTML 当 JSON 用。
 /// 非 2xx 一律当 IPC 错误，避免前端把 JSON 错误体当成成功。
-async fn decode(resp: reqwest::Response) -> Result<Value> {
+async fn decode(resp: reqwest::Response, limited: bool) -> Result<Value> {
     let status = resp.status();
     let ctype = resp
         .headers()
@@ -113,8 +120,10 @@ async fn decode(resp: reqwest::Response) -> Result<Value> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    if let Some(len) = resp.content_length() {
-        check_length(Some(len))?;
+    if limited {
+        if let Some(len) = resp.content_length() {
+            check_length(Some(len))?;
+        }
     }
     let bytes = resp.bytes().await?;
     if !status.is_success() {
@@ -167,7 +176,7 @@ pub async fn request(
     if let Some(b) = body {
         req = req.json(&b);
     }
-    decode(req.send().await?).await
+    decode(req.send().await?, has_body_limit(path)).await
 }
 
 /// SSE 桥：订阅内核 /global/event，把每帧原样转成 Tauri event 推给 WebView。
@@ -339,6 +348,17 @@ mod tests {
         assert!(check_length(Some(1024)).is_ok());
         assert!(check_length(Some(MAX_BODY_BYTES)).is_ok(), "正好等于上限应放行");
         assert!(check_length(Some(MAX_BODY_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn body_limit_only_covers_search() {
+        assert!(has_body_limit("/find"));
+        assert!(has_body_limit("/find?pattern=foo"));
+        assert!(has_body_limit("/find/file"));
+        assert!(has_body_limit("/find/file?query=tsx&type=file&limit=40"));
+        assert!(!has_body_limit("/findings"), "不能按前缀误伤别的路由");
+        assert!(!has_body_limit("/session/s1/message"), "长会话消息必须完整读回");
+        assert!(!has_body_limit("/session/s1/diff"));
     }
 
     #[test]

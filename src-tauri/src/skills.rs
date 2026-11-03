@@ -432,7 +432,7 @@ fn frontmatter_name(md: &[u8]) -> Option<String> {
 }
 
 /// 内核的校验规则：`^[a-z0-9]+(-[a-z0-9]+)*$`，最长 64
-fn is_kebab(s: &str) -> bool {
+pub(crate) fn is_kebab(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
         && !s.starts_with('-')
@@ -481,7 +481,7 @@ fn skill_dir(root: &Path, name: &str) -> Result<PathBuf> {
 }
 
 /// 相对路径再次过一遍成分：压缩包里的内容不可信，即便 unpack 已经过滤过
-fn safe_rel(rel: &str) -> Result<()> {
+pub(crate) fn safe_rel(rel: &str) -> Result<()> {
     for c in Path::new(rel).components() {
         if !matches!(c, Component::Normal(_) | Component::CurDir) {
             return Err(Error::Msg(format!("技能包里路径非法：{rel}")));

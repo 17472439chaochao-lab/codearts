@@ -1,8 +1,8 @@
-# CodeArts Desktop
+# CodeArts Cli Desktop
 
 ![platform](docs/badges/platform.svg) ![license](docs/badges/license.svg) ![version](docs/badges/version.svg) ![UI](docs/badges/ui.svg)
 
-**华为云码道 CodeArts 的 Mac 桌面端，开源（MIT）。** 源码开放在 [GitHub](https://github.com/17472439chaochao-lab/codearts)，可自由使用、修改、分发。
+**CodeArts Cli 的桌面端，开源（MIT）。** 源码开放在 [GitHub](https://github.com/17472439chaochao-lab/codearts)，可自由使用、修改、分发。
 
 本程序用 Rust + Tauri 2 编写（非官方版），官方只构建了 Apple Silicon 包，Intel 版的 Mac 无法安装。
 
@@ -10,7 +10,7 @@
 
 ![首次启动的检测页](screenshots/setup.png)
 
-主界面：左侧多工作区会话列表，中间流式会话（工具调用折成卡片、每轮末尾带步骤与文件改动小结），右侧资源管理器看文件与本次会话的改动：
+主界面：左侧多工作区会话列表，中间流式会话（工具调用按轮折成一张卡片、轮末列出改过的文件），右侧资源管理器看文件与本次会话的改动：
 
 ![主界面](screenshots/main.png)
 
@@ -21,8 +21,9 @@
 - 计划：agent 进入/退出规划模式时自动切换，计划文件可在侧栏预览
 - 多工作区：添加、切换目录，切区不重启内核，后台会话继续跑；资源管理器标题栏的目录名可直接下拉切换
 - Git 分支：顶栏分支胶囊点开可切本地/远程分支、从当前 HEAD 新建分支；会话运行中不给切，工作区有未提交改动时按 git 的判断拒绝并给出原因
-- 子任务与待办：子任务进展实时展示，待办清单按轮快照，每轮末尾生成小结
+- 子任务与待办：子任务进展实时展示，待办清单按轮快照，轮末汇总本轮改动
 - 权限与交互：权限审批、反问选项、斜杠命令、agent 与模型选择
+- 设置备份：工作区、第三方模型、MCP、已装技能与界面偏好可整体导出/导入；可选口令加密，加密备份连 AK/SK 和模型密钥一起带走
 - 技能安装：填 GitHub 仓库（`owner/repo`）即可装进用户级（全局）技能目录，支持更新与卸载
 - 稳定性：事件流断线自动重连、限流自动重试、危险命令告警、内核崩溃自愈
 - 凭据：AK/SK 存本机，SK 不进前端、不回显

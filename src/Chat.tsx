@@ -3,6 +3,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -140,9 +141,9 @@ function readImage(file: File): Promise<Attachment> {
 
 /** 上次用的模型：内核 /provider 的 default 每次重启都可能变，用户的选择要自己记住 */
 export const MODEL_KEY = "codearts.model";
-const AGENT_KEY = "codearts.agent";
+export const AGENT_KEY = "codearts.agent";
 /** 文件栏默认展开；用户收起一次之后记住 */
-const FILES_KEY = "codearts.filesPanel";
+export const FILES_KEY = "codearts.filesPanel";
 /** 每个工作区默认露出的会话条数；「加载更多」按同样步长展开，「收起」回到这个数。工作区本身不再折叠 */
 const SIDE_PAGE = 3;
 /** 置顶的会话 id（localStorage）。置顶排在各自工作区的最前面，跨工作区共用一份 */
@@ -568,6 +569,11 @@ export default function Chat({
    * 用户中途在系统设置里打开了权限，下一次就能正常弹出来。
    */
   const askedPermission = useRef(false);
+  /**
+   * 进入过运行态的会话：只有它们收尾才值得弹通知。
+   * 别的客户端（TUI / 另一个壳）在同一条事件流里也会发 idle，不拦就会乱弹。
+   */
+  const runSeen = useRef<Set<string>>(new Set());
   const notifyDone = useCallback(async (sid: string) => {
     const prefs = getNotifyPrefs();
     if (!prefs.enabled) return;
@@ -582,7 +588,7 @@ export default function Chat({
       if (!ok) return;
       const title = listRef.current.find((s) => s.id === sid)?.title || "会话";
       sendNotification({
-        title: "CodeArts · 会话已完成",
+        title: `${APP_TITLE} · 会话已完成`,
         body: title,
         ...(prefs.sound ? { sound: "Ping" } : {}),
       });
@@ -1046,6 +1052,8 @@ export default function Chat({
           }
         }
         setBusySet(next);
+        // 断线期间的收尾不补通知，但重连时仍在跑的会话要算进来
+        runSeen.current = new Set(next);
         setRetry(retryInfo);
       })
       .catch(() => {});
@@ -1160,11 +1168,17 @@ export default function Chat({
       if (sid === activeRef.current) setMsgs(fn);
       else setKidMsgs((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? []) }));
     };
-    /** delta 按动画帧合并，避免每个 token 整树重渲染 */
+    /**
+     * 增量按 ~30fps 合并。以前是每帧一次，长会话里每个 token 都要把整棵时间线走一遍，
+     * 反而把主线程占满；合并后视觉上仍然连贯，重渲染次数降到三分之一。
+     */
     const deltaQ: { sid: string; p: Record<string, unknown> }[] = [];
-    let deltaRaf = 0;
+    let deltaTimer = 0;
     const flushDeltas = () => {
-      deltaRaf = 0;
+      if (deltaTimer) {
+        window.clearTimeout(deltaTimer);
+        deltaTimer = 0;
+      }
       if (!deltaQ.length) return;
       const batch = deltaQ.splice(0, deltaQ.length);
       const bySid = new Map<string, typeof batch>();
@@ -1221,7 +1235,7 @@ export default function Chat({
         case "message.part.delta":
           if (mine) {
             deltaQ.push({ sid, p });
-            if (!deltaRaf) deltaRaf = requestAnimationFrame(flushDeltas);
+            if (!deltaTimer) deltaTimer = window.setTimeout(flushDeltas, 33);
           }
           break;
         // 整条消息被撤（undo/revert）：不删的话撤回的消息钉在时间线里，重开又没了
@@ -1250,6 +1264,7 @@ export default function Chat({
           const gone = String(p.sessionID ?? (p.info as Session | undefined)?.id ?? "");
           if (!gone) break;
           kidIds.current.delete(gone);
+          runSeen.current.delete(gone);
           setKids((ks) => ks.filter((k) => k.id !== gone));
           setKidMsgs((prev) => {
             if (!(gone in prev)) return prev;
@@ -1271,6 +1286,8 @@ export default function Chat({
         case "session.status": {
           const st = String(p.status?.type ?? "");
           if (sid) {
+            const wasRunning = runSeen.current.delete(sid);
+            if (st && st !== "idle") runSeen.current.add(sid);
             setBusySet((s) => {
               const has = s.has(sid);
               if (st === "idle" ? !has : has) return s;
@@ -1279,6 +1296,8 @@ export default function Chat({
               else next.add(sid);
               return next;
             });
+            // 有内核只发 status 不发 session.idle；两路都收尾，标记保证只弹一次
+            if (st === "idle" && wasRunning) void notifyRef.current(sid);
           }
           if (st === "retry") {
             setRetry({
@@ -1315,15 +1334,17 @@ export default function Chat({
               })
               .catch(() => {});
             reloadDiffsRef.current();
-          } else if (sid) {
-            // 不是当前会话（切走了或在别的区）：跑完给一条系统通知，别让人干等
-            void notifyRef.current(sid);
           }
+          // 当前会话也要提醒：窗口在后台时人根本看不到它跑完了。
+          // 弹不弹由「仅当窗口不在前台时提醒」和子任务开关在 notifyDone 里决定。
+          if (sid && runSeen.current.delete(sid)) void notifyRef.current(sid);
           break;
         case "session.error":
           if (sid === cur) {
             setErr(p.error?.data?.message ?? p.error?.name ?? "内核返回错误");
           }
+          // 出错不弹「会话已完成」，清掉标记免得下一次 idle 误报
+          if (sid) runSeen.current.delete(sid);
           setBusySet((s) => {
             if (!s.has(sid)) return s;
             const next = new Set(s);
@@ -1393,7 +1414,7 @@ export default function Chat({
       }
     });
     return () => {
-      if (deltaRaf) cancelAnimationFrame(deltaRaf);
+      if (deltaTimer) window.clearTimeout(deltaTimer);
       if (deltaQ.length) flushDeltas();
       stop.then((f) => f());
     };
@@ -1494,10 +1515,10 @@ export default function Chat({
     if (el) el.scrollTop = el.scrollHeight;
   }, [active]);
 
-  function jumpTo(id: string) {
+  const jumpTo = useCallback((id: string) => {
     setRailHit(id);
     document.getElementById(`m-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
+  }, []);
 
   /** 悬浮预览：跟随刻度条的位置，用 absolute 挂在 .body 上，不受滚动容器裁剪 */
   function showTip(el: HTMLElement, text: string) {
@@ -1684,10 +1705,12 @@ export default function Chat({
       }
       // 先标 busy：prompt 返回前 SSE 可能已 idle，事后再 add 会卡在 Stop
       setBusySet((s) => new Set(s).add(id));
+      runSeen.current.add(id);
       try {
         await sessions.prompt(id, parts, target, model, agent);
         stick.current = true;
       } catch (e) {
+        runSeen.current.delete(id);
         setBusySet((s) => {
           if (!s.has(id!)) return s;
           const next = new Set(s);
@@ -1716,10 +1739,12 @@ export default function Chat({
     setToast(null);
     // 先标 busy：prompt 返回前 SSE 可能已 idle，事后再 add 会卡在 Stop
     setBusySet((s) => new Set(s).add(id));
+    runSeen.current.add(id);
     try {
       await sessions.prompt(id, retryParts, dirOf(id), model, agent);
       stick.current = true;
     } catch (e) {
+      runSeen.current.delete(id);
       setBusySet((s) => {
         if (!s.has(id)) return s;
         const next = new Set(s);
@@ -2028,47 +2053,83 @@ export default function Chat({
    * 其余保持 `list` 里的时间倒序（sort 是稳定的）。
    */
   const kw = query.trim().toLowerCase();
-  const ofWs = (p: string) => {
-    const items = list.filter((s) => sameDir(s.directory, p));
-    const hit = kw
-      ? items.filter((s) => `${s.title ?? ""} ${s.id}`.toLowerCase().includes(kw))
-      : items;
+  // 侧栏每个工作区都要过滤+排序一遍；list 没变时别跟着流式帧重算
+  const wsItems = useMemo(() => {
     const rank = (id: string) => {
       const i = pins.indexOf(id);
       return i < 0 ? Number.MAX_SAFE_INTEGER : i;
     };
-    return [...hit].sort((a, b) => rank(a.id) - rank(b.id));
-  };
-  const turns = msgs.filter((m) => m.info.role === "user");
-  /** 本会话累计用量：token / 缓存 / 耗时都按助手消息累加，挂在会话末尾 */
-  const spend = msgs.reduce(
-    (acc, m) => {
-      const i = m.info;
-      if (i.role !== "assistant") return acc;
-      if (typeof i.cost === "number") acc.cost += i.cost;
-      const t = (i.tokens ?? {}) as Record<string, unknown>;
-      const n = (x: unknown) => (typeof x === "number" ? x : 0);
-      acc.in += n(t.input);
-      acc.out += n(t.output);
-      acc.reasoning += n(t.reasoning);
-      const c = (t.cache ?? {}) as Record<string, unknown>;
-      acc.cache += n(c.read) + n(c.write);
-      if (i.time?.completed) acc.ms += Math.max(0, i.time.completed - i.time.created);
-      return acc;
-    },
-    { cost: 0, in: 0, out: 0, reasoning: 0, cache: 0, ms: 0 },
-  );
-  const toolCalls = msgs.reduce((n, m) => n + m.parts.filter((p) => p.type === "tool").length, 0);
+    const map = new Map<string, Session[]>();
+    for (const p of projects) {
+      const items = list.filter((s) => sameDir(s.directory, p));
+      const hit = kw
+        ? items.filter((s) => `${s.title ?? ""} ${s.id}`.toLowerCase().includes(kw))
+        : items;
+      map.set(p, [...hit].sort((a, b) => rank(a.id) - rank(b.id)));
+    }
+    return map;
+  }, [projects, list, kw, pins]);
+  const ofWs = (p: string) => wsItems.get(p) ?? [];
+  /** 会话级汇总只在消息数组变化时重算：悬停、待办刷新等无关渲染不必再扫一遍 */
+  const { turns, spend, toolCalls } = useMemo(() => {
+    const turns = msgs.filter((m) => m.info.role === "user");
+    /** 本会话累计用量：token / 缓存 / 耗时都按助手消息累加，挂在会话末尾 */
+    const spend = msgs.reduce(
+      (acc, m) => {
+        const i = m.info;
+        if (i.role !== "assistant") return acc;
+        if (typeof i.cost === "number") acc.cost += i.cost;
+        const t = (i.tokens ?? {}) as Record<string, unknown>;
+        const n = (x: unknown) => (typeof x === "number" ? x : 0);
+        acc.in += n(t.input);
+        acc.out += n(t.output);
+        acc.reasoning += n(t.reasoning);
+        const c = (t.cache ?? {}) as Record<string, unknown>;
+        acc.cache += n(c.read) + n(c.write);
+        if (i.time?.completed) acc.ms += Math.max(0, i.time.completed - i.time.created);
+        return acc;
+      },
+      { cost: 0, in: 0, out: 0, reasoning: 0, cache: 0, ms: 0 },
+    );
+    const toolCalls = msgs.reduce((n, m) => n + m.parts.filter((p) => p.type === "tool").length, 0);
+    return { turns, spend, toolCalls };
+  }, [msgs]);
 
-  const lastRea = lastReasoning(msgs);
+  /** 时间线按轮渲染：一条用户消息 + 这一轮的全部助手步骤合成一段助手回复 */
+  const turnRows = useMemo(() => {
+    const rows: TurnRowData[] = [];
+    for (const m of msgs) {
+      if (m.info.role === "user") {
+        rows.push({ key: m.info.id, owner: m.info.id, user: m, assistants: [] });
+        continue;
+      }
+      const last = rows[rows.length - 1];
+      if (last) last.assistants.push(m);
+      else rows.push({ key: m.info.id, owner: "", assistants: [m] });
+    }
+    return rows;
+  }, [msgs]);
+
   /** 每轮小结的底账：切轮、数步、给每步拉一行摘要，详见 turnsOf */
-  const { stat: turnStat, owner: turnOf } = turnsOf(msgs, busy);
+  const turnsCache = useRef<{
+    busy: boolean;
+    runKey: string;
+    stat: Record<string, TurnStat>;
+    groups: TurnGroups;
+  } | null>(null);
+  const { stat: turnStat } = useMemo(() => {
+    const r = turnsOf(msgs, busy, turnsCache.current);
+    turnsCache.current = { busy, runKey: r.runKey, stat: r.stat, groups: r.groups };
+    return r;
+  }, [msgs, busy]);
   /** 全完成的旧清单不该在新一轮里继续悬浮，等内核写新清单再出现 */
   const openTodos = todos.some((t) => t.status !== "completed" && t.status !== "cancelled");
 
   /** 父会话里那条 task 工具记录只给一个子会话 id，过程全在子会话的帧上 */
-  const kidOf = (p: Part) =>
-    p.type === "tool" && p.tool === "task" ? kidMsgs[kidSid(p)] : undefined;
+  const kidOf = useCallback(
+    (p: Part) => (p.type === "tool" && p.tool === "task" ? kidMsgs[kidSid(p)] : undefined),
+    [kidMsgs],
+  );
 
   /**
    * 待决项是子会话发来的时候，卡片上得说是谁在问——否则看起来像主任务在拦你。
@@ -2164,7 +2225,7 @@ export default function Chat({
     onDropDir(p);
   }
 
-  function toggleFiles() {
+  const toggleFiles = useCallback(() => {
     setFilesOpen((open) => {
       const next = !open;
       try {
@@ -2174,25 +2235,45 @@ export default function Chat({
       }
       return next;
     });
-  }
+  }, []);
 
   /** 文件大窗只读它那个区的文件（root 已跟着会话走）；越界的仍然拦掉。计划文件由 files.rs 单独限定根目录 */
-  function openWorkspaceFile(f: OpenFile) {
-    if (!f.plan && relInRoot(wsDir, f.abs) === null) {
-      setToast("这个文件不在当前会话的工作区里，无法在应用内预览");
-      return;
-    }
-    setFileView(f);
-  }
+  const openWorkspaceFile = useCallback(
+    (f: OpenFile) => {
+      if (!f.plan && relInRoot(wsDir, f.abs) === null) {
+        setToast("这个文件不在当前会话的工作区里，无法在应用内预览");
+        return;
+      }
+      setFileView(f);
+    },
+    [wsDir],
+  );
 
-  function openDiffFile(d: FileDiff) {
-    const rel = relInRoot(wsDir, d.file);
-    if (rel === null) {
-      setToast("这条改动不在当前会话的工作区里，无法在应用内预览");
-      return;
-    }
-    setFileView({ rel, abs: d.file, tab: "diff" });
-  }
+  const openDiffFile = useCallback(
+    (d: FileDiff) => {
+      const rel = relInRoot(wsDir, d.file);
+      if (rel === null) {
+        setToast("这条改动不在当前会话的工作区里，无法在应用内预览");
+        return;
+      }
+      setFileView({ rel, abs: d.file, tab: "diff" });
+    },
+    [wsDir],
+  );
+
+  const closeFileView = useCallback(() => setFileView(null), []);
+  const onFileRestored = useCallback(() => {
+    reloadDiffs();
+    setEditPulse((n) => n + 1);
+  }, [reloadDiffs]);
+  const closeQuickOpen = useCallback(() => setQuickOpen(false), []);
+  const pickQuickFile = useCallback(
+    (rel: string) => {
+      setQuickOpen(false);
+      setFileView({ rel, abs: `${wsDir.replace(/\/+$/, "")}/${rel}`, tab: "preview" });
+    },
+    [wsDir],
+  );
 
   /** 原生右键菜单已被全局压掉，工作区与会话的菜单在这里自绘 */
   const [menu, setMenu] = useState<Menu | null>(null);
@@ -2278,6 +2359,15 @@ export default function Chat({
     items.push({ label: "只删除这条消息", danger: true, run: () => void removeMessage(m.info.id) });
     return items;
   }
+
+  // 菜单项依赖一堆当前状态，但时间线行是 memo 的：走 ref 取最新实现，回调本身保持稳定
+  const openMenuRef = useRef(openMenu);
+  openMenuRef.current = openMenu;
+  const msgMenuRef = useRef(msgMenu);
+  msgMenuRef.current = msgMenu;
+  const onMsgMenu = useCallback((e: ReactMouseEvent, m: Message) => {
+    openMenuRef.current(e, msgMenuRef.current(m));
+  }, []);
 
   return (
     <div className="shell2">
@@ -2600,68 +2690,35 @@ export default function Chat({
                 </ul>
               </details>
             )}
-            {msgs.map((m, mi) => {
-              // 这一轮的最后一条（再往下就是新的用户消息）后面挂这轮的小结胶囊
-              const ends = mi === msgs.length - 1 || msgs[mi + 1].info.role === "user";
-              const isLast = mi === msgs.length - 1;
-              const turnRunning = isLast && busy;
-              const tk = ends ? turnOf[mi] : "";
+            {turnRows.map((row, ri) => {
+              const last = ri === turnRows.length - 1;
+              const turnRunning = last && busy;
+              const tk = row.owner;
               const st = tk ? turnStat[tk] : undefined;
               // 最新一轮优先用事件快照（比分片里的 todowrite 新），历史轮用 part 还原
-              const turnTodo = turnTodos[tk]?.length
-                ? turnTodos[tk]
-                : isLast && todos.length
-                  ? todos
-                  : st?.todos;
-              // 用量挂在说话人这一行右端：每步少一整行，长会话能省出一屏
-              const u = m.info.role === "assistant" ? usage(m.info) : "";
+              const turnTodo = tk
+                ? turnTodos[tk]?.length
+                  ? turnTodos[tk]
+                  : last && todos.length
+                    ? todos
+                    : st?.todos
+                : undefined;
+              const tail = row.assistants[row.assistants.length - 1];
               return (
-                <Fragment key={m.info.id}>
-                  <article
-                    id={`m-${m.info.id}`}
-                    className={`msg ${m.info.role}`}
-                    onContextMenu={(e) => openMenu(e, msgMenu(m))}
-                  >
-                    <header>
-                      <span>{label(m.info)}</span>
-                      {u && (
-                        <span className="umeta" title={u}>
-                          {u}
-                        </span>
-                      )}
-                    </header>
-                    {m.info.error && (
-                      <p className="error inline">
-                        {m.info.error.data?.message ?? m.info.error.name}
-                        {isLast && retryBtn}
-                      </p>
-                    )}
-                    {m.parts.map((p) => (
-                      <Block
-                        key={p.id}
-                        part={p}
-                        onCopy={copy}
-                        autoOpen={p.id === lastRea}
-                        kid={kidOf(p)}
-                      />
-                    ))}
-                  </article>
-                  {st && (
-                    <>
-                      <TurnSum
-                        running={turnRunning}
-                        pulse={editPulse}
-                        steps={st.steps}
-                        tools={st.tools}
-                        diffs={st.diffs}
-                        list={st.list}
-                        onJump={jumpTo}
-                        onOpenFile={openDiffFile}
-                      />
-                      {!turnRunning && <TurnTodo todos={turnTodo} />}
-                    </>
-                  )}
-                </Fragment>
+                <TurnRow
+                  key={row.key}
+                  user={row.user}
+                  assistants={row.assistants}
+                  running={turnRunning}
+                  pulse={turnRunning ? editPulse : 0}
+                  stat={st}
+                  todo={turnTodo}
+                  retry={last && tail?.info.error ? retryBtn : undefined}
+                  onCopy={copy}
+                  onMenu={onMsgMenu}
+                  onOpenFile={openDiffFile}
+                  kidOf={kidOf}
+                />
               );
             })}
             {busy && (
@@ -2763,8 +2820,6 @@ export default function Chat({
                     <button onClick={() => void answer(p, "always")}>始终允许</button>
                   )}
                   <button onClick={() => void answer(p, "reject")}>拒绝</button>
-                  <span className="grow" />
-                  <span className="muted small">想少弹几次？右下角切「自动审批」</span>
                 </div>
               </div>
             ))}
@@ -2861,6 +2916,26 @@ export default function Chat({
             onKeyDown={onKey}
             onPaste={onPasteImages}
           />
+          {err && !lastErr && (
+            <div className="errbar" role="alert">
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" strokeWidth="1.3" />
+                <path d="M8 4.6v4.3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                <circle cx="8" cy="11.4" r="0.9" fill="currentColor" />
+              </svg>
+              <span className="grow">{err}</span>
+              {retryBtn}
+              <button
+                type="button"
+                className="x"
+                onClick={() => setErr(null)}
+                title="关闭"
+                aria-label="关闭错误提示"
+              >
+                ×
+              </button>
+            </div>
+          )}
           <div className="row">
             <div className="ctrls">
               <button
@@ -2946,12 +3021,6 @@ export default function Chat({
                   localStorage.setItem(MODEL_KEY, v);
                 }}
               />
-              {err && !lastErr && (
-                <span className="error inline">
-                  {err}
-                  {retryBtn}
-                </span>
-              )}
             </div>
             <span className="grow" />
             {busy ? (
@@ -3013,23 +3082,13 @@ export default function Chat({
           startTab={fileView.tab}
           diffs={sessionDiffs}
           pulse={editPulse}
-          onRestored={() => {
-            reloadDiffs();
-            setEditPulse((n) => n + 1);
-          }}
-          onClose={() => setFileView(null)}
+          onRestored={onFileRestored}
+          onClose={closeFileView}
         />
       )}
 
       {quickOpen && (
-        <QuickOpen
-          root={wsDir}
-          onClose={() => setQuickOpen(false)}
-          onPick={(rel) => {
-            setQuickOpen(false);
-            setFileView({ rel, abs: `${wsDir.replace(/\/+$/, "")}/${rel}`, tab: "preview" });
-          }}
-        />
+        <QuickOpen root={wsDir} onClose={closeQuickOpen} onPick={pickQuickFile} />
       )}
 
       {shareAsk && (
@@ -3306,27 +3365,6 @@ function label(info: MessageInfo): string {
   return mid ? `助手${ag} · ${mid}` : `助手${ag}`;
 }
 
-/** 只留人类需要的数字：step-finish / snapshot 这类内核内部标记不再单独占行 */
-function usage(info: MessageInfo): string {
-  const t = info.tokens ?? {};
-  const n = (x: unknown) => (typeof x === "number" && x > 0 ? x : 0);
-  const inp = n(t.input);
-  const out = n(t.output);
-  const reas = n(t.reasoning);
-  const cost = n(info.cost);
-  const bits: string[] = [];
-  if (inp) bits.push(`输入 ${fmtNum(inp)}`);
-  if (out) bits.push(`输出 ${fmtNum(out)}`);
-  if (reas) bits.push(`思考 ${fmtNum(reas)}`);
-  if (cost) bits.push(`成本 ${fmtNum(cost, 4)}`);
-  const secs = info.time?.completed
-    ? Math.max(0, Math.round((info.time.completed - info.time.created) / 100) / 10)
-    : 0;
-  if (secs > 0) bits.push(fmtSpan(secs));
-  // 流式过程中 token 全 0，这行只会变成噪音
-  return bits.length > 1 ? bits.join(" · ") : "";
-}
-
 const fmtNum = (n: number, frac = 0) =>
   n.toLocaleString("zh-CN", { maximumFractionDigits: frac });
 
@@ -3353,15 +3391,6 @@ function fmtSpan(sec: number): string {
   const d = Math.floor(h / 24);
   const hh = h % 24;
   return hh ? `${d}天${hh}小时` : `${d}天`;
-}
-
-/** 只有最新一段思考自动展开，否则一轮十几段思考能把正文顶出屏 */
-function lastReasoning(msgs: Message[]): string | null {
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const parts = msgs[i].parts;
-    for (let j = parts.length - 1; j >= 0; j--) if (parts[j].type === "reasoning") return parts[j].id;
-  }
-  return null;
 }
 
 /** 处理中要说明此刻在干什么：只有"内核处理中"四个字的时候，用户无从判断是排队还是卡死 */
@@ -3430,26 +3459,12 @@ function BusyHint({
   );
 }
 
-const Block = memo(function Block({
-  part,
-  onCopy,
-  autoOpen,
-  kid,
-}: {
-  part: Part;
-  onCopy: (t: string) => void;
-  autoOpen: boolean;
-  kid?: Message[];
-}) {
+const Block = memo(function Block({ part }: { part: Part }) {
   switch (part.type) {
     case "text":
       // 内核会往用户消息里塞 synthetic 文本（如语言提示），不属于对话内容
       if ((part as any).synthetic || part.metadata?.synthetic) return null;
       return <pre className="text">{part.text}</pre>;
-    case "reasoning":
-      return <ReasoningFold part={part} autoOpen={autoOpen} />;
-    case "tool":
-      return <ToolCard part={part} onCopy={onCopy} kid={kid} />;
     case "file": {
       const url = String(part.url ?? "");
       const name = part.filename ?? "图片附件";
@@ -3523,20 +3538,75 @@ const Block = memo(function Block({
   }
 });
 
-/** 思考过程：最新一段跟着流式输出展开，旧的自动收起，手动开合过就以手动为准 */
-function ReasoningFold({ part, autoOpen }: { part: Part; autoOpen: boolean }) {
-  const [manual, setManual] = useState<boolean | null>(null);
-  const open = manual ?? autoOpen;
-  const secs = dur(part.time);
-  // 只带了时间戳、没留思考正文的空块不占地方
-  if (!part.text?.trim()) return null;
+/** 工具执行的分组行：一轮里的思考和工具按发生顺序摊平，整轮只合成一张卡 */
+type RunItem = { p: Part; m: Message };
+type FlatUnit =
+  | { t: "run"; key: string; items: RunItem[]; ids: string[] }
+  | { t: "part"; key: string; p: Part; m: Message; ids: string[] };
+
+/** 内核内部标记不占行，也不该把一次连续执行截成两段 */
+const HIDDEN_PART = new Set(["step-start", "step-finish", "snapshot"]);
+
+function flattenParts(assistants: Message[]): FlatUnit[] {
+  const parts: FlatUnit[] = [];
+  const items: RunItem[] = [];
+  let ids: string[] = [];
+  // 卡片落在第一次执行的位置：开头的说明留在卡上方，其余正文和收尾回答依次排在卡下方
+  let cardAt = 0;
+  for (const m of assistants) {
+    let first = true;
+    for (const p of m.parts) {
+      if (HIDDEN_PART.has(p.type)) continue;
+      // 只带时间戳、还没有正文的思考块不占行
+      if (p.type === "reasoning" && !p.text?.trim()) continue;
+      const own = first ? [m.info.id] : [];
+      first = false;
+      if (p.type === "tool" || p.type === "reasoning") {
+        if (!items.length) cardAt = parts.length;
+        items.push({ p, m });
+        ids.push(...own);
+      } else {
+        parts.push({ t: "part", key: p.id, p, m, ids: own });
+      }
+    }
+  }
+  if (!items.length) return parts;
+  const card: FlatUnit = { t: "run", key: `run:${items[0].p.id}`, items, ids };
+  return [...parts.slice(0, cardAt), card, ...parts.slice(cardAt)];
+}
+
+/** 助手这一轮的全部 part：执行步骤收进一张卡，其余按原样留在卡片前后 */
+function AssistantParts({
+  assistants,
+  live,
+  onCopy,
+  onMenu,
+  kidOf,
+}: {
+  assistants: Message[];
+  /** 这一轮还在跑：卡片保持展开，别在两步之间闪一下 */
+  live: boolean;
+  onCopy: (t: string) => void;
+  onMenu: (e: ReactMouseEvent, m: Message) => void;
+  kidOf: (p: Part) => Message[] | undefined;
+}) {
   return (
-    <details className="fold" open={open}>
-      <summary onClick={() => setManual(!open)}>
-        思考过程{secs && <span className="muted"> · {secs}</span>}
-      </summary>
-      <pre className="text muted scroll">{part.text}</pre>
-    </details>
+    <>
+      {flattenParts(assistants).map((u) => (
+        <Fragment key={u.key}>
+          {u.ids.map((id) => (
+            <span key={id} id={`m-${id}`} className="anchor" aria-hidden="true" />
+          ))}
+          {u.t === "run" ? (
+            <ToolRun items={u.items} live={live} onCopy={onCopy} onMenu={onMenu} kidOf={kidOf} />
+          ) : (
+            <div className="unit" onContextMenu={(e) => onMenu(e, u.m)}>
+              <Block part={u.p} />
+            </div>
+          )}
+        </Fragment>
+      ))}
+    </>
   );
 }
 
@@ -3618,14 +3688,15 @@ function QuestionCard({
           </div>
         );
       })}
-      <div className="row">
-        <button className="primary" disabled={!ready} onClick={() => onAnswer(answers)}>
-          提交回答
-        </button>
-        <button onClick={onReject}>不回答</button>
-        <span className="grow" />
-        {!ready && <span className="muted small">每个问题至少选一项</span>}
-      </div>
+      <footer className="qfoot">
+        <div className="row">
+          <button className="primary" disabled={!ready} onClick={() => onAnswer(answers)}>
+            提交回答
+          </button>
+          <button onClick={onReject}>不回答</button>
+        </div>
+        {!ready && <p className="asknote">每个问题至少选一项</p>}
+      </footer>
     </div>
   );
 }
@@ -3667,19 +3738,13 @@ const STATE_CN: Record<string, string> = {
   error: "失败",
 };
 
-/** 工具状态角标：ToolCard 与 KidLog 共用一套配色与文案 */
+/** 子任务日志里的状态角标 */
 function StatusChip({ status }: { status: string }) {
-  return <span className={`st ${status}`}>{STATE_CN[status] ?? status}</span>;
+  return <span className={`st st-${status}`}>{STATE_CN[status] ?? status}</span>;
 }
 
 /** 改动清单里的状态字母（git 风格） */
 const FSTATUS_CN: Record<string, string> = { added: "A", deleted: "D", modified: "M" };
-
-const dur = (t?: { start?: number; end?: number }) => {
-  const ms = t?.start && t?.end && t.end >= t.start ? t.end - t.start : 0;
-  // 不到 0.1 秒的耗时对看的人没有信息量，只会在每步后面挂一串「0.0秒」
-  return ms >= 100 ? fmtSpan(ms / 1000) : "";
-};
 
 /** 这些工具的入参本身就写在标题行里，再摊一份 JSON 只会把正文挤成一堵墙 */
 const SELF_EXPLANATORY = new Set([
@@ -3705,25 +3770,40 @@ const baseName = (p: unknown) => {
 /** 标题行取最能说明"在干什么"的那个字段：bash 用它的 description，读写用文件名，检索用 pattern */
 function toolHead(part: Part): string {
   const s = part.state as any;
-  const i = (s?.input ?? {}) as Record<string, any>;
+  const { tool, input: i } = toolView(part);
   const title = String(s?.title ?? "").replace(/\s+/g, " ").trim();
   const qs = i.questions as any[] | undefined;
   const td = i.todos as any[] | undefined;
+  const files = i.file_paths as string[] | undefined;
   const raw =
-    part.tool === "bash"
+    tool === "bash"
       ? (i.description ?? title ?? i.command)
-      : part.tool === "read" || part.tool === "edit" || part.tool === "write"
+      : tool === "read" || tool === "edit" || tool === "write"
         ? baseName(i.filePath ?? i.path ?? title)
-        : part.tool === "grep" || part.tool === "glob"
+        : tool === "grep" || tool === "glob"
           ? i.pattern
-          : part.tool === "webfetch"
+          : tool === "webfetch"
             ? i.url
-            : part.tool === "question" && qs?.length
-              ? `${qs[0].header ?? qs[0].question}${qs.length > 1 ? ` 等 ${qs.length} 个问题` : ""}`
-              : part.tool === "todowrite" && td?.length
-                ? `${td.length} 项待办`
-                : title;
+            : tool === "deleteFile" && files?.length
+              ? files.length > 1
+                ? `${files.length} 个文件`
+                : baseName(files[0])
+              : tool === "skill"
+                ? i.name
+                : tool === "tool_search" || tool === "CodeSemanticSearch"
+                  ? i.query
+                  : tool === "tool_describe"
+                    ? i.id
+                    : tool === "invalid"
+                      ? i.tool
+                      : tool === "question" && qs?.length
+                        ? `${qs[0].header ?? qs[0].question}${qs.length > 1 ? ` 等 ${qs.length} 个问题` : ""}`
+                        : tool === "todowrite" && td?.length
+                          ? `${td.length} 项待办`
+                          : title;
   const text = String(raw ?? "").replace(/\s+/g, " ").trim();
+  // 个别步骤的标题只有内核内部 id，摆出来对用户没有意义
+  if (/^tool_[a-z0-9]{10,}$/i.test(text)) return "";
   return text.length > 90 ? `${text.slice(0, 90)}…` : text;
 }
 
@@ -3741,7 +3821,8 @@ function toolResult(part: Part): { text: string; truncated: boolean } {
   };
 }
 
-function ToolCard({
+/** 工具细节：命令、参数、待办、子会话进展与输出；分组行展开后共用这份内容 */
+function ToolBody({
   part,
   onCopy,
   kid,
@@ -3752,32 +3833,23 @@ function ToolCard({
 }) {
   const s: ToolState | undefined = part.state;
   const status = s?.status ?? "pending";
-  const args = (s as any)?.input as Record<string, any> | undefined;
-  const cmd = part.tool === "bash" ? String(args?.command ?? "") : "";
-  const json =
-    !cmd && args && !SELF_EXPLANATORY.has(part.tool ?? "") && Object.keys(args).length
-      ? JSON.stringify(args, null, 2)
-      : "";
+  const { tool, input: args } = toolView(part);
+  const cmd = tool === "bash" ? String(args?.command ?? "") : "";
   const { text: result, truncated } = toolResult(part);
   const err = status === "error" ? String((s as any)?.error ?? "") : "";
-  const head = toolHead(part);
+  const json =
+    !err && !cmd && args && !SELF_EXPLANATORY.has(tool) && Object.keys(args).length
+      ? JSON.stringify(args, null, 2)
+      : "";
   /** `todowrite` 的 input 与 output 是同一份清单，摊成清单看，两边都不再 dump */
   const todos =
-    part.tool === "todowrite"
+    tool === "todowrite"
       ? (args?.todos as Todo[] | undefined)
-      : part.tool === "todoread"
+      : tool === "todoread"
         ? parseTodos((s as any)?.output)
         : undefined;
-  // 执行中自动展开，跑完自动收起；用户手动开合过就以他为准
-  const [manual, setManual] = useState<boolean | null>(null);
-  const open = manual ?? status !== "completed";
   return (
-    <details className="fold tool" open={open}>
-      <summary onClick={() => setManual(!open)}>
-        <b>{part.tool ?? "工具"}</b>
-        {head && <span className="arg">{head}</span>}
-        <StatusChip status={status} />
-      </summary>
+    <>
       {cmd && (
         <Copyable text={cmd} onCopy={onCopy}>
           <pre className="code">$ {cmd}</pre>
@@ -3795,10 +3867,7 @@ function ToolCard({
         </div>
       )}
       {kid?.length ? (
-        <KidLog
-          msgs={kid}
-          running={status === "pending" || status === "running"}
-        />
+        <KidLog msgs={kid} running={status === "pending" || status === "running"} />
       ) : null}
       {err && <pre className="code err">{err}</pre>}
       {!err && !todos && result && (
@@ -3807,6 +3876,223 @@ function ToolCard({
         </Copyable>
       )}
       {!err && !todos && truncated && <p className="hint">输出已被内核截断</p>}
+    </>
+  );
+}
+
+/** 工具名换成人话，标题行只留用户看得懂的那半句 */
+const TOOL_CN: Record<string, string> = {
+  bash: "终端命令",
+  read: "读取文件",
+  edit: "修改文件",
+  write: "写入文件",
+  grep: "搜索内容",
+  glob: "查找文件",
+  list: "列出目录",
+  webfetch: "访问网页",
+  task: "子任务",
+  question: "询问",
+  todowrite: "更新待办",
+  todoread: "查看待办",
+  deleteFile: "删除文件",
+  skill: "技能",
+  tool_call: "调用工具",
+  tool_search: "搜索工具",
+  tool_describe: "查看工具说明",
+  CodeSemanticSearch: "语义搜索",
+  invalid: "工具调用",
+};
+
+/** tool_call 是内核的工具代理：真实工具和参数在 input.id / input.args 里 */
+function toolView(part: Part): { tool: string; input: Record<string, any> } {
+  const input = ((part.state as any)?.input ?? {}) as Record<string, any>;
+  if (part.tool === "tool_call" && typeof input.id === "string") {
+    return { tool: input.id, input: (input.args ?? {}) as Record<string, any> };
+  }
+  return { tool: part.tool ?? "", input };
+}
+
+/** 完成态按工具分说法：命令是"已运行"，其余是"已完成" */
+function runVerb(part: Part, status: string): string {
+  if (status === "completed") return toolView(part).tool === "bash" ? "已运行" : "已完成";
+  return STATE_CN[status] ?? status;
+}
+
+/** 行尾那半句：命令原样留（等宽），其余用标题行取到的摘要 */
+function runPreview(part: Part): { text: string; mono: boolean } {
+  if (part.type === "reasoning")
+    return { text: String(part.text ?? "").replace(/\s+/g, " ").trim(), mono: false };
+  const { tool, input } = toolView(part);
+  if (tool === "bash")
+    return { text: String(input.command ?? "").replace(/\s+/g, " ").trim(), mono: true };
+  if (tool === "grep" || tool === "glob" || tool === "webfetch")
+    return { text: toolHead(part), mono: true };
+  return { text: toolHead(part), mono: false };
+}
+
+/** 行首状态图标：完成打勾、失败打叉、执行中转圈 */
+function RunIcon({ status }: { status: string }) {
+  if (status === "running" || status === "pending") {
+    return (
+      <svg className="tgicon spin" viewBox="0 0 16 16" aria-hidden="true">
+        <circle
+          cx="8"
+          cy="8"
+          r="6.2"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeDasharray="12 27"
+        />
+      </svg>
+    );
+  }
+  if (status === "error") {
+    return (
+      <svg className="tgicon" viewBox="0 0 16 16" aria-hidden="true">
+        <circle cx="8" cy="8" r="6.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
+        <path
+          d="M5.7 5.7l4.6 4.6M10.3 5.7l-4.6 4.6"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.3"
+          strokeLinecap="round"
+        />
+      </svg>
+    );
+  }
+  return (
+    <svg className="tgicon" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
+      <path
+        d="M5 8.2l2.1 2.1 3.9-4.4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/** 一步工具：收起时一行，展开看完整命令/输出；跑着的那步行默认摊开 */
+function ToolRow({
+  part,
+  onCopy,
+  kid,
+}: {
+  part: Part;
+  onCopy: (t: string) => void;
+  kid?: Message[];
+}) {
+  const status = part.state?.status ?? "pending";
+  const [manual, setManual] = useState<boolean | null>(null);
+  const open = manual ?? (status === "running" || status === "pending");
+  const { text, mono } = runPreview(part);
+  return (
+    <details className="tgr" open={open}>
+      <summary onClick={() => setManual(!open)}>
+        <RunIcon status={status} />
+        <span className="tglabel">{TOOL_CN[toolView(part).tool] ?? "工具"}</span>
+        <span className={`tgverb tg-${status}`}>{runVerb(part, status)}</span>
+        {text && (
+          <>
+            <span className="tgsep" aria-hidden="true">
+              ·
+            </span>
+            <span className={`tgpreview ${mono ? "mono" : ""}`} title={text}>
+              {text}
+            </span>
+          </>
+        )}
+      </summary>
+      <div className="tgbody">
+        <ToolBody part={part} onCopy={onCopy} kid={kid} />
+      </div>
+    </details>
+  );
+}
+
+/** 思考也是一行：预览随流式输出刷新，想看全文再展开 */
+function ReasoningRow({ part }: { part: Part }) {
+  const [manual, setManual] = useState<boolean | null>(null);
+  const open = manual ?? false;
+  const preview = String(part.text ?? "").replace(/\s+/g, " ").trim();
+  return (
+    <details className="tgr" open={open}>
+      <summary onClick={() => setManual(!open)}>
+        <RunIcon status="completed" />
+        <span className="tglabel">已思考</span>
+        <span className="tgpreview" title={preview}>
+          {preview}
+        </span>
+      </summary>
+      <div className="tgbody">
+        <pre className="text muted scroll">{part.text}</pre>
+      </div>
+    </details>
+  );
+}
+
+/**
+ * 一轮里连续的思考和工具合成一张卡：标题只报次数，执行中自动摊开，
+ * 跑完收起；用户手动开合过就以他为准。单步细节仍按行展开。
+ */
+function ToolRun({
+  items,
+  live,
+  onCopy,
+  onMenu,
+  kidOf,
+}: {
+  items: RunItem[];
+  live: boolean;
+  onCopy: (t: string) => void;
+  onMenu: (e: ReactMouseEvent, m: Message) => void;
+  kidOf: (p: Part) => Message[] | undefined;
+}) {
+  const tools = items.filter((i) => i.p.type === "tool").length;
+  const running = items.some((i) => {
+    const s = i.p.type === "tool" ? i.p.state?.status : undefined;
+    return s === "running" || s === "pending";
+  });
+  const [manual, setManual] = useState<boolean | null>(null);
+  const open = manual ?? (running || live);
+  return (
+    <details className="toolrun" open={open}>
+      <summary onClick={() => setManual(!open)}>
+        <span className="tgchev" aria-hidden="true">
+          <svg viewBox="0 0 16 16">
+            <path
+              d="M6 3.6l4.4 4.4L6 12.4"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </span>
+        <span className="tgtitle">{tools ? `执行工具 ${tools} 次` : "已思考"}</span>
+        {running && <span className="pulse" aria-hidden="true" />}
+      </summary>
+      <ol className="tglist">
+        {items.map(({ p, m }) => (
+          <li
+            key={p.id}
+            className={`tgrow tg-${p.type === "tool" ? (p.state?.status ?? "pending") : "completed"}`}
+            onContextMenu={(e) => onMenu(e, m)}
+          >
+            {p.type === "reasoning" ? (
+              <ReasoningRow part={p} />
+            ) : (
+              <ToolRow part={p} onCopy={onCopy} kid={kidOf(p)} />
+            )}
+          </li>
+        ))}
+      </ol>
     </details>
   );
 }
@@ -3819,10 +4105,11 @@ const TODO_CN: Record<string, string> = {
   cancelled: "已取消",
 };
 
-const TODO_MARK: Record<string, string> = {
-  in_progress: "▶",
-  completed: "✓",
-  cancelled: "✕",
+const STATUS_TITLE: Record<string, string> = {
+  pending: "未开始",
+  in_progress: "正在执行",
+  completed: "已完成",
+  cancelled: "已取消",
 };
 
 /** `todoread`（内核默认 deny，放开就会用到）把清单放在 output 的 JSON 字符串里；解不出来就照旧摊原文 */
@@ -3844,17 +4131,61 @@ function todoProg(todos: Todo[]): string {
     : `已完成 ${done} / ${todos.length}${gone ? ` · 取消 ${gone}` : ""}`;
 }
 
+/** 每行的状态点：待办空圈、进行中蓝色三角、完成绿勾、取消灰叉 */
+function TodoMark({ status }: { status: string }) {
+  if (status === "completed")
+    return (
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <circle cx="8" cy="8" r="6.2" fill="currentColor" />
+        <path
+          d="M5.1 8.2l2 2 3.9-4.3"
+          fill="none"
+          stroke="#ffffff"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    );
+  if (status === "in_progress")
+    return (
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M6.3 4.4l5.3 3.6-5.3 3.6z" fill="currentColor" />
+      </svg>
+    );
+  if (status === "cancelled")
+    return (
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <circle cx="8" cy="8" r="5.6" fill="none" stroke="currentColor" strokeWidth="1.3" />
+        <path
+          d="M6 6l4 4M10 6l-4 4"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.3"
+          strokeLinecap="round"
+        />
+      </svg>
+    );
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" strokeWidth="1.3" />
+    </svg>
+  );
+}
+
 function TodoRows({ todos }: { todos: Todo[] }) {
   return (
     <ol className="todoRows">
       {todos.map((t, i) => (
-        <li key={i} className={t.status}>
-          <span className="mk" aria-hidden="true">
-            {TODO_MARK[t.status] ?? "○"}
+        <li key={i} data-status={t.status} title={STATUS_TITLE[t.status] ?? t.status}>
+          <span className="tmark" aria-hidden="true">
+            <TodoMark status={t.status} />
           </span>
           <span className="tx">{t.content}</span>
-          {t.priority === "high" && <span className="tag">高优</span>}
-          <span className="muted small st-cn">{TODO_CN[t.status] ?? t.status}</span>
+          <span className="tmeta">
+            {t.priority === "high" && <span className="pri">高优</span>}
+            <span className="st-cn">{TODO_CN[t.status] ?? t.status}</span>
+          </span>
         </li>
       ))}
     </ol>
@@ -3862,11 +4193,7 @@ function TodoRows({ todos }: { todos: Todo[] }) {
 }
 
 type TurnStat = {
-  steps: number;
-  tools: number;
   diffs: FileDiff[];
-  /** 每一步一行的摘要，胶囊展开时列出来 */
-  list: { id: string; label: string }[];
   /** 重开会话时事件快照没了，从这一轮的 todowrite part 还原清单 */
   todos: Todo[];
 };
@@ -3882,112 +4209,80 @@ function todosOfPart(part: Part): Todo[] | undefined {
   return part.tool === "todoread" ? parseTodos(s?.output) : undefined;
 }
 
-const clip = (s: string, n = 80) => (s.length > n ? `${s.slice(0, n)}…` : s);
-
 /**
- * 一步（一条助手消息）的一行摘要。跑着的那步报"现在在干什么"（盯最新一个 part），
- * 跑完的那步报整步要点：优先旁白文本，其次第一个工具，再退到子任务/思考。
+ * 以用户消息切轮：统计每轮的改动明细（取该用户消息上的 summary.diffs，
+ * 内核按轮写入；session.diff 是全轮累计口径，不用），并还原这一轮的待办快照。
  */
-function stepLabel(m: Message, running: boolean): string {
-  const tools = m.parts.filter((p) => p.type === "tool");
-  const text = m.parts
-    .filter((p) => p.type === "text" && !(p as any).synthetic)
-    .map((p) => String((p as any).text ?? ""))
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (running) {
-    const p = m.parts[m.parts.length - 1];
-    if (p?.type === "tool") {
-      const head = toolHead(p);
-      return clip(`执行 ${p.tool ?? "工具"}${head ? ` · ${head}` : ""}`);
+type TurnGroups = Record<string, Message[]>;
+
+/** 单轮的底账。抽出来是为了让没变化的轮次可以整份复用对象引用 */
+function turnStatOf(arr: Message[]): TurnStat {
+  const user = arr[0];
+  const d = user ? (user.info as any).summary?.diffs : undefined;
+  let todos: Todo[] = [];
+  for (const m of arr) {
+    if (m.info.role === "user") continue;
+    for (const p of m.parts) {
+      const t = todosOfPart(p);
+      if (t) todos = t;
     }
-    if (p?.type === "reasoning") return "思考中…";
-    if (p?.type === "subtask") return clip(`子任务 · ${String((p as any).description ?? "").trim()}`);
-    if (text) return clip(text);
-    return "等待模型响应…";
   }
-  if (text) return clip(text);
-  if (tools.length) return clip(toolHead(tools[0]));
-  const sub = m.parts.find((p) => p.type === "subtask");
-  if (sub) return clip(`子任务 · ${String((sub as any).description ?? (sub as any).agent ?? "").trim()}`);
-  if (m.parts.some((p) => p.type === "reasoning")) return "思考";
-  return "（空）";
+  return {
+    diffs: Array.isArray(d) ? (d as FileDiff[]) : [],
+    todos,
+  };
 }
 
 /**
- * 以用户消息切轮：统计每轮的助手步数、工具次数、改动明细（取该用户消息上的 summary.diffs，
- * 内核按轮写入；session.diff 是全轮累计口径，不用），并给每一步拉一行摘要。
- * 正在跑的那轮最后一步的摘要按"现在在干什么"实时算，时间线每来一帧就跟着刷新。
+ * 长会话的每一帧都会重算这张表；只有正在流式输出的那一轮消息对象会变，
+ * 其余轮按消息引用整份复用，避免每帧重拉几百条步骤摘要。
  */
-function turnsOf(msgs: Message[], busy: boolean): { stat: Record<string, TurnStat>; owner: string[] } {
-  const stat: Record<string, TurnStat> = {};
+function turnsOf(
+  msgs: Message[],
+  busy: boolean,
+  prev: { busy: boolean; runKey: string; stat: Record<string, TurnStat>; groups: TurnGroups } | null,
+): { stat: Record<string, TurnStat>; owner: string[]; groups: TurnGroups; runKey: string } {
   const owner: string[] = [];
-  const stepMsgs: Record<string, Message[]> = {};
+  const groups: TurnGroups = {};
   let cur = "";
-  msgs.forEach((m) => {
+  for (const m of msgs) {
     if (m.info.role === "user") {
       cur = m.info.id;
-      const d = (m.info as any).summary?.diffs;
-      stat[cur] = {
-        steps: 0,
-        tools: 0,
-        diffs: Array.isArray(d) ? (d as FileDiff[]) : [],
-        list: [],
-        todos: [],
-      };
-      stepMsgs[cur] = [];
+      groups[cur] = [];
     }
     owner.push(cur);
-    const s = stat[cur];
-    if (s && m.info.role !== "user") {
-      if (m.info.role === "assistant") {
-        s.steps += 1;
-        stepMsgs[cur].push(m);
-      }
-      for (const p of m.parts) {
-        const t = todosOfPart(p);
-        if (t) s.todos = t;
-      }
-      // subtask 是 task 工具的另一种呈现形态，同源，两边都算才不漏"派活"这步
-      s.tools += m.parts.filter((p) => p.type === "tool" || p.type === "subtask").length;
-    }
-  });
-  const runKey = busy && owner.length ? owner[owner.length - 1] : "";
-  for (const k of Object.keys(stat)) {
-    const arr = stepMsgs[k];
-    stat[k].list = arr.map((m, i) => ({
-      id: m.info.id,
-      label: stepLabel(m, k === runKey && i === arr.length - 1),
-    }));
+    if (cur) groups[cur].push(m);
   }
-  return { stat, owner };
+  const runKey = busy && owner.length ? owner[owner.length - 1] : "";
+  const sameShape = !!prev && prev.busy === busy && prev.runKey === runKey;
+  const stat: Record<string, TurnStat> = {};
+  for (const [k, arr] of Object.entries(groups)) {
+    const old = sameShape ? prev!.groups[k] : undefined;
+    const reuse =
+      !!old &&
+      old.length === arr.length &&
+      arr.every((m, i) => m === old[i]) &&
+      !!prev!.stat[k];
+    stat[k] = reuse ? prev!.stat[k] : turnStatOf(arr);
+  }
+  return { stat, owner, groups, runKey };
 }
 
 /**
- * 一轮对话的执行小结：只报步骤和文件改动，待办清单单独由 TurnTodo 挂在轮末。
- * 收起就一行「✓ 步骤 N / N · F 个文件已修改 +a -d」，展开看每一步做了什么。
+ * 一轮对话的文件改动小结：步骤本身都在上面的执行卡里，这里只报这一轮改了哪些文件。
  */
-function TurnSum({
+const TurnSum = memo(function TurnSum({
   running,
   pulse,
-  steps,
-  tools,
   diffs,
-  list,
-  onJump,
   onOpenFile,
 }: {
   running: boolean;
   pulse: number;
-  steps: number;
-  tools: number;
   diffs: FileDiff[];
-  list: { id: string; label: string }[];
-  onJump?: (id: string) => void;
   onOpenFile?: (d: FileDiff) => void;
 }) {
-  if (!running && !tools && !diffs.length) return null;
+  if (!diffs.length) return null;
   const add = diffs.reduce((n, d) => n + (d.additions ?? 0), 0);
   const del = diffs.reduce((n, d) => n + (d.deletions ?? 0), 0);
   return (
@@ -4000,66 +4295,48 @@ function TurnSum({
             ✓
           </span>
         )}
-        <span>{running ? (steps ? `正在执行 · ${steps} 步` : "正在执行…") : `步骤 ${steps} / ${steps}`}</span>
-        {!!diffs.length && (
-          <span className="muted">
-            · {diffs.length} 个文件已修改
-            {(add > 0 || del > 0) && (
-              <>
-                {" "}
-                <span className="add">+{add}</span> <span className="del">-{del}</span>
-              </>
-            )}
-          </span>
-        )}
+        <span>
+          {diffs.length} 个文件已修改
+          {(add > 0 || del > 0) && (
+            <>
+              {" "}
+              <span className="add">+{add}</span> <span className="del">-{del}</span>
+            </>
+          )}
+        </span>
       </summary>
-      {!!list.length && (
-        <ol className="steplist">
-          {list.map((s, i) => (
-            <li key={s.id} className={running && i === list.length - 1 ? "now" : ""}>
-              <span className="no">{i + 1}</span>
-              <button className="tx" onClick={() => onJump?.(s.id)} title="跳到这条消息">
-                {s.label}
-              </button>
-              {running && i === list.length - 1 && <span className="pulse-dot" aria-hidden="true" />}
-            </li>
-          ))}
-        </ol>
-      )}
-      {!!diffs.length && (
-        <ul className="flist">
-          {diffs.map((d, i) => (
-            <li key={i}>
-              <button
-                className="flink"
-                onClick={() => onOpenFile?.(d)}
-                title={`${d.file} · 打开 diff`}
-              >
-                <span className={`fx ${d.status ?? "modified"}`}>
-                  {FSTATUS_CN[d.status ?? "modified"]}
-                </span>
-                <span className="fname">{baseName(d.file)}</span>
-                <span className="muted small">
-                  {d.additions ? `+${d.additions}` : ""}
-                  {d.deletions ? ` -${d.deletions}` : ""}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
+      <ul className="flist">
+        {diffs.map((d, i) => (
+          <li key={i}>
+            <button
+              className="flink"
+              onClick={() => onOpenFile?.(d)}
+              title={`${d.file} · 打开 diff`}
+            >
+              <span className={`fx ${d.status ?? "modified"}`}>
+                {FSTATUS_CN[d.status ?? "modified"]}
+              </span>
+              <span className="fname">{baseName(d.file)}</span>
+              <span className="muted small">
+                {d.additions ? `+${d.additions}` : ""}
+                {d.deletions ? ` -${d.deletions}` : ""}
+              </span>
+            </button>
+          </li>
+        ))}
+      </ul>
     </details>
   );
-}
+});
 
 const doneCount = (todos: Todo[]) =>
   todos.filter((t) => t.status === "completed" || t.status === "cancelled").length;
 
 /**
- * 轮末待办：与步骤胶囊分开，收在该轮最底部。跑着的时候不在这里出现，
+ * 轮末待办：收在该轮最底部。跑着的时候不在这里出现，
  * 由 TodoFly 悬浮展示；一轮结束后才落到这里，回看时按轮归档。
  */
-function TurnTodo({ todos }: { todos?: Todo[] }) {
+const TurnTodo = memo(function TurnTodo({ todos }: { todos?: Todo[] }) {
   if (!todos?.length) return null;
   const done = doneCount(todos);
   const all = done === todos.length;
@@ -4076,6 +4353,142 @@ function TurnTodo({ todos }: { todos?: Todo[] }) {
       <TodoRows todos={todos} />
     </details>
   );
+});
+
+type TurnRowData = { key: string; owner: string; user?: Message; assistants: Message[] };
+
+/** 一整轮只报一次用量：每步各报一遍会把头部撑成一列重复数字 */
+function turnUsage(msgs: Message[]): string {
+  const n = (x: unknown) => (typeof x === "number" && x > 0 ? x : 0);
+  let inp = 0;
+  let out = 0;
+  let reas = 0;
+  let cost = 0;
+  let ms = 0;
+  for (const m of msgs) {
+    const i = m.info;
+    const t = i.tokens ?? {};
+    inp += n(t.input);
+    out += n(t.output);
+    reas += n(t.reasoning);
+    cost += n(i.cost);
+    if (i.time.completed) ms += Math.max(0, i.time.completed - i.time.created);
+  }
+  const bits: string[] = [];
+  if (inp) bits.push(`输入 ${fmtNum(inp)}`);
+  if (out) bits.push(`输出 ${fmtNum(out)}`);
+  if (reas) bits.push(`思考 ${fmtNum(reas)}`);
+  if (cost) bits.push(`成本 ${fmtNum(cost, 4)}`);
+  if (ms >= 100) bits.push(fmtSpan(ms / 1000));
+  return bits.length > 1 ? bits.join(" · ") : "";
+}
+
+type TurnRowProps = {
+  user?: Message;
+  assistants: Message[];
+  running: boolean;
+  pulse: number;
+  stat?: TurnStat;
+  todo?: Todo[];
+  retry?: ReactNode;
+  onCopy: (t: string) => void;
+  onMenu: (e: ReactMouseEvent, m: Message) => void;
+  onOpenFile: (d: FileDiff) => void;
+  kidOf: (p: Part) => Message[] | undefined;
+};
+
+/** 一轮 = 一条用户消息 + 合并成一段的助手输出 + 轮末改动小结 */
+const TurnRow = memo(function TurnRow({
+  user,
+  assistants,
+  running,
+  pulse,
+  stat,
+  todo,
+  retry,
+  onCopy,
+  onMenu,
+  onOpenFile,
+  kidOf,
+}: TurnRowProps) {
+  const tail = assistants[assistants.length - 1];
+  const u = assistants.length ? turnUsage(assistants) : "";
+  return (
+    <>
+      {user && (
+        <article
+          id={`m-${user.info.id}`}
+          className="msg user"
+          onContextMenu={(e) => onMenu(e, user)}
+        >
+          <header>
+            <span>{label(user.info)}</span>
+          </header>
+          {user.parts.map((p) => (
+            <Block key={p.id} part={p} />
+          ))}
+        </article>
+      )}
+      {tail && (
+        <article className="msg assistant">
+          <header>
+            <span>{label(tail.info)}</span>
+            {u && (
+              <span className="umeta" title={u}>
+                {u}
+              </span>
+            )}
+          </header>
+          {assistants.map((m) =>
+            m.info.error ? (
+              <p className="error inline" key={m.info.id}>
+                {m.info.error.data?.message ?? m.info.error.name}
+                {m === tail && retry}
+              </p>
+            ) : null,
+          )}
+          <AssistantParts
+            assistants={assistants}
+            live={running}
+            onCopy={onCopy}
+            onMenu={onMenu}
+            kidOf={kidOf}
+          />
+        </article>
+      )}
+      {stat && (
+        <>
+          <TurnSum
+            running={running}
+            pulse={running ? pulse : 0}
+            diffs={stat.diffs}
+            onOpenFile={onOpenFile}
+          />
+          {!running && <TurnTodo todos={todo} />}
+        </>
+      )}
+    </>
+  );
+}, sameTurn);
+
+/** 流式输出时只有正在跑的那轮消息引用会变，历史轮靠引用比较整份跳过 */
+function sameTurn(a: TurnRowProps, b: TurnRowProps): boolean {
+  if (
+    a.user !== b.user ||
+    a.running !== b.running ||
+    a.pulse !== b.pulse ||
+    a.stat !== b.stat ||
+    a.todo !== b.todo ||
+    a.retry !== b.retry ||
+    a.onCopy !== b.onCopy ||
+    a.onMenu !== b.onMenu ||
+    a.onOpenFile !== b.onOpenFile ||
+    a.kidOf !== b.kidOf ||
+    a.assistants.length !== b.assistants.length
+  )
+    return false;
+  for (let i = 0; i < a.assistants.length; i++) if (a.assistants[i] !== b.assistants[i]) return false;
+  return true;
 }
 
 /** 运行中的悬浮清单：绝对定位在对话区右上角，不随消息滚走，可折叠 */
@@ -4083,6 +4496,7 @@ function TodoFly({ todos, pulse }: { todos: Todo[]; pulse: number }) {
   const [fold, setFold] = useState(false);
   if (!todos.length) return null;
   const done = doneCount(todos);
+  const pct = Math.round((done / todos.length) * 100);
   return (
     <aside className={`todofly ${fold ? "folded" : ""}`} aria-label="运行中的待办清单">
       <button
@@ -4095,14 +4509,30 @@ function TodoFly({ todos, pulse }: { todos: Todo[]; pulse: number }) {
         <span className="pulse-dot" key={pulse} aria-hidden="true" />
         <b>待办清单</b>
         <span className="tfprog">
-          {done}/{todos.length}
+          {done} / {todos.length}
         </span>
         <span className="grow" />
         <span className="tfchev" aria-hidden="true">
-          {fold ? "▸" : "▾"}
+          <svg viewBox="0 0 16 16">
+            <path
+              d={fold ? "M6 3.6l4.4 4.4L6 12.4" : "M3.6 6L8 10.4 12.4 6"}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
         </span>
       </button>
-      {!fold && <TodoRows todos={todos} />}
+      {!fold && (
+        <>
+          <div className="tfbar" aria-hidden="true">
+            <span style={{ width: `${pct}%` }} />
+          </div>
+          <TodoRows todos={todos} />
+        </>
+      )}
     </aside>
   );
 }
