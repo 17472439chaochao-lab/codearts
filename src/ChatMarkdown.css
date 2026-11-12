@@ -1,0 +1,253 @@
+.chat-markdown {
+  display: flow-root;
+  min-width: 0;
+  max-width: 100%;
+  /* 正文比标题淡一档：长回复里满屏纯黑会显得逼近，标题仍用 --fg 保持层级 */
+  color: var(--fg-3a3a3f);
+  font: inherit;
+  line-height: 1.75;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.chat-markdown *,
+.chat-markdown *::before,
+.chat-markdown *::after {
+  box-sizing: border-box;
+}
+
+.chat-markdown .chat-md-block {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chat-markdown .chat-md-stream {
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown .chat-md-block + .chat-md-block {
+  margin-top: 0.85em;
+}
+
+.chat-markdown :is(p, ul, ol, blockquote, pre, table) {
+  margin: 0.75em 0;
+}
+
+.chat-markdown .chat-md-block > :first-child {
+  margin-top: 0;
+}
+
+.chat-markdown .chat-md-block > :last-child {
+  margin-bottom: 0;
+}
+
+/* 模型的回答常用标题和加粗分点，字重再拉满整段就像加粗墙；标题靠字号和留白分层 */
+.chat-markdown :is(h1, h2, h3, h4, h5, h6) {
+  margin: 1.2em 0 0.5em;
+  color: var(--fg);
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.chat-markdown h1 { font-size: 1.38em; }
+.chat-markdown h2 { font-size: 1.22em; }
+.chat-markdown h3 { font-size: 1.08em; }
+.chat-markdown :is(h4, h5, h6) { font-size: 1em; }
+
+/* 模型几乎每个分点都用 **强调**；正文不再加粗，只靠深一档的颜色表示重点 */
+.chat-markdown strong {
+  font-weight: inherit;
+  color: var(--fg);
+}
+
+.chat-markdown a {
+  color: var(--fg);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+  cursor: pointer;
+}
+
+.chat-markdown :is(a, button, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent, var(--fg));
+  outline-offset: 3px;
+}
+
+.chat-markdown :is(ul, ol) {
+  padding-inline-start: 1.65em;
+}
+
+.chat-markdown li {
+  margin: 0.25em 0;
+  padding-inline-start: 0.15em;
+}
+
+.chat-markdown li :is(ul, ol) {
+  margin: 0.25em 0;
+}
+
+.chat-markdown li > p {
+  margin: 0.4em 0;
+}
+
+.chat-markdown input[type="checkbox"] {
+  display: inline-block;
+  width: 0.95em;
+  height: 0.95em;
+  margin: 0 0.4em 0 0;
+  padding: 0;
+  vertical-align: -0.05em;
+  accent-color: var(--accent, var(--fg));
+}
+
+.chat-markdown blockquote {
+  min-width: 0;
+  padding: 0.1em 0 0.1em 1em;
+  border-inline-start: 3px solid var(--line);
+  color: var(--muted);
+}
+
+.chat-markdown blockquote > :first-child { margin-top: 0; }
+.chat-markdown blockquote > :last-child { margin-bottom: 0; }
+
+.chat-markdown hr {
+  margin: 1.2em 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.chat-markdown code {
+  padding: 0.12em 0.35em;
+  border-radius: 4px;
+  background: var(--bg-f4f6fa);
+  color: var(--fg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+  white-space: break-spaces;
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown .chat-md-code {
+  min-width: 0;
+  max-width: 100%;
+  margin: 0.85em 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-f4f6fa);
+  color: var(--fg);
+}
+
+.chat-markdown .chat-md-code-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 8px 5px 12px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  user-select: none;
+}
+
+.chat-markdown .chat-md-language {
+  min-width: 0;
+  flex: 1;
+}
+
+.chat-markdown .chat-md-copy-status {
+  flex: none;
+}
+
+.chat-markdown .chat-md-copy {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 5px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.chat-markdown .chat-md-copy:hover {
+  border-color: var(--line);
+  background: var(--bg-ffffff);
+  color: var(--fg);
+}
+
+.chat-markdown .chat-md-copy:disabled {
+  cursor: wait;
+}
+
+.chat-markdown .chat-md-code pre {
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  padding: 12px 14px;
+  color: var(--fg);
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  tab-size: 4;
+}
+
+.chat-markdown .chat-md-code pre code {
+  display: block;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  white-space: inherit;
+  font-size: 0.9em;
+}
+
+.chat-markdown .chat-md-table {
+  min-width: 0;
+  max-width: 100%;
+  margin: 0.85em 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.chat-markdown .chat-md-table table {
+  width: 100%;
+  margin: 0;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.chat-markdown :is(th, td) {
+  min-width: 6em;
+  max-width: 30em;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown th {
+  background: var(--bg-f4f6fa);
+  font-weight: 600;
+}
+
+.chat-markdown .chat-md-align-left { text-align: left; }
+.chat-markdown .chat-md-align-center { text-align: center; }
+.chat-markdown .chat-md-align-right { text-align: right; }
+
+.chat-markdown .chat-md-link-error {
+  margin: 0.6em 0 0;
+  color: var(--muted);
+  font-size: 0.9em;
+}

@@ -40,7 +40,7 @@ export type KernelStatus = {
 };
 
 /** 系统标题栏已经沉浸掉了，标题由壳自己画在左上角 */
-export const APP_TITLE = "CodeArts Cli Desktop";
+export const APP_TITLE = "CodeArts CLI Desktop";
 
 /** 标题栏和关于页都要版本号，进程内取一次缓存住 */
 let appVersion: Promise<string | null> | null = null;
@@ -2224,7 +2224,7 @@ function About({ check, status }: { check: EnvCheck | null; status: KernelStatus
         </dd>
       </dl>
 
-      <p className="hint">CodeArts Cli 的桌面端。</p>
+      <p className="hint">CodeArts CLI 的桌面端。</p>
 
       <h3>技术栈</h3>
       <ul className="stack">

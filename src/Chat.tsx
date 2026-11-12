@@ -3,6 +3,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -55,6 +56,10 @@ import { FilePanel, FileViewer, QuickOpen, relInRoot, type OpenFile } from "./Fi
 import { BranchPicker, type GitState } from "./GitBranch";
 import { exportName, sessionMarkdown } from "./sessionExport";
 import { getNotifyPrefs } from "./notify";
+import { applyMessageEvents, MESSAGE_EVENTS, reconcileMessages, recordSnapshotEvent, type SnapshotChanges } from "./messageState";
+import { ChatMarkdown } from "./ChatMarkdown";
+import { ConversationWindow, useConversationExpansion } from "./ConversationWindow";
+import { readableToolOutput } from "./toolOutput";
 
 type Props = {
   projectDir: string;
@@ -275,7 +280,6 @@ const AGENT_DESC_CN: Record<string, string> = {
   explore: "只读探索代码和工作区，不做修改。",
 };
 
-const newMsg = (info: Message["info"]): Message => ({ info, parts: [] });
 
 /** 工作区路径可能带尾斜杠，内核返回的一定不带 */
 const sameDir = (a: string | null | undefined, b: string | null | undefined) =>
@@ -306,65 +310,6 @@ function expandSlash(text: string, cmds: CommandInfo[]): string {
   const args = m[2].trim();
   if (cmd.template.includes("$ARGUMENTS")) return cmd.template.replace(/\$ARGUMENTS/g, args);
   return args ? `${cmd.template}\n\n${args}` : cmd.template;
-}
-
-function upsertInfo(list: Message[], info: Message["info"]): Message[] {
-  const i = list.findIndex((m) => m.info.id === info.id);
-  if (i < 0) return [...list, newMsg(info)];
-  const merged = { ...list[i], info: { ...list[i].info, ...info } };
-  return [...list.slice(0, i), merged, ...list.slice(i + 1)];
-}
-
-function upsertPart(list: Message[], part: Part): Message[] {
-  let hit = false;
-  const next = list.map((m) => {
-    if (m.info.id !== part.messageID) return m;
-    hit = true;
-    const i = m.parts.findIndex((p) => p.id === part.id);
-    if (i < 0) return { ...m, parts: [...m.parts, part] };
-    const merged = { ...m.parts[i] } as Record<string, unknown>;
-    for (const [k, val] of Object.entries(part)) {
-      // 内核会把 text:"" 的空 part.updated 排在增量之后，不能让已渲染的正文被抹掉
-      if (val === "" && typeof merged[k] === "string" && merged[k]) continue;
-      merged[k] = val;
-    }
-    return { ...m, parts: [...m.parts.slice(0, i), merged, ...m.parts.slice(i + 1)] } as Message;
-  });
-  return hit ? next : list;
-}
-
-/**
- * 实测 26.9.26：`message.part.delta` = `{sessionID, messageID, partID, field:"text", delta}`，
- * `delta` 是**增量片段**（一轮 285 帧），part 由更早的 `part.updated`（text:""）建好，
- * 收尾再发一条带全文的 `part.updated`。
- */
-function appendDelta(list: Message[], p: Record<string, any>): Message[] {
-  const field = String(p.field ?? "text");
-  return list.map((m) => {
-    if (m.info.id !== p.messageID) return m;
-    const i = m.parts.findIndex((q) => q.id === p.partID);
-    if (i < 0) return m; // part 还没建，等它的 part.updated 再来
-    const cur = m.parts[i] as Record<string, unknown>;
-    const part = { ...cur, [field]: String(cur[field] ?? "") + String(p.delta ?? "") } as unknown as Part;
-    return { ...m, parts: [...m.parts.slice(0, i), part, ...m.parts.slice(i + 1)] };
-  });
-}
-
-/** 子会话回灌与早期 SSE 合并：快照补缺口，已流式更新的消息保留更多 parts 的一侧 */
-function mergeMessages(live: Message[], snap: Message[]): Message[] {
-  if (!live.length) return snap;
-  if (!snap.length) return live;
-  const liveMap = new Map(live.map((m) => [m.info.id, m]));
-  const merged = snap.map((m) => {
-    const cur = liveMap.get(m.info.id);
-    if (!cur) return m;
-    return cur.parts.length > m.parts.length ? cur : m;
-  });
-  const inSnap = new Set(snap.map((m) => m.info.id));
-  for (const m of live) {
-    if (!inSnap.has(m.info.id)) merged.push(m);
-  }
-  return merged;
 }
 
 export default function Chat({
@@ -467,6 +412,20 @@ export default function Chat({
   const thread = useRef<HTMLDivElement>(null);
   // 用户往上翻的时候不能再被拽回底部
   const stick = useRef(true);
+  const [following, setFollowing] = useState(true);
+  const scrollDirection = useRef<"up" | "down" | null>(null);
+  const content = useRef<HTMLDivElement>(null);
+  const followFrame = useRef(0);
+  const setFollow = useCallback((value: boolean) => {
+    stick.current = value;
+    setFollowing(value);
+  }, []);
+  const followLatest = useCallback(() => {
+    setFollow(true);
+    scrollDirection.current = null;
+    const el = thread.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [setFollow]);
   const sending = useRef(false);
   const [railHit, setRailHit] = useState<string | null>(null);
   const body = useRef<HTMLDivElement>(null);
@@ -498,6 +457,81 @@ export default function Chat({
    */
   const [kidMsgs, setKidMsgs] = useState<Record<string, Message[]>>({});
   const kidIds = useRef<Set<string>>(new Set());
+  const messageStore = useRef(new Map<string, Message[]>());
+  const messageEpoch = useRef(0);
+  const messageRequests = useRef(new Map<string, number>());
+  const messagePending = useRef(new Map<string, SnapshotChanges>());
+  const messageRepairs = useRef(new Map<string, { timer: number; run: () => void }>());
+  const messageSettled = useRef(new Map<string, (messages: Message[]) => void>());
+  const delayMessageRepair = useCallback((sid: string) => {
+    const repair = messageRepairs.current.get(sid);
+    if (!repair) return;
+    window.clearTimeout(repair.timer);
+    repair.timer = window.setTimeout(() => {
+      messageRepairs.current.delete(sid);
+      repair.run();
+    }, 200);
+  }, []);
+  const flushMessages = useRef(() => {});
+  const updateMessages = useCallback((sid: string, next: Message[]) => {
+    if (messageStore.current.get(sid) === next) return;
+    messageStore.current.set(sid, next);
+    if (sid === activeRef.current) setMsgs(next);
+    else setKidMsgs((prev) => ({ ...prev, [sid]: next }));
+  }, []);
+  const readMessages = useCallback(async (sid: string, directory: string, settled?: (messages: Message[]) => void): Promise<Message[] | undefined> => {
+    flushMessages.current();
+    window.clearTimeout(messageRepairs.current.get(sid)?.timer);
+    messageRepairs.current.delete(sid);
+    if (settled) messageSettled.current.set(sid, settled);
+    const epoch = messageEpoch.current;
+    const request = (messageRequests.current.get(sid) ?? 0) + 1;
+    messageRequests.current.set(sid, request);
+    const baseline = messageStore.current.get(sid) ?? [];
+    const changes: SnapshotChanges = { dirty: false, messages: new Set(), parts: new Set() };
+    messagePending.current.set(sid, changes);
+    let snapshot: Message[];
+    try {
+      snapshot = await sessions.messages(sid, directory);
+    } finally {
+      if (messagePending.current.get(sid) === changes) messagePending.current.delete(sid);
+    }
+    if (epoch !== messageEpoch.current || request !== messageRequests.current.get(sid)) return;
+    flushMessages.current();
+    const next = reconcileMessages(messageStore.current.get(sid) ?? [], snapshot, baseline, changes);
+    updateMessages(sid, next);
+    if (changes.dirty) {
+      // HTTP 快照与 SSE 没有共同序号；等输出间隙再取权威快照，不按文字猜测重叠部分。
+      messageRepairs.current.set(sid, { timer: 0, run: () => { void readMessages(sid, directory).catch(() => {}); } });
+      delayMessageRepair(sid);
+      return;
+    }
+    const onSettled = messageSettled.current.get(sid);
+    messageSettled.current.delete(sid);
+    onSettled?.(next);
+    return next;
+  }, [updateMessages, delayMessageRepair]);
+  useLayoutEffect(() => {
+    messageEpoch.current++;
+    messageStore.current.clear();
+    messageRequests.current.clear();
+    messagePending.current.clear();
+    messageSettled.current.clear();
+    for (const repair of messageRepairs.current.values()) window.clearTimeout(repair.timer);
+    messageRepairs.current.clear();
+    kidIds.current.clear();
+    setMsgs([]);
+    setKidMsgs({});
+    setTurnTodos({});
+    setTodos([]);
+    return () => {
+      messageEpoch.current++;
+      for (const repair of messageRepairs.current.values()) window.clearTimeout(repair.timer);
+      messageRepairs.current.clear();
+      messagePending.current.clear();
+      messageSettled.current.clear();
+    };
+  }, [active, live]);
   /** 会话级待办清单（内核每次 todowrite 整体覆盖）：最后一轮胶囊的兜底数据 */
   const [todos, setTodos] = useState<Todo[]>([]);
   /**
@@ -890,27 +924,20 @@ export default function Chat({
     setKidMsgs({});
     if (!active || !live) return;
     const parent = active;
+    const epoch = messageEpoch.current;
     sessions
       .children(parent, wsOf ?? dir)
       .then((ks) => {
-        if (activeRef.current !== parent) return;
+        if (activeRef.current !== parent || messageEpoch.current !== epoch) return;
         setKids(ks);
         for (const k of ks) {
           kidIds.current.add(k.id);
           const kid = k.id;
-          sessions
-            .messages(kid, k.directory ?? wsOf ?? dir)
-            .then((ms) =>
-              setKidMsgs((prev) => {
-                if (activeRef.current !== parent) return prev;
-                return { ...prev, [kid]: mergeMessages(prev[kid] ?? [], ms) };
-              }),
-            )
-            .catch(() => {});
+          void readMessages(kid, k.directory ?? wsOf ?? dir).catch(() => {});
         }
       })
       .catch(() => {
-        if (activeRef.current === parent) setKids([]);
+        if (activeRef.current === parent && messageEpoch.current === epoch) setKids([]);
       });
   }, [active, wsOf, dir, live]);
 
@@ -935,11 +962,7 @@ export default function Chat({
     let alive = true;
     setErr(null);
     setToast(null);
-    sessions
-      .messages(sid, wsOf ?? dir)
-      .then((ms) => {
-        if (alive && activeRef.current === sid) setMsgs(ms);
-      })
+    readMessages(sid, wsOf ?? dir)
       .catch((e) => {
         if (alive && activeRef.current === sid) setErr(String(e));
       });
@@ -1031,6 +1054,7 @@ export default function Chat({
     reloadList();
     reloadPending();
     const sid = activeRef.current;
+    const epoch = messageEpoch.current;
     const d = wsOfRef.current ?? dirRef.current;
     // 运行态也按目录分实例，后台会话在别的区，逐个区取回来才能拼出完整的忙集合
     const ws = projects.length ? projects : [dirRef.current];
@@ -1058,12 +1082,7 @@ export default function Chat({
       })
       .catch(() => {});
     if (!sid) return;
-    sessions
-      .messages(sid, d)
-      .then((ms) => {
-        if (activeRef.current === sid) setMsgs(ms);
-      })
-      .catch(() => {});
+    void readMessages(sid, d).catch(() => {});
     sessions
       .todos(sid, d)
       .then((ts) => {
@@ -1082,20 +1101,12 @@ export default function Chat({
     sessions
       .children(sid, d)
       .then((ks) => {
-        if (activeRef.current !== sid) return;
+        if (activeRef.current !== sid || messageEpoch.current !== epoch) return;
         setKids(ks);
         for (const k of ks) {
           kidIds.current.add(k.id);
           const kid = k.id;
-          sessions
-            .messages(kid, k.directory ?? d)
-            .then((ms) =>
-              setKidMsgs((prev) => {
-                if (activeRef.current !== sid) return prev;
-                return { ...prev, [kid]: mergeMessages(prev[kid] ?? [], ms) };
-              }),
-            )
-            .catch(() => {});
+          void readMessages(kid, k.directory ?? d).catch(() => {});
         }
       })
       .catch(() => {});
@@ -1163,47 +1174,37 @@ export default function Chat({
   persistPlanRef.current = persistPlan;
 
   useEffect(() => {
-    /** 帧属于当前会话就进主时间线，属于它派出的子会话就进那张 task 卡 */
-    const merge = (sid: string, fn: (m: Message[]) => Message[]) => {
-      if (sid === activeRef.current) setMsgs(fn);
-      else setKidMsgs((prev) => ({ ...prev, [sid]: fn(prev[sid] ?? []) }));
-    };
-    /**
-     * 增量按 ~30fps 合并。以前是每帧一次，长会话里每个 token 都要把整棵时间线走一遍，
-     * 反而把主线程占满；合并后视觉上仍然连贯，重渲染次数降到三分之一。
-     */
-    const deltaQ: { sid: string; p: Record<string, unknown> }[] = [];
-    let deltaTimer = 0;
-    const flushDeltas = () => {
-      if (deltaTimer) {
-        window.clearTimeout(deltaTimer);
-        deltaTimer = 0;
+    const queue: { sid: string; event: KernelEvent; epoch: number }[] = [];
+    let timer = 0;
+    const flush = () => {
+      window.clearTimeout(timer);
+      timer = 0;
+      const bySid = new Map<string, KernelEvent[]>();
+      for (const item of queue.splice(0)) {
+        if (item.epoch !== messageEpoch.current) continue;
+        const events = bySid.get(item.sid) ?? [];
+        events.push(item.event);
+        bySid.set(item.sid, events);
       }
-      if (!deltaQ.length) return;
-      const batch = deltaQ.splice(0, deltaQ.length);
-      const bySid = new Map<string, typeof batch>();
-      for (const item of batch) {
-        const list = bySid.get(item.sid);
-        if (list) list.push(item);
-        else bySid.set(item.sid, [item]);
-      }
-      for (const [sid, items] of bySid) {
-        merge(sid, (m) => {
-          let next = m;
-          for (const { p } of items) next = appendDelta(next, p);
-          return next;
-        });
+      for (const [sid, events] of bySid) {
+        updateMessages(sid, applyMessageEvents(messageStore.current.get(sid) ?? [], events));
       }
     };
+    flushMessages.current = flush;
     const stop = listen<KernelEvent>("kernel-event", ({ payload: ev }) => {
       const p = ev.properties ?? {};
-      const sid = String(p.sessionID ?? "");
+      const sid = String(p.sessionID ?? p.part?.sessionID ?? p.info?.sessionID ?? "");
       const cur = activeRef.current;
       const mine = sid === cur || kidIds.current.has(sid);
+      // 全量与增量必须共用有序队列，不能让延迟的 delta 跑到最终快照后面。
+      if (mine && MESSAGE_EVENTS.has(ev.type)) {
+        const pending = messagePending.current.get(sid);
+        if (pending) recordSnapshotEvent(pending, ev);
+        delayMessageRepair(sid);
+        queue.push({ sid, event: ev, epoch: messageEpoch.current });
+        if (!timer) timer = window.setTimeout(flush, 50);
+      }
       switch (ev.type) {
-        case "message.updated":
-          if (mine && p.info) merge(sid, (m) => upsertInfo(m, p.info));
-          break;
         case "message.part.updated": {
           if (!p.part) break;
           // task 的正文里带着它派出去的那个子会话 id，见到就先登记，别等 children 接口
@@ -1225,23 +1226,8 @@ export default function Chat({
             planSwitch.current = p.part.id;
             chooseAgent("build");
           }
-          if (mine) merge(sid, (m) => upsertPart(m, p.part));
           break;
         }
-        case "message.part.removed":
-          if (mine)
-            merge(sid, (m) => m.map((x) => ({ ...x, parts: x.parts.filter((q) => q.id !== p.partID) })));
-          break;
-        case "message.part.delta":
-          if (mine) {
-            deltaQ.push({ sid, p });
-            if (!deltaTimer) deltaTimer = window.setTimeout(flushDeltas, 33);
-          }
-          break;
-        // 整条消息被撤（undo/revert）：不删的话撤回的消息钉在时间线里，重开又没了
-        case "message.removed":
-          if (mine && p.messageID) merge(sid, (m) => m.filter((x) => x.info.id !== p.messageID));
-          break;
         // 子会话在 task 工具执行时才创建，不登记上就永远收不到它后面任何一帧；
         // 顶层新会话（别的窗口/CLI 建的）列表要跟着长出来
         case "session.created": {
@@ -1263,6 +1249,15 @@ export default function Chat({
         case "session.deleted": {
           const gone = String(p.sessionID ?? (p.info as Session | undefined)?.id ?? "");
           if (!gone) break;
+          for (let i = queue.length - 1; i >= 0; i--) {
+            if (queue[i].sid === gone) queue.splice(i, 1);
+          }
+          messageRequests.current.delete(gone);
+          messagePending.current.delete(gone);
+          messageSettled.current.delete(gone);
+          window.clearTimeout(messageRepairs.current.get(gone)?.timer);
+          messageRepairs.current.delete(gone);
+          messageStore.current.delete(gone);
           kidIds.current.delete(gone);
           runSeen.current.delete(gone);
           setKids((ks) => ks.filter((k) => k.id !== gone));
@@ -1285,6 +1280,7 @@ export default function Chat({
         }
         case "session.status": {
           const st = String(p.status?.type ?? "");
+          if (st === "idle") flush();
           if (sid) {
             const wasRunning = runSeen.current.delete(sid);
             if (st && st !== "idle") runSeen.current.add(sid);
@@ -1311,10 +1307,7 @@ export default function Chat({
           break;
         }
         case "session.idle":
-          // 丢掉未刷的增量，避免 idle 全量替换后再叠一帧旧 delta
-          for (let i = deltaQ.length - 1; i >= 0; i--) {
-            if (deltaQ[i].sid === sid) deltaQ.splice(i, 1);
-          }
+          flush();
           setBusySet((s) => {
             if (!s.has(sid)) return s;
             const next = new Set(s);
@@ -1325,14 +1318,9 @@ export default function Chat({
           // 轮次收尾时内核才把 summary.diffs 写进用户消息，重拉一次才有每轮改动
           if (sid === cur) {
             const want = sid;
-            sessions
-              .messages(want, wsOfRef.current ?? dirRef.current)
-              .then((ms) => {
-                if (activeRef.current === want) setMsgs(ms);
-                // 规划轮的正文内核不落盘，收尾时代它存一份，资源管理器才有「计划」
-                void persistPlanRef.current(want, ms);
-              })
-              .catch(() => {});
+            void readMessages(want, wsOfRef.current ?? dirRef.current, (ms) => {
+              void persistPlanRef.current(want, ms);
+            }).catch(() => {});
             reloadDiffsRef.current();
           }
           // 当前会话也要提醒：窗口在后台时人根本看不到它跑完了。
@@ -1340,6 +1328,7 @@ export default function Chat({
           if (sid && runSeen.current.delete(sid)) void notifyRef.current(sid);
           break;
         case "session.error":
+          flush();
           if (sid === cur) {
             setErr(p.error?.data?.message ?? p.error?.name ?? "内核返回错误");
           }
@@ -1414,8 +1403,9 @@ export default function Chat({
       }
     });
     return () => {
-      if (deltaTimer) window.clearTimeout(deltaTimer);
-      if (deltaQ.length) flushDeltas();
+      window.clearTimeout(timer);
+      queue.length = 0;
+      flushMessages.current = () => {};
       stop.then((f) => f());
     };
   }, []);
@@ -1451,7 +1441,13 @@ export default function Chat({
 
   const onScroll = () => {
     const el = thread.current;
-    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (el) {
+      const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+      // 触控板轻扫会先产生几像素的位移；离开底部一段距离才暂停跟随，避免提示频繁闪现。
+      if (gap <= 2) setFollow(true);
+      else if (scrollDirection.current === "up" && gap > 80) setFollow(false);
+    }
+    scrollDirection.current = null;
     flashBar();
   };
 
@@ -1464,6 +1460,7 @@ export default function Chat({
     const h = th.offsetHeight;
     const max = el.scrollHeight - el.clientHeight;
     if (max <= 2 || track <= h) return;
+    setFollow(false);
     e.preventDefault();
     wrap.setPointerCapture(e.pointerId);
     const box = wrap.getBoundingClientRect();
@@ -1502,23 +1499,41 @@ export default function Chat({
     };
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = thread.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [msgs, kidMsgs]);
+  }, [msgs, kidMsgs, busy]);
 
   useEffect(() => {
-    stick.current = true;
+    const el = thread.current;
+    const inner = content.current;
+    if (!el || !inner) return;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(followFrame.current);
+      followFrame.current = requestAnimationFrame(() => {
+        if (stick.current) el.scrollTop = el.scrollHeight;
+        syncBar();
+      });
+    });
+    observer.observe(inner);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(followFrame.current);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    followLatest();
     setRailHit(null);
     setTip(null);
-    const el = thread.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [active]);
+  }, [active, followLatest]);
 
   const jumpTo = useCallback((id: string) => {
+    setFollow(false);
     setRailHit(id);
-    document.getElementById(`m-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, []);
+    document.getElementById(`m-${id}`)?.scrollIntoView({ behavior: "instant", block: "start" });
+  }, [setFollow]);
 
   /** 悬浮预览：跟随刻度条的位置，用 absolute 挂在 .body 上，不受滚动容器裁剪 */
   function showTip(el: HTMLElement, text: string) {
@@ -1708,7 +1723,7 @@ export default function Chat({
       runSeen.current.add(id);
       try {
         await sessions.prompt(id, parts, target, model, agent);
-        stick.current = true;
+        setFollow(true);
       } catch (e) {
         runSeen.current.delete(id);
         setBusySet((s) => {
@@ -1742,7 +1757,7 @@ export default function Chat({
     runSeen.current.add(id);
     try {
       await sessions.prompt(id, retryParts, dirOf(id), model, agent);
-      stick.current = true;
+      setFollow(true);
     } catch (e) {
       runSeen.current.delete(id);
       setBusySet((s) => {
@@ -1922,7 +1937,7 @@ export default function Chat({
     setErr(null);
     try {
       await sessions.init(id, model, anchor, dirOf(id));
-      stick.current = true;
+      setFollow(true);
       resync();
     } catch (e) {
       setErr(String(e));
@@ -1971,7 +1986,7 @@ export default function Chat({
         reloadList();
       }
       await sessions.shell(id, agent ?? "build", command, dirOf(id));
-      stick.current = true;
+      setFollow(true);
       resync();
     } catch (e) {
       setErr(String(e));
@@ -2072,7 +2087,7 @@ export default function Chat({
   const ofWs = (p: string) => wsItems.get(p) ?? [];
   /** 会话级汇总只在消息数组变化时重算：悬停、待办刷新等无关渲染不必再扫一遍 */
   const { turns, spend, toolCalls } = useMemo(() => {
-    const turns = msgs.filter((m) => m.info.role === "user");
+    const turns = msgs.filter((m) => m.info.role === "user" && m.info.time.created > 0);
     /** 本会话累计用量：token / 缓存 / 耗时都按助手消息累加，挂在会话末尾 */
     const spend = msgs.reduce(
       (acc, m) => {
@@ -2099,6 +2114,7 @@ export default function Chat({
   const turnRows = useMemo(() => {
     const rows: TurnRowData[] = [];
     for (const m of msgs) {
+      if (m.info.time.created === 0) continue;
       if (m.info.role === "user") {
         rows.push({ key: m.info.id, owner: m.info.id, user: m, assistants: [] });
         continue;
@@ -2668,7 +2684,19 @@ export default function Chat({
         )}
 
         <div className={`body ${turns.length > 1 ? "hasrail" : ""}`} ref={body}>
-          <section className="thread" ref={thread} onScroll={onScroll}>
+          <section className="thread" ref={thread} onScroll={onScroll} tabIndex={0} aria-label="会话消息"
+            onWheel={(e) => {
+              scrollDirection.current = e.deltaY < 0 ? "up" : "down";
+            }}
+            onKeyDown={(e) => {
+              if (e.target instanceof HTMLElement && e.target.closest("input, textarea, button, summary, a")) return;
+              if (["ArrowUp", "PageUp", "Home"].includes(e.key) || (e.key === " " && e.shiftKey)) {
+                scrollDirection.current = "up";
+              } else if (["ArrowDown", "PageDown", "End", " "].includes(e.key)) {
+                scrollDirection.current = "down";
+              }
+            }}>
+            <div className="thread-content" ref={content}>
             {!!kids.length && (
               <details className="fold kids">
                 <summary>
@@ -2705,8 +2733,8 @@ export default function Chat({
                 : undefined;
               const tail = row.assistants[row.assistants.length - 1];
               return (
+                <ConversationWindow key={`${active}:${row.key}`} id={row.key} eager={last} estimate={estimateTurnHeight(row)} root={thread} following={stick}>
                 <TurnRow
-                  key={row.key}
                   user={row.user}
                   assistants={row.assistants}
                   running={turnRunning}
@@ -2719,6 +2747,7 @@ export default function Chat({
                   onOpenFile={openDiffFile}
                   kidOf={kidOf}
                 />
+                </ConversationWindow>
               );
             })}
             {busy && (
@@ -2750,7 +2779,14 @@ export default function Chat({
                 </p>
               </div>
             )}
+            </div>
           </section>
+          {!following && !!msgs.length && (
+            <button className="jump-latest" onClick={followLatest} title="回到最新消息并继续跟随输出">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10m-4-4 4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+              回到最新
+            </button>
+          )}
 
           {busy && openTodos && <TodoFly todos={todos} pulse={editPulse} />}
 
@@ -3459,12 +3495,14 @@ function BusyHint({
   );
 }
 
-const Block = memo(function Block({ part }: { part: Part }) {
+const Block = memo(function Block({ part, assistant = false, streaming = false }: { part: Part; assistant?: boolean; streaming?: boolean }) {
   switch (part.type) {
     case "text":
       // 内核会往用户消息里塞 synthetic 文本（如语言提示），不属于对话内容
       if ((part as any).synthetic || part.metadata?.synthetic) return null;
-      return <pre className="text">{part.text}</pre>;
+      return assistant
+        ? <ChatMarkdown text={part.text ?? ""} streaming={streaming} />
+        : <pre className="text">{part.text}</pre>;
     case "file": {
       const url = String(part.url ?? "");
       const name = part.filename ?? "图片附件";
@@ -3571,7 +3609,7 @@ function flattenParts(assistants: Message[]): FlatUnit[] {
     }
   }
   if (!items.length) return parts;
-  const card: FlatUnit = { t: "run", key: `run:${items[0].p.id}`, items, ids };
+  const card: FlatUnit = { t: "run", key: "execution", items, ids };
   return [...parts.slice(0, cardAt), card, ...parts.slice(cardAt)];
 }
 
@@ -3584,7 +3622,6 @@ function AssistantParts({
   kidOf,
 }: {
   assistants: Message[];
-  /** 这一轮还在跑：卡片保持展开，别在两步之间闪一下 */
   live: boolean;
   onCopy: (t: string) => void;
   onMenu: (e: ReactMouseEvent, m: Message) => void;
@@ -3601,7 +3638,7 @@ function AssistantParts({
             <ToolRun items={u.items} live={live} onCopy={onCopy} onMenu={onMenu} kidOf={kidOf} />
           ) : (
             <div className="unit" onContextMenu={(e) => onMenu(e, u.m)}>
-              <Block part={u.p} />
+              <Block part={u.p} assistant streaming={live && !u.m.info.time.completed && !u.p.time?.end} />
             </div>
           )}
         </Fragment>
@@ -3807,16 +3844,14 @@ function toolHead(part: Part): string {
   return text.length > 90 ? `${text.slice(0, 90)}…` : text;
 }
 
-/**
- * 内核的 `output` 外面套了 `<path>/<type>/<content>` 这类给模型看的包装，
- * `metadata.preview` 才是同一份内容的人读版，直接摊 output 会满屏标签。
- */
+// preview 可能截断，展开详情优先使用完整 output，并剥离内核给模型看的包装。
 function toolResult(part: Part): { text: string; truncated: boolean } {
   const s = part.state as any;
   const meta = s?.metadata ?? {};
   const preview = typeof meta.preview === "string" ? meta.preview : "";
+  const output = readableToolOutput(String(s?.output ?? ""));
   return {
-    text: preview.trim() ? preview : String(s?.output ?? ""),
+    text: output.trim() ? output : preview,
     truncated: !!meta.truncated,
   };
 }
@@ -3846,7 +3881,7 @@ function ToolBody({
     tool === "todowrite"
       ? (args?.todos as Todo[] | undefined)
       : tool === "todoread"
-        ? parseTodos((s as any)?.output)
+        ? parseTodos(readableToolOutput(String((s as any)?.output ?? "")))
         : undefined;
   return (
     <>
@@ -3977,8 +4012,7 @@ function RunIcon({ status }: { status: string }) {
   );
 }
 
-/** 一步工具：收起时一行，展开看完整命令/输出；跑着的那步行默认摊开 */
-function ToolRow({
+const ToolRow = memo(function ToolRow({
   part,
   onCopy,
   kid,
@@ -3988,12 +4022,11 @@ function ToolRow({
   kid?: Message[];
 }) {
   const status = part.state?.status ?? "pending";
-  const [manual, setManual] = useState<boolean | null>(null);
-  const open = manual ?? (status === "running" || status === "pending");
+  const [open, setOpen] = useConversationExpansion(part.id);
   const { text, mono } = runPreview(part);
   return (
     <details className="tgr" open={open}>
-      <summary onClick={() => setManual(!open)}>
+      <summary onClick={(e) => { e.preventDefault(); setOpen(!open); }} aria-expanded={open}>
         <RunIcon status={status} />
         <span className="tglabel">{TOOL_CN[toolView(part).tool] ?? "工具"}</span>
         <span className={`tgverb tg-${status}`}>{runVerb(part, status)}</span>
@@ -4008,38 +4041,32 @@ function ToolRow({
           </>
         )}
       </summary>
-      <div className="tgbody">
+      {open && <div className="tgbody">
         <ToolBody part={part} onCopy={onCopy} kid={kid} />
-      </div>
+      </div>}
     </details>
   );
-}
+});
 
-/** 思考也是一行：预览随流式输出刷新，想看全文再展开 */
-function ReasoningRow({ part }: { part: Part }) {
-  const [manual, setManual] = useState<boolean | null>(null);
-  const open = manual ?? false;
+const ReasoningRow = memo(function ReasoningRow({ part }: { part: Part }) {
+  const [open, setOpen] = useConversationExpansion(part.id);
   const preview = String(part.text ?? "").replace(/\s+/g, " ").trim();
   return (
     <details className="tgr" open={open}>
-      <summary onClick={() => setManual(!open)}>
+      <summary onClick={(e) => { e.preventDefault(); setOpen(!open); }} aria-expanded={open}>
         <RunIcon status="completed" />
         <span className="tglabel">已思考</span>
         <span className="tgpreview" title={preview}>
           {preview}
         </span>
       </summary>
-      <div className="tgbody">
+      {open && <div className="tgbody">
         <pre className="text muted scroll">{part.text}</pre>
-      </div>
+      </div>}
     </details>
   );
-}
+});
 
-/**
- * 一轮里连续的思考和工具合成一张卡：标题只报次数，执行中自动摊开，
- * 跑完收起；用户手动开合过就以他为准。单步细节仍按行展开。
- */
 function ToolRun({
   items,
   live,
@@ -4058,11 +4085,12 @@ function ToolRun({
     const s = i.p.type === "tool" ? i.p.state?.status : undefined;
     return s === "running" || s === "pending";
   });
-  const [manual, setManual] = useState<boolean | null>(null);
-  const open = manual ?? (running || live);
+  const [open, setOpen] = useConversationExpansion("execution");
+  const latest = [...items].reverse().find((item) => item.p.type === "tool");
+  const activity = latest ? `${TOOL_CN[toolView(latest.p).tool] ?? "工具"} · ${runPreview(latest.p).text}` : "思考中";
   return (
     <details className="toolrun" open={open}>
-      <summary onClick={() => setManual(!open)}>
+      <summary onClick={(e) => { e.preventDefault(); setOpen(!open); }} aria-expanded={open}>
         <span className="tgchev" aria-hidden="true">
           <svg viewBox="0 0 16 16">
             <path
@@ -4076,9 +4104,10 @@ function ToolRun({
           </svg>
         </span>
         <span className="tgtitle">{tools ? `执行工具 ${tools} 次` : "已思考"}</span>
-        {running && <span className="pulse" aria-hidden="true" />}
+        {(live || running) && <span className="tgactivity" title={activity}>{activity}</span>}
+        <span className={`tgstate ${live || running ? "tg-active" : ""}`}>{live || running ? "进行中" : "已结束"}</span>
       </summary>
-      <ol className="tglist">
+      {open && <ol className="tglist">
         {items.map(({ p, m }) => (
           <li
             key={p.id}
@@ -4092,7 +4121,7 @@ function ToolRun({
             )}
           </li>
         ))}
-      </ol>
+      </ol>}
     </details>
   );
 }
@@ -4357,6 +4386,21 @@ const TurnTodo = memo(function TurnTodo({ todos }: { todos?: Todo[] }) {
 
 type TurnRowData = { key: string; owner: string; user?: Message; assistants: Message[] };
 
+function estimateTurnHeight(row: TurnRowData): number {
+  let chars = 0;
+  let blocks = 0;
+  let tools = 0;
+  for (const m of [row.user, ...row.assistants]) {
+    if (!m) continue;
+    for (const p of m.parts) {
+      blocks++;
+      if (p.type === "tool") tools++;
+      if (p.type === "text" || p.type === "reasoning") chars += p.text?.length ?? 0;
+    }
+  }
+  return Math.max(180, Math.min(12000, 120 + chars * 0.5 + tools * 46 + blocks * 10));
+}
+
 /** 一整轮只报一次用量：每步各报一遍会把头部撑成一列重复数字 */
 function turnUsage(msgs: Message[]): string {
   const n = (x: unknown) => (typeof x === "number" && x > 0 ? x : 0);
@@ -4417,7 +4461,6 @@ const TurnRow = memo(function TurnRow({
     <>
       {user && (
         <article
-          id={`m-${user.info.id}`}
           className="msg user"
           onContextMenu={(e) => onMenu(e, user)}
         >

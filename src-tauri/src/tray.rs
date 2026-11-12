@@ -16,11 +16,11 @@ const ITEM_QUIT: &str = "quit";
 /// 装托盘图标。菜单只有两项：把窗口要回来，或者真正退出（退出才收内核）。
 pub fn init(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, ITEM_SHOW, "显示主窗口", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, ITEM_QUIT, "退出 CodeArts Cli Desktop", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, ITEM_QUIT, "退出 CodeArts CLI Desktop", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip("CodeArts Cli Desktop")
+        .tooltip("CodeArts CLI Desktop")
         .menu(&menu)
         // 左键直接亮窗口，右键才出菜单：托盘常驻状态下这是最省事的分工
         .show_menu_on_left_click(false)

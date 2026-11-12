@@ -297,6 +297,8 @@ pub fn run() {
             files::files_list,
             files::file_read,
             files::file_restore,
+            files::file_write,
+            files::plan_write,
             files::plans_list,
             files::plan_read,
             files::plan_save,

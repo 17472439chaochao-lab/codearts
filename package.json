@@ -1,13 +1,15 @@
 {
   "name": "codearts-desktop",
   "private": true,
-  "version": "0.1.5",
+  "version": "0.1.6",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "test": "node --test src/messageState.test.mjs src/toolOutput.test.mjs",
+    "test:ui": "node tests/run-ui.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

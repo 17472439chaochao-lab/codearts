@@ -482,6 +482,41 @@ export function restoreFile(rel: string, content: string | null, dir?: string | 
   return invoke<string>("file_restore", { rel, content, directory: dir ?? null });
 }
 
+export type FileSaved = { size: number; mtime: number };
+
+/** 编辑器保存；expectedMtime 用来发现别处改动，force 表示用户确认覆盖 */
+export function saveFile(
+  rel: string,
+  content: string,
+  expectedMtime: number | null,
+  dir?: string | null,
+  force = false,
+) {
+  return invoke<FileSaved>("file_write", {
+    rel,
+    content,
+    expectedMtime,
+    force,
+    directory: dir ?? null,
+  });
+}
+
+export function savePlan(
+  path: string,
+  content: string,
+  expectedMtime: number | null,
+  dir?: string | null,
+  force = false,
+) {
+  return invoke<FileSaved>("plan_write", {
+    path,
+    content,
+    expectedMtime,
+    force,
+    directory: dir ?? null,
+  });
+}
+
 /** 会话导出：path 必须是保存对话框给出的绝对路径 */
 export function exportMarkdown(path: string, content: string) {
   return invoke<string>("export_write", { path, content });

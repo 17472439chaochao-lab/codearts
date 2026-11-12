@@ -69,6 +69,8 @@ pub struct FileList {
 pub struct FileContent {
     /// 二进制与图片为 None；GBK 等非 UTF-8 文本会转成 UTF-8 后返回
     content: Option<String>,
+    /// 原文是不是 UTF-8；非 UTF-8 只读，避免保存时静默改掉文件编码
+    utf8: bool,
     binary: bool,
     truncated: bool,
     size: u64,
@@ -77,6 +79,13 @@ pub struct FileContent {
     data_url: Option<String>,
     /// 文件头认出来的图片类型。体积超限时 data_url 为空但这里仍有值，界面据此说清原因
     mime: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSaved {
+    size: u64,
+    mtime: u64,
 }
 
 #[derive(Serialize)]
@@ -372,7 +381,7 @@ fn walk_plans(
     }
 }
 
-fn read_plan(roots: &[PlanRoot], path: &str) -> Result<FileContent> {
+fn plan_target(roots: &[PlanRoot], path: &str) -> Result<PathBuf> {
     let target = PathBuf::from(path).canonicalize().msg("计划文件不存在")?;
     if target.extension().and_then(|e| e.to_str()) != Some("md") {
         return Err(Error::Msg("计划文件必须是 Markdown".into()));
@@ -385,7 +394,11 @@ fn read_plan(roots: &[PlanRoot], path: &str) -> Result<FileContent> {
     if !inside {
         return Err(Error::Msg("不属于计划目录".into()));
     }
-    read_at(&target)
+    Ok(target)
+}
+
+fn read_plan(roots: &[PlanRoot], path: &str) -> Result<FileContent> {
+    read_at(&plan_target(roots, path)?)
 }
 
 /// 壳子代内核写计划用哪个目录：跟 `plan_roots` 认的两个内核落盘根保持一致，
@@ -563,6 +576,86 @@ pub fn file_restore(
     restore(&root, &rel, content.as_deref())
 }
 
+/// 编辑器的保存：以读到的 mtime 判断磁盘是否被别处改过。
+/// 冲突不直接覆盖，交给前端让用户选「覆盖保存」还是「重新加载」。
+#[tauri::command]
+pub fn file_write(
+    app: tauri::AppHandle,
+    rel: String,
+    content: String,
+    expected_mtime: Option<u64>,
+    force: Option<bool>,
+    directory: Option<String>,
+) -> Result<FileSaved> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
+    let target = resolve_write(&root, &rel)?;
+    write_text(&target, &content, expected_mtime, force.unwrap_or(false))
+}
+
+#[tauri::command]
+pub fn plan_write(
+    app: tauri::AppHandle,
+    path: String,
+    content: String,
+    expected_mtime: Option<u64>,
+    force: Option<bool>,
+    directory: Option<String>,
+) -> Result<FileSaved> {
+    let settings = Settings::load(&app)?;
+    let root = workspace_root(&settings, directory.as_deref())?;
+    let target = plan_target(&plan_roots(&settings, Some(&root)), &path)?;
+    write_text(&target, &content, expected_mtime, force.unwrap_or(false))
+}
+
+const SAVE_CONFLICT: &str = "file-conflict";
+
+fn write_text(
+    target: &Path,
+    content: &str,
+    expected_mtime: Option<u64>,
+    force: bool,
+) -> Result<FileSaved> {
+    if content.len() > MAX_TEXT_BYTES {
+        return Err(Error::Msg(format!(
+            "文件 {} MB，超过 {} MB 的编辑上限",
+            content.len() / 1024 / 1024,
+            MAX_TEXT_BYTES / 1024 / 1024
+        )));
+    }
+    let md = std::fs::metadata(target).msg("文件不存在")?;
+    if !md.is_file() {
+        return Err(Error::Msg("只能保存普通文件".into()));
+    }
+    let mut probe = Vec::new();
+    std::fs::File::open(target)?
+        .take(SNIFF_BYTES)
+        .read_to_end(&mut probe)?;
+    if image_mime(&probe).is_some() || looks_binary(&probe) {
+        return Err(Error::Msg("二进制文件不支持编辑".into()));
+    }
+    if !force {
+        if let Some(expected) = expected_mtime {
+            if mtime_of(&md) != expected {
+                return Err(Error::Msg(SAVE_CONFLICT.into()));
+            }
+        }
+    }
+    let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = target.with_file_name(format!(".{name}.{}.codearts-save.tmp", std::process::id()));
+    std::fs::write(&tmp, content).msg("写入失败")?;
+    let _ = std::fs::set_permissions(&tmp, md.permissions());
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Msg(format!("保存失败：{e}")));
+    }
+    let saved = std::fs::metadata(target).msg("保存后读取失败")?;
+    Ok(FileSaved {
+        size: saved.len(),
+        mtime: mtime_of(&saved),
+    })
+}
+
 fn restore(root: &Path, rel: &str, content: Option<&str>) -> Result<String> {
     let target = resolve_write(root, rel)?;
     match content {
@@ -660,6 +753,7 @@ fn read_at(path: &Path) -> Result<FileContent> {
     let binary = looks_binary(&buf);
     Ok(FileContent {
         content: (!binary).then(|| decode_text(&buf)),
+        utf8: std::str::from_utf8(&buf).is_ok(),
         binary,
         truncated,
         size: md.len(),
@@ -690,6 +784,7 @@ fn read_image(
     };
     Ok(FileContent {
         content: None,
+        utf8: false,
         binary: true,
         truncated: too_big,
         size,
@@ -1027,6 +1122,44 @@ mod tests {
         std::fs::write(&outside, "no").unwrap();
         assert!(read_plan(&roots, &outside.display().to_string()).is_err());
         assert!(read_plan(&roots, &plans.join("notes.txt").display().to_string()).is_err());
+    }
+
+    #[test]
+    fn saves_edits_with_mtime_guard_and_force() {
+        let root = TempRoot::new();
+        std::fs::write(root.0.join("a.txt"), "旧内容\n").unwrap();
+        let target = root.0.join("a.txt");
+        let stale = mtime_of(&std::fs::metadata(&target).unwrap());
+        // 文件系统 mtime 精度可能只有毫秒，稍等再写，冲突用例才不至于撞在同一毫秒
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let saved = write_text(&target, "新内容\n", Some(stale), false).unwrap();
+        assert_eq!(saved.size, "新内容\n".len() as u64);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "新内容\n");
+
+        let err = write_text(&target, "别处改过\n", Some(stale), false).unwrap_err();
+        assert_eq!(err.to_string(), SAVE_CONFLICT);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "新内容\n");
+
+        write_text(&target, "强制覆盖\n", Some(stale), true).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "强制覆盖\n");
+    }
+
+    #[test]
+    fn plan_write_only_touches_known_plan_roots() {
+        let root = TempRoot::new();
+        let plans = root.0.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        let plan = plans.join("plan.md");
+        std::fs::write(&plan, "# 旧\n").unwrap();
+        let roots = vec![("kernel", plans.clone())];
+        let target = plan_target(&roots, &plan.display().to_string()).unwrap();
+        write_text(&target, "# 新\n", None, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&plan).unwrap(), "# 新\n");
+
+        let outside = root.0.join("outside.md");
+        std::fs::write(&outside, "x").unwrap();
+        assert!(plan_target(&roots, &outside.display().to_string()).is_err());
     }
 
     #[test]

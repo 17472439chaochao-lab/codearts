@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { structuredPatch, type StructuredPatchHunk } from "diff";
 import type { FileDiff, GitStatus, Session } from "./kernelApi";
-import { find, restoreFile, workspaceGit } from "./kernelApi";
+import { find, restoreFile, saveFile, savePlan, workspaceGit } from "./kernelApi";
 import { useResolvedTheme, type ResolvedTheme } from "./theme";
 import type { ThemedToken } from "./highlight";
 import { renderMarkdown } from "./markdown";
@@ -29,6 +29,8 @@ type Entry = {
 type FileList = { entries: Entry[]; truncated: boolean };
 type FileContent = {
   content: string | null;
+  /** 非 UTF-8 文件不做编辑，保存会把编码悄悄改掉 */
+  utf8: boolean;
   binary: boolean;
   truncated: boolean;
   size: number;
@@ -707,17 +709,124 @@ export const FileViewer = memo(function FileViewer({
   const [askRestore, setAskRestore] = useState(false);
   /** HEIC 这类系统 WebView 未必解得了的格式：解码失败就退回文字提示，别留个裂图标 */
   const [imgFail, setImgFail] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  /** 磁盘上的文件被别处改过；保存前必须让用户选覆盖还是重载 */
+  const [conflict, setConflict] = useState(false);
+  /** 编辑期间收到 file.edited：先不自动重载，免得冲掉正在写的内容 */
+  const [diskChanged, setDiskChanged] = useState(false);
+  const [askLeave, setAskLeave] = useState<"close" | "edit" | null>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const downOnBackdrop = useRef(false);
   /** pulse / 刷新按钮不走 effect cleanup，用序号丢掉过期回填 */
   const reqId = useRef(0);
   const dataRef = useRef<FileContent | null>(null);
   dataRef.current = data;
+  const dirty = editing && !!data && draft !== (data.content ?? "");
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+  const editingRef = useRef(editing);
+  editingRef.current = editing;
+  const saveRef = useRef<() => Promise<boolean>>(async () => false);
+  const leaveRef = useRef<() => void>(() => {});
 
   const diff = useMemo(
     () => diffs.find((d) => samePath(d.file, file.abs)) ?? null,
     [diffs, file.abs],
   );
+
+  const editableText = !!data && !data.binary && data.content !== null && !data.truncated && !data.mime;
+  const canEdit = editableText && data.utf8;
+
+  function startEdit() {
+    if (!data || data.content === null) return;
+    setTab("preview");
+    setMdRaw(false);
+    setDraft(data.content);
+    setEditing(true);
+    setConflict(false);
+    setDiskChanged(false);
+    setAskLeave(null);
+    requestAnimationFrame(() => editorRef.current?.focus());
+  }
+
+  function exitEdit() {
+    setEditing(false);
+    setDraft("");
+    setConflict(false);
+    setAskLeave(null);
+    if (diskChanged) {
+      setDiskChanged(false);
+      load(false);
+    }
+  }
+
+  function requestStopEdit() {
+    if (dirtyRef.current) setAskLeave("edit");
+    else exitEdit();
+  }
+
+  function requestClose() {
+    if (dirtyRef.current) setAskLeave("close");
+    else onClose();
+  }
+
+  async function save(force = false): Promise<boolean> {
+    if (!data || !editing || saving) return false;
+    const body = draft;
+    setSaving(true);
+    setErr(null);
+    try {
+      const saved = file.plan
+        ? await savePlan(file.abs, body, data.mtime, root, force)
+        : await saveFile(file.rel, body, data.mtime, root, force);
+      setData((cur) =>
+        cur ? { ...cur, content: body, size: saved.size, mtime: saved.mtime, truncated: false } : cur,
+      );
+      setConflict(false);
+      setDiskChanged(false);
+      setNote("已保存");
+      window.setTimeout(() => setNote(null), 1600);
+      return true;
+    } catch (e) {
+      if (String(e) === "file-conflict") {
+        setConflict(true);
+        setDiskChanged(true);
+      } else {
+        setErr(String(e));
+      }
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveAndLeave() {
+    const target = askLeave;
+    if (!(await save())) return;
+    setAskLeave(null);
+    if (target === "close") onClose();
+    else exitEdit();
+  }
+
+  function discardAndLeave() {
+    const target = askLeave;
+    setAskLeave(null);
+    setEditing(false);
+    setDraft("");
+    setConflict(false);
+    setDiskChanged(false);
+    if (target === "close") onClose();
+    else load(false);
+  }
+
+  saveRef.current = () => save();
+  leaveRef.current = () => {
+    if (editingRef.current) requestStopEdit();
+    else requestClose();
+  };
 
   const load = useCallback((soft = false) => {
     const id = ++reqId.current;
@@ -751,6 +860,11 @@ export const FileViewer = memo(function FileViewer({
   useEffect(() => {
     setTab(startTab);
     setMdRaw(false);
+    setEditing(false);
+    setDraft("");
+    setConflict(false);
+    setDiskChanged(false);
+    setAskLeave(null);
   }, [file.abs, startTab]);
 
   useEffect(() => {
@@ -766,17 +880,26 @@ export const FileViewer = memo(function FileViewer({
   // 文件正在被 agent 写：跟 file.edited 一起刷新预览，别让用户对着旧内容
   useEffect(() => {
     if (!pulse) return;
+    if (editingRef.current) {
+      setDiskChanged(true);
+      return;
+    }
     const t = window.setTimeout(() => load(true), 700);
     return () => window.clearTimeout(t);
   }, [pulse, load]);
 
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && editingRef.current) {
+        e.preventDefault();
+        void saveRef.current();
+        return;
+      }
+      if (e.key === "Escape") leaveRef.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   // copy 事件落在焦点元素上，不一定冒泡到正文；挂在 document 上才不会漏
   useEffect(() => {
@@ -828,7 +951,7 @@ export const FileViewer = memo(function FileViewer({
 
   // 搜索跳过来的一律看源码：Markdown 渲染后的 DOM 没有行号可对
   const markdown =
-    tab === "preview" && isMd(file.rel) && !!data && !data.binary && data.content !== null && !file.line;
+    tab === "preview" && !editing && isMd(file.rel) && !!data && !data.binary && data.content !== null && !file.line;
 
   return (
     <div
@@ -838,7 +961,7 @@ export const FileViewer = memo(function FileViewer({
       }}
       onClick={(e) => {
         // 从正文拖选到面板外时，click 的 target 也会落到遮罩上；只认从遮罩按下的关闭
-        if (downOnBackdrop.current && e.target === e.currentTarget) onClose();
+        if (downOnBackdrop.current && e.target === e.currentTarget) requestClose();
       }}
     >
       <div
@@ -857,6 +980,58 @@ export const FileViewer = memo(function FileViewer({
             </span>
           </div>
           <div className="row fvacts">
+            {dirty && (
+              <span className="fvdirty" title="有未保存的修改">
+                未保存
+              </span>
+            )}
+            {editableText && !editing && (
+              <button
+                className="ico-btn"
+                onClick={startEdit}
+                disabled={!canEdit}
+                title={canEdit ? "编辑文件" : "非 UTF-8 编码，暂不支持编辑"}
+                aria-label="编辑文件"
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M10.8 2.6l2.6 2.6-7.6 7.6-3.3.7.7-3.3z"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.3"
+                    strokeLinejoin="round"
+                  />
+                  <path d="M9.3 4.1l2.6 2.6" fill="none" stroke="currentColor" strokeWidth="1.3" />
+                </svg>
+              </button>
+            )}
+            {editing && (
+              <>
+                <button
+                  className={`ico-btn save ${dirty ? "on" : ""}`}
+                  disabled={!dirty || saving}
+                  onClick={() => void save()}
+                  title="保存（⌘S）"
+                  aria-label="保存"
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path
+                      d="M3 2.8h8.2L13 4.6v8.6H3z"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.3"
+                      strokeLinejoin="round"
+                    />
+                    <path d="M5.4 2.8v3.4h4.4V2.8M5.4 9.4h5.2" fill="none" stroke="currentColor" strokeWidth="1.3" />
+                  </svg>
+                </button>
+                <button className="ico-btn" onClick={requestStopEdit} title="退出编辑" aria-label="退出编辑">
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </>
+            )}
             {tab === "diff" && canRestore && (
               <button
                 className={`restorebtn ${askRestore ? "ask" : ""}`}
@@ -944,7 +1119,13 @@ export const FileViewer = memo(function FileViewer({
                 />
               </svg>
             </button>
-            <button className="ico-btn" onClick={() => load(false)} title="重新读取" aria-label="重新读取">
+            <button
+              className="ico-btn"
+              onClick={() => load(false)}
+              disabled={editing}
+              title={editing ? "先退出编辑再重新读取" : "重新读取"}
+              aria-label="重新读取"
+            >
               <svg viewBox="0 0 16 16" aria-hidden="true">
                 <path
                   d="M13 8a5 5 0 1 1-1.5-3.6M13 2.6V6h-3.4"
@@ -956,7 +1137,7 @@ export const FileViewer = memo(function FileViewer({
                 />
               </svg>
             </button>
-            <button className="ico-btn" onClick={onClose} title="关闭" aria-label="关闭预览">
+            <button className="ico-btn" onClick={requestClose} title="关闭" aria-label="关闭预览">
               <svg viewBox="0 0 16 16" aria-hidden="true">
                 <path
                   d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"
@@ -971,6 +1152,41 @@ export const FileViewer = memo(function FileViewer({
         </header>
 
         {note && <p className="fhint">{note}</p>}
+
+        {editing && (conflict || diskChanged) && (
+          <div className="fvbar warn">
+            <span className="grow">
+              {conflict ? "文件在磁盘上已被修改，直接保存会覆盖别人的改动。" : "磁盘上的文件已更新，当前显示的可能不是最新内容。"}
+            </span>
+            <button onClick={() => void save(true)}>覆盖保存</button>
+            <button
+              onClick={() => {
+                setConflict(false);
+                setDiskChanged(false);
+                setEditing(false);
+                setDraft("");
+                load(false);
+              }}
+            >
+              放弃修改并重新加载
+            </button>
+          </div>
+        )}
+
+        {askLeave && (
+          <div className="fvbar">
+            <span className="grow">有未保存的修改。</span>
+            <button className="primary" onClick={() => void saveAndLeave()} disabled={saving}>
+              {askLeave === "close" ? "保存并关闭" : "保存并退出编辑"}
+            </button>
+            <button className="danger" onClick={discardAndLeave}>
+              放弃修改
+            </button>
+            <button onClick={() => setAskLeave(null)}>继续编辑</button>
+          </div>
+        )}
+
+        {err && editing && <p className="fhint err">{err}</p>}
 
         <div className="fvtabs">
           <button className={tab === "preview" ? "on" : ""} onClick={() => setTab("preview")}>
@@ -992,7 +1208,27 @@ export const FileViewer = memo(function FileViewer({
 
         <div className="fvbody" ref={bodyRef}>
           {tab === "preview" ? (
-            err ? (
+            editing ? (
+              <textarea
+                ref={editorRef}
+                className="fvedit"
+                value={draft}
+                spellCheck={false}
+                aria-label={`编辑 ${file.rel}`}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== "Tab") return;
+                  e.preventDefault();
+                  const el = e.currentTarget;
+                  const start = el.selectionStart;
+                  const end = el.selectionEnd;
+                  setDraft(draft.slice(0, start) + "  " + draft.slice(end));
+                  requestAnimationFrame(() => {
+                    el.selectionStart = el.selectionEnd = start + 2;
+                  });
+                }}
+              />
+            ) : err ? (
               <p className="fhint err">{err}</p>
             ) : !data ? (
               <p className="fhint">读取中…</p>

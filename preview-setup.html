@@ -33,7 +33,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>CodeArts Cli Desktop · 首屏预览</title>
+    <title>CodeArts CLI Desktop · 首屏预览</title>
   </head>
   <body>
     <div id="root"></div>
@@ -1512,7 +1512,7 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           return window.__ocrText ?? "预览台 OCR：这是从截图里识别出的文字";
         }
         // 与 package.json 的 version 保持一致：截图会带上这个号
-        if (cmd === "plugin:app|version") return "0.1.5";
+        if (cmd === "plugin:app|version") return "0.1.6";
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;
         if (cmd === "settings_save") {
@@ -1617,11 +1617,25 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           const content = files[rel];
           return {
             content,
+            utf8: true,
             binary: false,
             truncated: false,
             size: content.length,
-            mtime: now,
+            mtime: (window.__fileMtimes ??= {})[`${payload?.directory ?? ""}:${rel}`] ?? now,
           };
+        }
+        if (cmd === "file_write") {
+          const rel = payload?.rel ?? "";
+          const files = payload?.directory === otherDir ? otherFiles : demoFiles;
+          if (!(rel in files)) throw new Error(`路径不存在：${rel}`);
+          const mtimes = (window.__fileMtimes ??= {});
+          const key = `${payload?.directory ?? ""}:${rel}`;
+          const current = mtimes[key] ?? now;
+          if (!payload?.force && payload?.expectedMtime != null && payload.expectedMtime !== current) throw "file-conflict";
+          const mtime = Math.max(Date.now(), current + 1);
+          files[rel] = String(payload?.content ?? "");
+          mtimes[key] = mtime;
+          return { size: files[rel].length, mtime };
         }
         if (cmd === "plans_list")
           return hasDir ? (payload?.directory === otherDir ? [] : demoPlans) : [];
@@ -1631,11 +1645,23 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           if (typeof content !== "string") throw new Error(`计划不存在：${path}`);
           return {
             content,
+            utf8: true,
             binary: false,
             truncated: false,
             size: content.length,
-            mtime: now,
+            mtime: (window.__planMtimes ??= {})[path] ?? now,
           };
+        }
+        if (cmd === "plan_write") {
+          const path = payload?.path ?? "";
+          if (typeof demoPlanFiles[path] !== "string") throw new Error(`计划不存在：${path}`);
+          const mtimes = (window.__planMtimes ??= {});
+          const current = mtimes[path] ?? now;
+          if (!payload?.force && payload?.expectedMtime != null && payload.expectedMtime !== current) throw "file-conflict";
+          const mtime = Math.max(Date.now(), current + 1);
+          demoPlanFiles[path] = String(payload?.content ?? "");
+          mtimes[path] = mtime;
+          return { size: demoPlanFiles[path].length, mtime };
         }
         if (cmd === "kernel_start") {
           kernelUp = healthy;
