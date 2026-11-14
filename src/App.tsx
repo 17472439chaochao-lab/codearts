@@ -63,11 +63,17 @@ const KERNEL_INSTALL_CMD = IS_WINDOWS
   : 'sh -c "$(curl -L https://cnnorth4-cloudide-marketplace.obs.cn-north-4.myhuaweicloud.com/codearts/cli_tui/install_script/install.sh)"';
 /** 装完还要把 installers 目录放进 PATH，这句留在说明里，不混进复制的命令 */
 const KERNEL_PATH_CMD = IS_WINDOWS
-  ? 'set "PATH=%USERPROFILE%\.codeartsdoer\installers\bin;%PATH%"'
+  ? 'set "PATH=%USERPROFILE%\\.codeartsdoer\\installers\\bin;%PATH%"'
   : "export PATH=~/.codeartsdoer/installers:$PATH";
 const KERNEL_REL_PATH = IS_WINDOWS
-  ? ".codeartsdoer\installers\bin\codearts.exe"
+  ? ".codeartsdoer\\installers\\bin\\codearts.exe"
   : ".codeartsdoer/installers/bin/codearts";
+// Windows 没有红绿灯，标题栏自绘元素要让出的 78px 在 CSS 里按这个类名收回来
+if (IS_WINDOWS) document.documentElement.classList.add("is-win");
+
+const CODEARTS_HOME =
+  "https://devcloud.cn-north-4.huaweicloud.com/chat?source=dmzntgwlb&sourcead=dmzntgwlb1&invitecode=INV-WlFtHNxrqBi7GE3gwnnFCDvZ89vB13jrYmxiRygSWbS9pJ3Is-NlbupXaiakNsEMo-xUeJn1o1dBEphjpv-EsepU27wNjKe6Jffas1d7m5kMff1drB60Gdc6O0AvnhzHf-18uAiwgjxXzlX3ztvIgg_02RW7bu9kMO03";
+const AKSK_MANAGE = "https://codearts.huaweicloud.com/portal/settings/cli-auth";
 
 export default function App() {
   const [check, setCheck] = useState<EnvCheck | null>(null);
@@ -314,6 +320,14 @@ function Setup({
         <p className="hint">
           驱动本机已安装的码道 CLI（<code>codearts serve</code>）。
         </p>
+        <div className="setup-links">
+          <button onClick={() => void openUrl(CODEARTS_HOME).catch((e) => console.error("打开官网失败", e))}>
+            CodeArts 官网
+          </button>
+          <button onClick={() => void openUrl(AKSK_MANAGE).catch((e) => console.error("打开 AK/SK 管理失败", e))}>
+            AK/SK 管理
+          </button>
+        </div>
 
         <Step done={!!check?.kernelInstalled} n={1} title="检测码道 CLI">
           {check?.kernelInstalled ? (
@@ -748,7 +762,7 @@ function Settings({
                   <p className="hint">
                     本地技能 {caps.local.length} 个 · 内置技能 {caps.sys.length} 个 · MCP 服务器{" "}
                     {Object.keys(caps.servers).length} 个 · 当前工作区{" "}
-                    {dir ? dir.split("/").pop() : "未选择"}
+                    {dir ? dir.split(/[\\/]+/).pop() : "未选择"}
                   </p>
                   <ul className="cap">
                     {caps.local.map((s) => (

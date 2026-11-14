@@ -1168,7 +1168,7 @@ export default function Chat({
       });
       // 计划页签靠 file.edited 的脉冲刷新，内核这次没发，自己来一下
       setEditPulse((n) => n + 1);
-      setToast(`计划已保存到 ${path.split("/").pop()}`);
+      setToast(`计划已保存到 ${path.split(/[\\/]+/).pop()}`);
     } catch (e) {
       setToast(`计划保存失败：${String(e)}`);
     }
@@ -3804,7 +3804,7 @@ const SELF_EXPLANATORY = new Set([
 
 const baseName = (p: unknown) => {
   const s = String(p ?? "");
-  return s.replace(/\/+$/, "").split("/").pop() || s;
+  return s.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || s;
 };
 
 /** 标题行取最能说明"在干什么"的那个字段：bash 用它的 description，读写用文件名，检索用 pattern */

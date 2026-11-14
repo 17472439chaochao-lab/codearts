@@ -176,7 +176,14 @@ pub(crate) fn workspace_root(settings: &Settings, directory: Option<&str>) -> Re
         .flatten()
         .filter_map(|p| Path::new(p).canonicalize().ok())
         .collect();
-    known.extend(settings.project_dir().ok());
+    // Windows 的 canonicalize 会加 \\?\ 前缀：白名单里所有条目必须同样过一遍
+    // canonicalize，才能和 want 比得上（mac 上 canonicalize 基本是原样返回）
+    known.extend(
+        settings
+            .project_dir()
+            .ok()
+            .and_then(|p| p.canonicalize().ok()),
+    );
     if !known.iter().any(|p| *p == want) {
         return Err(Error::Msg("这个目录不在已添加的工作区里".into()));
     }

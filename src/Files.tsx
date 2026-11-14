@@ -72,7 +72,7 @@ export function relInRoot(root: string, abs: string): string | null {
   return abs.startsWith(r + "/") ? abs.slice(r.length + 1) : null;
 }
 
-const baseName = (p: string) => p.split("/").filter(Boolean).pop() ?? p;
+const baseName = (p: string) => p.split(/[\\/]+/).filter(Boolean).pop() ?? p;
 const dirName = (rel: string) => {
   const i = rel.lastIndexOf("/");
   return i < 0 ? "" : rel.slice(0, i);

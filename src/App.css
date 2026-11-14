@@ -552,6 +552,31 @@ code {
   user-select: none;
 }
 
+/* Windows 没有红绿灯压左边，标题贴回窗口边缘 */
+.is-win .wtitle {
+  padding-left: 14px;
+}
+
+/* 引导页的两个外链按钮：官网入口和 AK/SK 管理页 */
+.setup-links {
+  display: flex;
+  gap: 16px;
+  margin: 4px 0 16px;
+}
+
+.setup-links button {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 13px;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.setup-links button:hover {
+  text-decoration: underline;
+}
+
 /* 标题右侧的版本号小字 */
 .wver {
   margin-left: 6px;
