@@ -1,0 +1,37 @@
+name: 构建安装包
+
+# 手动触发：Actions → 构建安装包 → Run workflow
+# 产物：windows 出 NSIS(.exe) + MSI，macOS 出 universal DMG（见 scripts/tauri.mjs 的注入逻辑）
+on:
+  workflow_dispatch:
+
+jobs:
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build installers
+        run: |
+          npm ci
+          npm run tauri build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          path: |
+            src-tauri/target/**/release/bundle/dmg/*
+            src-tauri/target/**/release/bundle/nsis/*
+            src-tauri/target/**/release/bundle/msi/*
+          if-no-files-found: error

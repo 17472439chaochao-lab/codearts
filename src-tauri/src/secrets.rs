@@ -1,7 +1,8 @@
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::io::Write;
 
 use crate::error::{Error::Msg, MsgExt, Result};
 
@@ -14,16 +15,25 @@ pub const ENDPOINT: &str = "endpoint";
 /// 所以统一用 0600 文件，与内核自己存 cli.env 的做法一致。
 pub fn set(account: &str, value: &str) -> Result<()> {
     let path = store_dir()?.join(account);
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .msg(format!("无法写入 {}", path.display()))?;
-    f.write_all(value.as_bytes())?;
-    f.flush()?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .msg(format!("无法写入 {}", path.display()))?;
+        f.write_all(value.as_bytes())?;
+        f.flush()?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows 的 secrets 落在用户目录（%APPDATA%）里，文件继承该目录 ACL，仅当前用户可读
+        fs::write(&path, value).msg(format!("无法写入 {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -47,13 +57,22 @@ pub fn remove(account: &str) -> Result<()> {
 }
 
 fn store_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .msg("无法解析 HOME")?;
-    let dir = PathBuf::from(home)
-        .join("Library/Application Support")
-        .join(crate::settings::APP_ID)
-        .join("secrets");
+    #[cfg(windows)]
+    let base = {
+        let appdata = std::env::var("APPDATA").msg("无法解析 APPDATA")?;
+        PathBuf::from(appdata)
+    };
+    #[cfg(not(windows))]
+    let base = {
+        let home = std::env::var("HOME").msg("无法解析 HOME")?;
+        PathBuf::from(home).join("Library/Application Support")
+    };
+    let dir = base.join(crate::settings::APP_ID).join("secrets");
     fs::create_dir_all(&dir).msg(format!("无法创建 {}", dir.display()))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(dir)
 }

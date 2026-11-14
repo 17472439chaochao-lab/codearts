@@ -606,6 +606,9 @@ fn kernel_env(cmd: &mut Command, home: &std::path::Path, data_dir: &std::path::P
         .env("CODEARTS_CLI_AK", ak)
         .env("CODEARTS_CLI_SK", sk)
         .env_remove("NODE_TLS_REJECT_UNAUTHORIZED");
+    // Windows 上 Bun/Node 的 os.homedir() 靠 USERPROFILE 找家目录，两个键都留着
+    #[cfg(windows)]
+    cmd.env("USERPROFILE", home);
 }
 
 /// serve 与 upgrade 共用的产品场景变量；少了 SCENARIO，upgrade 会按匿名产品的路径和通道走
@@ -636,7 +639,16 @@ async fn reap_stored_pid() {
         return;
     };
     let Some(pid) = stored.pid else { return };
-    // pid 会被系统复用：要求命令行里既有名为 codearts 的可执行文件，又有 serve 参数
+    #[cfg(windows)]
+    windows_reap(pid).await;
+    #[cfg(not(windows))]
+    unix_reap(pid).await;
+}
+
+/// 壳上次被强杀、句柄丢了，按持久化的 pid 收掉遗留内核。
+/// pid 会被系统复用：要求命令行里既有名为 codearts 的可执行文件，又有 serve 参数
+#[cfg(not(windows))]
+async fn unix_reap(pid: u32) {
     let cmdline = tokio::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
@@ -673,6 +685,7 @@ async fn reap_stored_pid() {
 }
 
 /// 命令行是否像 `…/codearts serve …`（按可执行文件 basename，不做子串误伤）
+#[cfg(not(windows))]
 fn is_codearts_serve(cmdline: &str) -> bool {
     let parts: Vec<&str> = cmdline.split_whitespace().collect();
     let has_bin = parts.iter().any(|p| {
@@ -686,12 +699,60 @@ fn is_codearts_serve(cmdline: &str) -> bool {
 }
 
 async fn pid_alive(pid: u32) -> bool {
-    tokio::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
+    #[cfg(windows)]
+    {
+        tokio::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .await
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        tokio::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+}
+
+/// `tasklist` 里该 pid 的镜像名是否恰好是 image（不区分大小写）
+#[cfg(windows)]
+async fn tasklist_image_is(pid: u32, image: &str) -> bool {
+    tokio::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
         .await
-        .map(|s| s.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .to_ascii_lowercase()
+                .contains(&format!(""{image}""))
+        })
         .unwrap_or(false)
+}
+
+/// Windows 没有 ps/kill：tasklist 按镜像名匹配、taskkill 连进程树一起强杀。
+/// 相比 unix 少了 serve 参数校验，但同名进程只在安装目录存在，pid 复用撞上的概率极低
+#[cfg(windows)]
+async fn windows_reap(pid: u32) {
+    if !tasklist_image_is(pid, "codearts.exe").await {
+        return;
+    }
+    eprintln!("[kernel] 回收上次遗留的内核 pid={pid}");
+    let _ = tokio::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status()
+        .await;
+    for _ in 0..50 {
+        if !pid_alive(pid).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!("[kernel] 遗留内核 pid={pid} 5 秒内没退出，继续启动流程");
 }
 
 async fn pump<R>(reader: R, tail: Arc<Mutex<String>>)
@@ -759,6 +820,7 @@ fn persist_endpoint(ep: &Endpoint) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
     #[test]
     fn codearts_serve_matches_basename_and_serve() {
         assert!(is_codearts_serve("/Users/me/.codeartsdoer/installers/bin/codearts serve --port 1"));

@@ -116,9 +116,16 @@ fn candidate_homes() -> Vec<PathBuf> {
     if let Some(h) = passwd_home() {
         push(h);
     }
+    #[cfg(windows)]
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        push(PathBuf::from(h));
+    }
+    #[cfg(not(windows))]
     if let Ok(h) = std::env::var("HOME") {
         push(PathBuf::from(h));
     }
+    // Windows 的官方安装器只落在当前用户的 USERPROFILE 下，不必像 macOS 那样扫全部用户
+    #[cfg(target_os = "macos")]
     if let Ok(entries) = std::fs::read_dir("/Users") {
         let mut users: Vec<_> = entries.flatten().map(|e| e.path()).collect();
         users.sort();
@@ -141,6 +148,7 @@ fn preferred_home() -> PathBuf {
     candidate_homes().into_iter().next().unwrap_or_default()
 }
 
+#[cfg(unix)]
 fn passwd_home() -> Option<PathBuf> {
     unsafe {
         let pw = libc::getpwuid(libc::getuid());
@@ -156,6 +164,12 @@ fn passwd_home() -> Option<PathBuf> {
     }
 }
 
+/// Windows 没有 passwd 那套，$USERPROFILE 就是用户的真家目录
+#[cfg(not(unix))]
+fn passwd_home() -> Option<PathBuf> {
+    None
+}
+
 fn paths_same(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(x), Ok(y)) => x == y,
@@ -163,7 +177,11 @@ fn paths_same(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// 码道 CLI 官方安装脚本的落地位置，相对各用户 HOME
+/// 码道 CLI 官方安装脚本的落地位置，相对各用户 HOME；
+/// Windows 是 install.ps1 摆在 %USERPROFILE% 下的 codearts.exe
+#[cfg(windows)]
+const KERNEL_REL_PATH: &str = ".codeartsdoer/installers/bin/codearts.exe";
+#[cfg(not(windows))]
 const KERNEL_REL_PATH: &str = ".codeartsdoer/installers/bin/codearts";
 
 /// 与 tauri.conf.json 里的 identifier 保持一致：配置目录、凭据目录都跟它走

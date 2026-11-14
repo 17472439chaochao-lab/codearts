@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -102,7 +103,8 @@ pub(crate) fn write_root(path: &Path, root: &Value) -> Result<()> {
     let body = serde_json::to_string_pretty(root).unwrap() + "\n";
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, body).msg(format!("写入 {}", path.display()))?;
-    // 这里存着第三方服务的密钥，别留成同组可读
+    // 这里存着第三方服务的密钥，别留成同组可读（Windows 靠用户目录 ACL 兜底）
+    #[cfg(unix)]
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
         .msg("无法收紧配置文件权限")?;
     std::fs::rename(&tmp, path).msg("保存配置失败")

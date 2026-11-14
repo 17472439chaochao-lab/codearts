@@ -1007,9 +1007,12 @@ mod tests {
         assert!(restore(&root.0, "missing-dir/a.rs", Some("x")).is_err());
 
         // 指向工作区外的符号链接目录不能被当成合法父目录
-        std::os::unix::fs::symlink(&outside.0, root.0.join("link")).unwrap();
-        assert!(restore(&root.0, "link/a.rs", Some("x")).is_err());
-        assert!(!outside.0.join("a.rs").exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside.0, root.0.join("link")).unwrap();
+            assert!(restore(&root.0, "link/a.rs", Some("x")).is_err());
+            assert!(!outside.0.join("a.rs").exists());
+        }
     }
 
     #[test]
