@@ -56,7 +56,7 @@ export function useAppVersion(): string | null {
 type Runner = <T>(fn: () => Promise<T>) => Promise<T | null>;
 
 /** WebView2 的 UA 里带 Windows NT，够分辨平台了，不必再引 plugin-os */
-const IS_WINDOWS = /Windows/.test(navigator.userAgent);
+export const IS_WINDOWS = /Windows/.test(navigator.userAgent);
 /** 官方安装命令照抄文档，别自己编；复制按钮只给这一句 */
 const KERNEL_INSTALL_CMD = IS_WINDOWS
   ? "irm https://cnnorth4-cloudide-marketplace.obs.cn-north-4.myhuaweicloud.com/codearts/cli_tui/install_script/install.ps1 | iex"

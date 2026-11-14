@@ -52,7 +52,7 @@ import {
   type ToolState,
   type VcsInfo,
 } from "./kernelApi";
-import { APP_TITLE, useAppVersion, type KernelStatus } from "./App";
+import { APP_TITLE, IS_WINDOWS, useAppVersion, type KernelStatus } from "./App";
 import { FilePanel, FileViewer, QuickOpen, relInRoot, type OpenFile } from "./Files";
 import { BranchPicker, type GitState } from "./GitBranch";
 import { exportName, sessionMarkdown } from "./sessionExport";
@@ -784,7 +784,7 @@ export default function Chat({
   useEffect(() => {
     if (!live) return;
     const onKey = (e: globalThis.KeyboardEvent) => {
-      if (!e.metaKey || e.altKey || e.isComposing) return;
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.isComposing) return;
       if (e.key.toLowerCase() === "p" && !e.shiftKey) {
         e.preventDefault();
         setQuickOpen((v) => !v);
@@ -2635,7 +2635,7 @@ export default function Chat({
             className="ico-btn"
             onClick={() => setQuickOpen(true)}
             disabled={!live}
-            title="按文件名打开文件（⌘P）"
+            title={`按文件名打开文件（${IS_WINDOWS ? "Ctrl+P" : "⌘P"}）`}
             aria-label="按文件名打开文件"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">

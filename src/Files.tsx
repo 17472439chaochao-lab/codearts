@@ -4,6 +4,7 @@ import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { structuredPatch, type StructuredPatchHunk } from "diff";
 import type { FileDiff, GitStatus, Session } from "./kernelApi";
 import { find, restoreFile, saveFile, savePlan, workspaceGit } from "./kernelApi";
+import { IS_WINDOWS } from "./App";
 import { useResolvedTheme, type ResolvedTheme } from "./theme";
 import type { ThemedToken } from "./highlight";
 import { renderMarkdown } from "./markdown";
@@ -1011,7 +1012,7 @@ export const FileViewer = memo(function FileViewer({
                   className={`ico-btn save ${dirty ? "on" : ""}`}
                   disabled={!dirty || saving}
                   onClick={() => void save()}
-                  title="保存（⌘S）"
+                  title={`保存（${IS_WINDOWS ? "Ctrl+S" : "⌘S"}）`}
                   aria-label="保存"
                 >
                   <svg viewBox="0 0 16 16" aria-hidden="true">
