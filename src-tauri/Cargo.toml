@@ -1,6 +1,6 @@
 [package]
 name = "codearts-desktop"
-version = "0.1.6"
+version = "0.1.7"
 description = "CodeArts CLI Desktop shell"
 authors = ["wuchengchao"]
 license = "MIT"
@@ -28,9 +28,6 @@ thiserror = "2"
 base64 = "0.22"
 # 未签名 dev 二进制用不了钥匙串（写入后回读 NoEntry），凭据统一存 0600 文件
 rand = "0.8"
-# 加密备份：口令走 Argon2id 派生，内容用 AES-256-GCM 封装
-argon2 = "0.5"
-aes-gcm = "0.10"
 futures-util = "0.3"
 tokio = { version = "1", features = ["process", "time", "io-util", "sync", "macros"] }
 # native-tls 只用系统 Security.framework：给 GitHub tarball 下载用，内核侧仍走 127.0.0.1 明文

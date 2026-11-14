@@ -259,6 +259,8 @@ impl Kernel {
         let (ak, sk) = self.credentials(&home)?;
         trust::trust_folder(&data_dir, &project)?;
         self.shutdown_inner().await;
+        // 内核只在启动时读配置，且加密用的 DEK 每个会话都会变：换明文要在它起来之前
+        crate::providers::restore_plaintext_keys(app);
 
         let mut endpoint = Endpoint {
             port: free_port()?,
@@ -335,6 +337,8 @@ impl Kernel {
         }
         self.remember_probe(&begun.endpoint);
         persist_endpoint(&begun.endpoint)?;
+        // 内核 boot 时会把明文密钥加密回写；这份密文壳里解不开，落盘还原成明文
+        crate::providers::restore_plaintext_keys(app);
         let _ = app.emit("kernel-status", self.status_obj());
         crate::api::spawn_pump(app.clone(), begun.endpoint.clone());
         Ok(begun.endpoint)

@@ -27,6 +27,7 @@ import {
   api,
   commands,
   exportMarkdown,
+  isSyntheticPart,
   normalizeProviders,
   permissionConfig,
   permissions,
@@ -831,6 +832,8 @@ export default function Chat({
     if (!src) return null;
     const parts = src.parts.flatMap(
       (p): { type: string; text?: string; mime?: string; url?: string; filename?: string }[] => {
+        // 内核塞的提示（如语言说明）不算用户输入，重发时不能带回去
+        if (isSyntheticPart(p)) return [];
         if (p.type === "text" && p.text) return [{ type: "text", text: p.text }];
         if (p.type === "file" && p.url)
           return [{ type: "file", mime: p.mime, url: p.url, filename: p.filename }];
@@ -1148,7 +1151,7 @@ export default function Chat({
     }
     if (!final) return;
     const text = final.parts
-      .filter((p) => p.type === "text" && !(p as any).synthetic && !p.metadata?.synthetic)
+      .filter((p) => p.type === "text" && !isSyntheticPart(p))
       .map((p) => p.text ?? "")
       .join("\n\n")
       .trim();
@@ -1882,7 +1885,7 @@ export default function Chat({
     try {
       mergeSession(await sessions.revert(id, messageID, dirOf(id)));
       const text = src?.parts
-        .filter((p) => p.type === "text" && !p.metadata?.synthetic)
+        .filter((p) => p.type === "text" && !isSyntheticPart(p))
         .map((p) => p.text ?? "")
         .join("\n\n")
         .trim();
@@ -3322,7 +3325,7 @@ export function ChipSelect({
 
 /** 右侧轮次导航的标题：取该轮用户输入的第一段真实文本 */
 function turnText(m: Message, max = 24): string {
-  const t = m.parts.find((p) => p.type === "text" && !((p as any).synthetic))?.text;
+  const t = m.parts.find((p) => p.type === "text" && !isSyntheticPart(p))?.text;
   const s = t?.replace(/\s+/g, " ").trim() ?? "";
   return s ? `${s.slice(0, max)}${s.length > max ? "…" : ""}` : "（空）";
 }
@@ -3499,7 +3502,7 @@ const Block = memo(function Block({ part, assistant = false, streaming = false }
   switch (part.type) {
     case "text":
       // 内核会往用户消息里塞 synthetic 文本（如语言提示），不属于对话内容
-      if ((part as any).synthetic || part.metadata?.synthetic) return null;
+      if (isSyntheticPart(part)) return null;
       return assistant
         ? <ChatMarkdown text={part.text ?? ""} streaming={streaming} />
         : <pre className="text">{part.text}</pre>;

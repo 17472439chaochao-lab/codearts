@@ -55,12 +55,17 @@ export type Part = {
   callID?: string;
   tool?: string;
   state?: ToolState;
+  /** 内核往消息里塞的提示（如语言说明），不属于用户/助手写的内容 */
+  synthetic?: boolean;
   metadata?: Record<string, unknown>;
   time?: { start?: number; end?: number };
   reason?: string;
   cost?: number;
   tokens?: Record<string, number>;
 };
+
+export const isSyntheticPart = (p: Part): boolean =>
+  !!(p.synthetic || p.metadata?.synthetic);
 
 export type Message = { info: MessageInfo; parts: Part[] };
 

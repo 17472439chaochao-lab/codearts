@@ -1,4 +1,4 @@
-import type { Message, Part, Session } from "./kernelApi";
+import { isSyntheticPart, type Message, type Part, type Session } from "./kernelApi";
 
 /** 工具输出截这么长：导出的 Markdown 是给人读的，几百行 stdout 只会把正文淹掉 */
 const TOOL_CHARS = 600;
@@ -20,7 +20,7 @@ function fence(text: string): string {
 function textOf(p: Part): string {
   if (p.type === "text") {
     // 内核会往用户消息里塞 synthetic 提示（如语言说明），那不属于对话内容
-    if ((p as any).synthetic || p.metadata?.synthetic) return "";
+    if (isSyntheticPart(p)) return "";
     return (p.text ?? "").trim();
   }
   if (p.type === "file") return `\`[附件] ${p.filename ?? p.mime ?? "文件"}\``;

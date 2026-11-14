@@ -44,8 +44,6 @@
       const state = new URLSearchParams(location.search).get("state") ?? "fresh";
       // vision=1 把 mock 模型标成能看图，验证「直接发图」分支
       window.__vision = new URLSearchParams(location.search).get("vision") === "1";
-      // encrypted=1 把备份文件模拟成口令加密的，验证导入口令框
-      window.__encrypted = new URLSearchParams(location.search).get("encrypted") === "1";
       // 用假路径，别把开发机的工作目录写进预览台
       const kernelBin = "/Users/you/.codeartsdoer/installers/bin/codearts";
       const projectDir = "/Users/you/work/demo";
@@ -1463,19 +1461,11 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           window.__exported = {
             path: payload?.path,
             prefs: payload?.prefs,
-            passphrase: payload?.passphrase,
           };
           return payload?.path;
         }
-        if (cmd === "settings_backup_encrypted") {
-          // ?encrypted=1 时模拟口令加密备份
-          return window.__encrypted ?? false;
-        }
         if (cmd === "settings_import") {
-          window.__imported = { path: payload?.path, passphrase: payload?.passphrase };
-          if (window.__encrypted && payload?.passphrase !== "secret12") {
-            throw "口令不对，或备份已损坏";
-          }
+          window.__imported = { path: payload?.path };
           return {
             settings: true,
             workspacesAdded: 1,
@@ -1512,7 +1502,7 @@ $service->syncManagerRole($merchantId, $userId, 'admin');
           return window.__ocrText ?? "预览台 OCR：这是从截图里识别出的文字";
         }
         // 与 package.json 的 version 保持一致：截图会带上这个号
-        if (cmd === "plugin:app|version") return "0.1.6";
+        if (cmd === "plugin:app|version") return "0.1.7";
         if (cmd === "plugin:opener|open_url") return null;
         if (cmd === "plugin:opener|reveal_item_in_dir") return null;
         if (cmd === "settings_save") {

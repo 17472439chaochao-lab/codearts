@@ -218,13 +218,20 @@ pub fn list(app: &tauri::AppHandle) -> Result<Vec<ProviderView>> {
     Ok(out)
 }
 
-pub fn save(app: &tauri::AppHandle, draft: ProviderDraft) -> Result<Vec<ProviderView>> {
+pub fn save(app: &tauri::AppHandle, mut draft: ProviderDraft) -> Result<Vec<ProviderView>> {
     valid_id(&draft.id)?;
     valid_base_url(draft.base_url.trim())?;
     if draft.models.is_empty() {
         return Err(Error::Msg("至少填一个模型".into()));
     }
-    // 内核会把配置里的明文密钥加密回写成只有本机能解的 enc:v3:，所以壳自己留一份明文，
+    // 密钥留空 = 沿用旧值。旧值可能已经是内核加密的 enc:v4:（重启后解不开的那种），
+    // 壳有明文副本就换成明文再落盘，让内核按本次会话重新加密。
+    if draft.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).is_none() {
+        if let Some(plain) = vault_key(&draft.id).filter(|k| !k.trim().is_empty()) {
+            draft.api_key = Some(plain);
+        }
+    }
+    // 内核会把配置里的明文密钥加密回写成只有当前会话能解的 enc:v4:，所以壳自己留一份明文，
     // 口令加密备份才带得走。先落副本再写配置：配置写失败最多多一条副本，反过来会丢密钥。
     if let Some(key) = draft.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
         vault_store(&draft.id, key)?;
@@ -255,10 +262,63 @@ fn vault_forget(id: &str) {
     }
 }
 
+/// 内核启动时会把盘上明文 apiKey 用钥匙串里的 DEK 加密成 enc:v4: 回写，而它自己的进程
+/// 在桌面壳里读不到钥匙串（日志：user name or passphrase you entered is not correct），
+/// 密文重启后注定解不开。本函数把明文还回配置：启动前调用，让内核拿到可用密钥；
+/// 跑起来后再调一次，把内核刚写下的密文还原成明文，盘上不再保留这种加密。
+/// 只用壳保存时留的明文副本，不碰钥匙串——读一次就是一次系统授权弹窗。
+pub(crate) fn restore_plaintext_keys(app: &tauri::AppHandle) {
+    if let Err(e) = heal_keys(app) {
+        eprintln!("[providers] 恢复自定义模型密钥失败：{e}");
+    }
+}
+
+fn heal_keys(app: &tauri::AppHandle) -> Result<()> {
+    let path = config_path(app)?;
+    let mut root = read_root(&path)?;
+    let changed = resolve_encrypted_keys(&mut root, vault_key);
+    if changed > 0 {
+        write_root(&path, &root)?;
+    }
+    Ok(())
+}
+
+/// 把 `provider.*.options.apiKey` 里的 enc: 换回壳留的明文副本，返回改动的条数。
+fn resolve_encrypted_keys(
+    root: &mut Value,
+    vault: impl Fn(&str) -> Option<String>,
+) -> usize {
+    let Some(providers) = root.get_mut("provider").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    let mut changed = 0;
+    for (id, entry) in providers.iter_mut() {
+        if RESERVED.contains(&id.as_str()) {
+            continue;
+        }
+        let encrypted = entry
+            .pointer("/options/apiKey")
+            .and_then(Value::as_str)
+            .is_some_and(|k| k.starts_with(ENCRYPTED_PREFIX));
+        if !encrypted {
+            continue;
+        }
+        let Some(plain) = vault(id).filter(|k| !k.trim().is_empty()) else {
+            eprintln!("[providers] 「{id}」的密钥只剩密文，没有明文副本，需要在设置里重新填写");
+            continue;
+        };
+        if let Some(options) = entry.get_mut("options").and_then(Value::as_object_mut) {
+            options.insert("apiKey".into(), Value::String(plain));
+            changed += 1;
+        }
+    }
+    changed
+}
+
 /// 把草稿并进全局配置的 provider 段。与盘上已有条目逐键合并：
 /// 界面不认识的键（`options.headers`、模型上的 `cost` 等）原样保留。
 fn merge_draft(root: &mut Value, draft: &ProviderDraft) -> Result<()> {
-    // 密钥留空 = 沿用盘上原值（内核会把明文加密回写，所以原值可能是 enc:v3:）
+    // 密钥留空 = 沿用盘上原值（内核会把明文加密回写，所以原值可能是 enc:）
     let existing = providers_of(root).get(&draft.id).cloned();
     let kept_key = existing
         .as_ref()
@@ -448,6 +508,27 @@ mod tests {
         assert_eq!(key_mask(""), None);
         assert_eq!(key_mask("enc:v3:abcdef").as_deref(), Some("已加密"));
         assert_eq!(key_mask("sk-proj-abcdefghij").as_deref(), Some("****ghij"));
+    }
+
+    /// 密文一律用壳的明文副本还原；没有副本就留着等用户重填
+    #[test]
+    fn heal_restores_encrypted_keys_from_vault_only() {
+        let mut root = serde_json::json!({
+            "provider": {
+                "vaulted": { "options": { "baseURL": "https://x/v1", "apiKey": "enc:v4:abc" } },
+                "kept": { "options": { "baseURL": "https://y/v1", "apiKey": "sk-plain" } },
+                "orphan": { "options": { "baseURL": "https://z/v1", "apiKey": "enc:v4:dead" } }
+            }
+        });
+        let changed = resolve_encrypted_keys(&mut root, |id| {
+            (id == "vaulted").then(|| "vault-key".to_string())
+        });
+
+        assert_eq!(changed, 1);
+        assert_eq!(root["provider"]["vaulted"]["options"]["apiKey"], "vault-key");
+        // 明文条目不动；没有副本的密文原样留着，日志提示重填
+        assert_eq!(root["provider"]["kept"]["options"]["apiKey"], "sk-plain");
+        assert_eq!(root["provider"]["orphan"]["options"]["apiKey"], "enc:v4:dead");
     }
 
     #[test]

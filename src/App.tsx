@@ -1122,8 +1122,8 @@ function applyPrefs(raw: unknown) {
 
 /**
  * 设置备份：工作区、第三方模型、MCP 和界面偏好打成一个 JSON。
- * 加密备份会带上 AK/SK 和模型密钥，导入时必须输对同一口令；不加密的备份不含凭据。
- * 导入后模型/MCP 需要内核重启才生效，跑着的时候给一个重启按钮。
+ * 备份是明文，AK/SK、模型密钥和 MCP 凭据都原样带走（文件按 0600 落盘）；
+ * 旧版口令加密的备份仍可导入。导入后模型/MCP 需要内核重启才生效，跑着的时候给一个重启按钮。
  */
 function BackupSettings({
   running,
@@ -1141,37 +1141,9 @@ function BackupSettings({
   const [working, setWorking] = useState(false);
   const [restart, setRestart] = useState(false);
 
-  // 导出先定加密方式再挑路径；导入遇到加密文件才要口令
-  const [exportOpen, setExportOpen] = useState(false);
-  const [encrypt, setEncrypt] = useState(true);
-  const [pass, setPass] = useState("");
-  const [pass2, setPass2] = useState("");
-  const [dlgErr, setDlgErr] = useState<string | null>(null);
-  const [askPath, setAskPath] = useState<string | null>(null);
-  const [importPass, setImportPass] = useState("");
-
-  function beginExport() {
+  async function doExport() {
     setErr(null);
     setNote(null);
-    setDlgErr(null);
-    setEncrypt(true);
-    setPass("");
-    setPass2("");
-    setExportOpen(true);
-  }
-
-  async function doExport() {
-    setDlgErr(null);
-    if (encrypt) {
-      if (pass.length < 6) {
-        setDlgErr("口令至少 6 位");
-        return;
-      }
-      if (pass !== pass2) {
-        setDlgErr("两次输入的口令不一致");
-        return;
-      }
-    }
     const path = await saveDialog({
       defaultPath: `CodeArts Desktop 设置 ${new Date().toISOString().slice(0, 10)}.json`,
       filters: [{ name: "JSON", extensions: ["json"] }],
@@ -1182,14 +1154,10 @@ function BackupSettings({
       const out = await invoke<string>("settings_export", {
         path,
         prefs: collectPrefs(),
-        passphrase: encrypt ? pass : null,
       });
-      setExportOpen(false);
-      setPass("");
-      setPass2("");
       setNote(`已导出到 ${out}`);
     } catch (e) {
-      setDlgErr(String(e));
+      setErr(String(e));
     }
     setWorking(false);
   }
@@ -1202,28 +1170,14 @@ function BackupSettings({
       filters: [{ name: "JSON", extensions: ["json"] }],
     });
     if (typeof path !== "string") return;
-    setWorking(true);
-    try {
-      const encrypted = await invoke<boolean>("settings_backup_encrypted", { path });
-      if (encrypted) {
-        setDlgErr(null);
-        setImportPass("");
-        setAskPath(path);
-        setWorking(false);
-        return;
-      }
-      await runImport(path, null);
-    } catch (e) {
-      setErr(String(e));
-      setWorking(false);
-    }
+    await runImport(path);
   }
 
-  async function runImport(path: string, passphrase: string | null) {
+  async function runImport(path: string) {
     setWorking(true);
     setErr(null);
     try {
-      const r = await invoke<ImportReport>("settings_import", { path, passphrase });
+      const r = await invoke<ImportReport>("settings_import", { path });
       applyPrefs(r.prefs);
       await onChanged();
       const bits: string[] = [];
@@ -1237,30 +1191,14 @@ function BackupSettings({
       if (r.skillsSkipped) line += `；${r.skillsSkipped} 个技能已存在或无效，已跳过`;
       if (r.keysMissing) line += `；${r.keysMissing} 家提供商还没有密钥，去「模型」页补上`;
       setNote(line);
-      setAskPath(null);
-      setImportPass("");
       if (r.providers || r.mcp || r.skills || r.credentials) {
         onModelChange();
         setRestart(running);
       }
     } catch (e) {
-      // 口令框里失败就留在框里重输，别把口令框关掉
-      if (passphrase !== null) setDlgErr(String(e));
-      else setErr(String(e));
+      setErr(String(e));
     }
     setWorking(false);
-  }
-
-  function submitImport() {
-    if (!askPath || !importPass) return;
-    setDlgErr(null);
-    void runImport(askPath, importPass);
-  }
-
-  function cancelImport() {
-    setAskPath(null);
-    setImportPass("");
-    setDlgErr(null);
   }
 
   async function restartKernel() {
@@ -1279,14 +1217,16 @@ function BackupSettings({
   return (
     <>
       <div className="row">
-        <button className="primary" onClick={beginExport} disabled={working}>
+        <button className="primary" onClick={() => void doExport()} disabled={working}>
           导出设置
         </button>
         <button onClick={() => void doImport()} disabled={working}>
           导入设置
         </button>
       </div>
-      <p className="hint">不加密的备份不含 AK/SK 和模型密钥；已装技能会一起备份。</p>
+      <p className="hint">
+        备份是明文 JSON：AK/SK、模型密钥和 MCP 凭据都会原样写入（文件权限 0600），请妥善保管；已装技能会一起备份。
+      </p>
       {restart && (
         <div className="row">
           <button onClick={() => void restartKernel()} disabled={working}>
@@ -1296,78 +1236,6 @@ function BackupSettings({
       )}
       {note && <p className="hint">{note}</p>}
       {err && <pre className="error inline">{err}</pre>}
-
-      {exportOpen && (
-        <div className="modal" onClick={() => !working && setExportOpen(false)}>
-          <div className="panel narrow" onClick={(e) => e.stopPropagation()}>
-            <h2>导出设置</h2>
-            <label className="awake">
-              <input
-                type="checkbox"
-                checked={encrypt}
-                onChange={(e) => setEncrypt(e.target.checked)}
-              />
-              加密备份（包含 AK/SK 和模型密钥）
-            </label>
-            {encrypt && (
-              <>
-                <input
-                  type="password"
-                  autoFocus
-                  placeholder="口令（至少 6 位）"
-                  value={pass}
-                  onChange={(e) => setPass(e.target.value)}
-                />
-                <input
-                  type="password"
-                  placeholder="再输一次口令"
-                  value={pass2}
-                  onChange={(e) => setPass2(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void doExport();
-                  }}
-                />
-              </>
-            )}
-            {dlgErr && <pre className="error inline">{dlgErr}</pre>}
-            <div className="row">
-              <button className="primary" onClick={() => void doExport()} disabled={working}>
-                导出
-              </button>
-              <button onClick={() => setExportOpen(false)} disabled={working}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {askPath && (
-        <div className="modal" onClick={() => !working && cancelImport()}>
-          <div className="panel narrow" onClick={(e) => e.stopPropagation()}>
-            <h2>输入备份口令</h2>
-            <input
-              type="password"
-              autoFocus
-              placeholder="口令"
-              value={importPass}
-              onChange={(e) => setImportPass(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") submitImport();
-              }}
-            />
-            {dlgErr && <pre className="error inline">{dlgErr}</pre>}
-            <div className="row">
-              <button className="primary" onClick={submitImport} disabled={working || !importPass}>
-                导入
-              </button>
-              <button onClick={cancelImport} disabled={working}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </>
   );
 }

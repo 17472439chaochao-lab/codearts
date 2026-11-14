@@ -1,18 +1,12 @@
 //! 设置备份：把壳的配置、界面偏好、第三方模型、MCP 和已装技能汇总成一份 JSON。
 //!
-//! 不加密的备份里不放任何凭据：名字像密钥的字段在导出时统一换成 null，导入时本地已有的值会保留。
-//! 口令加密的备份会带上 AK/SK 和模型密钥（模型密钥走壳自己留的明文副本，内核配置里的是
-//! 本机加密的 enc:v3:，换机解不开），导入时必须输对同一口令才能解开。
+//! 备份一律是明文：AK/SK、模型密钥、MCP 里的 token 都原样写入（文件按 0600 落盘）。
 //! 技能（用户级）按文件带进备份，导入时本地已有同名技能不覆盖。
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
-use argon2::{Algorithm, Argon2, Params as ArgonParams, Version as ArgonVersion};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use rand::RngCore;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -25,18 +19,7 @@ use crate::skills;
 
 const APP: &str = "codearts-desktop";
 const KIND: &str = "settings";
-/// 口令加密后的外层格式；里面裹着的仍是 KIND 那份明文结构
-const KIND_ENC: &str = "settings.encrypted";
 const VERSION: u64 = 1;
-const CIPHER: &str = "aes-256-gcm";
-const KDF: &str = "argon2id";
-/// OWASP 给 Argon2id 的常用档位；参数固定，导入时不接受文件里自报的大小（防内存撑爆）
-const KDF_M_KIB: u32 = 19456;
-const KDF_T: u32 = 2;
-const KDF_P: u32 = 1;
-const SALT_LEN: usize = 16;
-const NONCE_LEN: usize = 12;
-const KEY_LEN: usize = 32;
 /// 备份只装配置和技能，正常几十 KB；技能带文件后放宽上限，防的是误选了大文件
 const MAX_BYTES: u64 = 48 * 1024 * 1024;
 /// 技能文件直接进备份：单文件与安装时同一上限，单个技能 8 MiB，全体 24 MiB
@@ -45,7 +28,7 @@ const SKILL_FILES: usize = 200;
 const SKILL_BYTES: usize = 8 * 1024 * 1024;
 const SKILL_TOTAL_BYTES: usize = 24 * 1024 * 1024;
 const MAX_SKILLS: usize = 64;
-/// 字段名里带这些词的都当凭据处理；不加密导出置 null，导入时不覆盖本机已有的值
+/// 字段名里带这些词的都当凭据处理；导入时空值和 enc: 占位不能覆盖本机已有的值
 const SECRET_WORDS: [&str; 8] = [
     "key",
     "token",
@@ -73,18 +56,13 @@ pub struct ImportReport {
     /// 技能是整目录带走的，恢复时本地已有同名技能不覆盖
     pub skills: usize,
     pub skills_skipped: usize,
-    /// 加密备份里的 AK/SK 已写回本机
+    /// 备份里的 AK/SK 已写回本机
     pub credentials: bool,
     /// 界面偏好原样交给前端写 localStorage
     pub prefs: Value,
 }
 
-pub fn export(
-    app: &tauri::AppHandle,
-    path: &str,
-    prefs: Value,
-    passphrase: Option<&str>,
-) -> Result<String> {
+pub fn export(app: &tauri::AppHandle, path: &str, prefs: Value) -> Result<String> {
     let path = PathBuf::from(path.trim());
     if path.as_os_str().is_empty() {
         return Err(Error::Msg("导出路径为空".into()));
@@ -99,19 +77,11 @@ pub fn export(
     let settings = Settings::load(app)?;
     let root = providers::read_root(&providers::config_path(app)?)?;
     let skills = collect_skills(&settings)?;
-    let pass = passphrase.map(str::trim).filter(|p| !p.is_empty());
-    let bundle = match pass {
-        Some(pass) => {
-            let vault = &providers::vault_key as &dyn Fn(&str) -> Option<String>;
-            let mut bundle = build_bundle(&settings, &root, prefs, skills, Some(vault));
-            // AK/SK 只有加密备份才带；SK 在这里才第一次离开凭据目录
-            if let Some(creds) = credentials()? {
-                bundle["credentials"] = creds;
-            }
-            seal(&bundle, pass)?
-        }
-        None => build_bundle(&settings, &root, prefs, skills, None),
-    };
+    let vault = &providers::vault_key as &dyn Fn(&str) -> Option<String>;
+    let mut bundle = build_bundle(&settings, &root, prefs, skills, vault);
+    if let Some(creds) = credentials()? {
+        bundle["credentials"] = creds;
+    }
     write_bundle(&path, &bundle)?;
     Ok(path.display().to_string())
 }
@@ -121,7 +91,7 @@ fn build_bundle(
     root: &Value,
     prefs: Value,
     skills: Value,
-    vault: Option<&dyn Fn(&str) -> Option<String>>,
+    vault: &dyn Fn(&str) -> Option<String>,
 ) -> Value {
     let mut workspaces = settings.projects.clone().unwrap_or_default();
     if let Some(cur) = settings.project_dir.as_ref() {
@@ -132,15 +102,10 @@ fn build_bundle(
     }
     workspaces.retain(|w| !w.trim().is_empty());
 
-    let keep_secrets = vault.is_some();
-    let mut provider_map = collect_entries(
-        root.get("provider"),
-        |id| providers::valid_id(id).is_ok(),
-        keep_secrets,
-    );
-    if let Some(vault) = vault {
-        apply_vault_keys(&mut provider_map, root, vault);
-    }
+    let mut provider_map = collect_entries(root.get("provider"), |id| {
+        providers::valid_id(id).is_ok()
+    });
+    apply_vault_keys(&mut provider_map, root, vault);
 
     serde_json::json!({
         "app": APP,
@@ -154,24 +119,15 @@ fn build_bundle(
         },
         "prefs": prefs,
         "providers": provider_map,
-        "mcp": collect_entries(
-            root.get("mcp"),
-            |name| mcp::valid_name(name).is_ok(),
-            keep_secrets,
-        ),
+        "mcp": collect_entries(root.get("mcp"), |name| mcp::valid_name(name).is_ok()),
         "skills": skills,
     })
 }
 
-pub fn import(
-    app: &tauri::AppHandle,
-    path: &str,
-    passphrase: Option<&str>,
-) -> Result<ImportReport> {
+pub fn import(app: &tauri::AppHandle, path: &str) -> Result<ImportReport> {
     let path = PathBuf::from(path.trim());
     let text = read_bundle(&path)?;
     let doc: Value = serde_json::from_str(&text).msg("备份文件不是合法 JSON")?;
-    let (doc, encrypted) = unwrap_bundle(doc, passphrase)?;
     validate(&doc)?;
 
     let mut settings = Settings::load(app)?;
@@ -200,23 +156,18 @@ pub fn import(
         providers::write_root(&cfg_path, &root)?;
     }
     restore_skills(&settings, &doc, &mut report);
-    if encrypted {
-        restore_credentials(&doc, &mut report)?;
-        // 内核下次启动会把配置里的明文密钥重新加密回写，这里同时补上壳自己的副本，
-        // 否则下一份加密备份又会缺密钥
-        vault_imported_keys(&root);
-    }
+    restore_credentials(&doc, &mut report)?;
+    // 内核下次启动会把配置里的明文密钥加密回写；壳的副本留一份，换机/回滚时导出仍拿得到
+    vault_imported_keys(&root);
     Ok(report)
 }
 
-/// 只判断文件是不是口令加密的，导入前用来决定要不要弹口令框
-pub fn is_encrypted(path: &str) -> Result<bool> {
-    let text = read_bundle(&PathBuf::from(path.trim()))?;
-    let doc: Value = serde_json::from_str(&text).msg("备份文件不是合法 JSON")?;
-    Ok(doc.get("kind").and_then(Value::as_str) == Some(KIND_ENC))
-}
-
 fn validate(doc: &Value) -> Result<()> {
+    if doc.get("kind").and_then(Value::as_str) == Some("settings.encrypted") {
+        return Err(Error::Msg(
+            "这是旧版口令加密的备份，当前版本只认明文备份；请用旧版本导入后重新导出".into(),
+        ));
+    }
     if doc.get("app").and_then(Value::as_str) != Some(APP)
         || doc.get("kind").and_then(Value::as_str) != Some(KIND)
     {
@@ -229,30 +180,6 @@ fn validate(doc: &Value) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// 明文直接返回；加密的先解开再交给后面的统一校验
-fn unwrap_bundle(doc: Value, passphrase: Option<&str>) -> Result<(Value, bool)> {
-    match doc.get("kind").and_then(Value::as_str) {
-        Some(KIND) => Ok((doc, false)),
-        Some(KIND_ENC) => {
-            if doc.get("app").and_then(Value::as_str) != Some(APP) {
-                return Err(Error::Msg("这不是本应用的设置备份".into()));
-            }
-            let version = doc.get("version").and_then(Value::as_u64).unwrap_or(0);
-            if version != VERSION {
-                return Err(Error::Msg(format!(
-                    "备份版本 {version} 不受支持，当前只认 {VERSION}"
-                )));
-            }
-            let pass = passphrase
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| Error::Msg("备份已加密，需要口令".into()))?;
-            Ok((open(&doc, pass)?, true))
-        }
-        _ => Err(Error::Msg("这不是本应用的设置备份".into())),
-    }
 }
 
 fn credentials() -> Result<Option<Value>> {
@@ -305,7 +232,7 @@ fn vault_imported_keys(root: &Value) {
     }
 }
 
-/// 加密备份里的密钥优先取壳的明文副本；盘上已经是 enc: 的换机解不开，留空让用户重填
+/// 导出时的模型密钥：盘上已是明文就用盘上的（可能比副本新），是 enc: 才退回壳的副本
 fn apply_vault_keys(
     providers: &mut Map<String, Value>,
     root: &Value,
@@ -319,7 +246,7 @@ fn apply_vault_keys(
             .and_then(|o| o.get("apiKey"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        let key = vault(id).or_else(|| disk.filter(|k| usable_key(k)));
+        let key = disk.filter(|k| usable_key(k)).or_else(|| vault(id));
         if let Some(options) = entry.get_mut("options").and_then(Value::as_object_mut) {
             options.insert("apiKey".into(), key.map(Value::String).unwrap_or(Value::Null));
         }
@@ -591,100 +518,6 @@ fn restore_skill(root: &Path, item: &Value, total: &mut usize) -> Result<Option<
     Ok(Some(Value::Object(meta)))
 }
 
-fn seal(bundle: &Value, passphrase: &str) -> Result<Value> {
-    let mut salt = [0u8; SALT_LEN];
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let key = derive(passphrase, &salt)?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|_| Error::Msg("加密初始化失败".into()))?;
-    let plain = serde_json::to_vec(bundle)?;
-    let aad = aad();
-    let data = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload { msg: &plain, aad: aad.as_bytes() },
-        )
-        .map_err(|_| Error::Msg("加密备份失败".into()))?;
-    Ok(serde_json::json!({
-        "app": APP,
-        "kind": KIND_ENC,
-        "version": VERSION,
-        "exportedAt": now(),
-        "crypto": {
-            "cipher": CIPHER,
-            "kdf": KDF,
-            "mKiB": KDF_M_KIB,
-            "iterations": KDF_T,
-            "parallelism": KDF_P,
-            "salt": B64.encode(salt),
-            "nonce": B64.encode(nonce),
-            "data": B64.encode(data),
-        },
-    }))
-}
-
-fn open(bundle: &Value, passphrase: &str) -> Result<Value> {
-    let c = bundle
-        .get("crypto")
-        .and_then(Value::as_object)
-        .ok_or_else(|| Error::Msg("加密备份缺少参数，文件已损坏".into()))?;
-    let bad = || Error::Msg("加密备份参数不受支持，文件已损坏或来自更新版本".into());
-    for (key, want) in [("cipher", CIPHER), ("kdf", KDF)] {
-        if c.get(key).and_then(Value::as_str) != Some(want) {
-            return Err(bad());
-        }
-    }
-    if c.get("mKiB").and_then(Value::as_u64) != Some(KDF_M_KIB as u64)
-        || c.get("iterations").and_then(Value::as_u64) != Some(KDF_T as u64)
-        || c.get("parallelism").and_then(Value::as_u64) != Some(KDF_P as u64)
-    {
-        return Err(bad());
-    }
-    let salt = decode(c, "salt")?;
-    let nonce = decode(c, "nonce")?;
-    let data = decode(c, "data")?;
-    if salt.len() != SALT_LEN || nonce.len() != NONCE_LEN {
-        return Err(bad());
-    }
-    let key = derive(passphrase, &salt)?;
-    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| bad())?;
-    let aad = aad();
-    let plain = cipher
-        .decrypt(
-            Nonce::from_slice(&nonce),
-            Payload { msg: &data, aad: aad.as_bytes() },
-        )
-        .map_err(|_| Error::Msg("口令不对，或备份已损坏".into()))?;
-    serde_json::from_slice(&plain)
-        .map_err(|_| Error::Msg("备份内容不是合法 JSON，文件已损坏".into()))
-}
-
-fn decode(c: &Map<String, Value>, key: &str) -> Result<Vec<u8>> {
-    let text = c
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::Msg("加密备份缺少参数，文件已损坏".into()))?;
-    B64.decode(text)
-        .map_err(|_| Error::Msg("加密备份参数不是合法 base64".into()))
-}
-
-fn derive(passphrase: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
-    let params = ArgonParams::new(KDF_M_KIB, KDF_T, KDF_P, Some(KEY_LEN))
-        .map_err(|_| Error::Msg("口令派生参数无效".into()))?;
-    let argon = Argon2::new(Algorithm::Argon2id, ArgonVersion::V0x13, params);
-    let mut key = [0u8; KEY_LEN];
-    argon
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
-        .map_err(|_| Error::Msg("口令派生失败".into()))?;
-    Ok(key)
-}
-
-fn aad() -> String {
-    format!("{APP}|{KIND_ENC}|v{VERSION}")
-}
-
 fn apply_config(root: &mut Value, doc: &Value, report: &mut ImportReport) -> Result<bool> {
     let mut changed = false;
     if let Some(section) = doc.get("providers").and_then(Value::as_object) {
@@ -776,11 +609,10 @@ fn apply_settings(settings: &mut Settings, doc: &Value) -> (bool, usize, usize) 
     (changed, added, skipped)
 }
 
-/// 只取合法的顶层条目；不加密导出时再把凭据字段抹成 null
+/// 只取合法的顶层条目，凭据原样带走
 fn collect_entries(
     section: Option<&Value>,
     valid: impl Fn(&str) -> bool,
-    keep_secrets: bool,
 ) -> Map<String, Value> {
     let mut out = Map::new();
     let Some(map) = section.and_then(Value::as_object) else {
@@ -790,29 +622,9 @@ fn collect_entries(
         if !value.is_object() || !valid(key) {
             continue;
         }
-        let mut clean = value.clone();
-        if !keep_secrets {
-            redact(&mut clean);
-        }
-        out.insert(key.clone(), clean);
+        out.insert(key.clone(), value.clone());
     }
     out
-}
-
-fn redact(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                if secret_key(key) {
-                    *child = Value::Null;
-                } else {
-                    redact(child);
-                }
-            }
-        }
-        Value::Array(items) => items.iter_mut().for_each(redact),
-        _ => {}
-    }
 }
 
 /// 导入方向把「没用的凭据」也抹成 null：空串会覆盖本机旧值，enc: 是内核在本机加密的，换机解不开
@@ -949,26 +761,24 @@ mod tests {
         })
     }
 
-    /// 导出的备份里不能出现任何密钥字符，但结构要完整到能导回去
+    /// 导出不脱敏：模型密钥和 headers 里的凭据原样带走
     #[test]
-    fn export_redacts_secrets_and_keeps_shape() {
-        let mut clean = provider_fixture();
-        redact(&mut clean);
-        let text = clean.to_string();
-        assert!(!text.contains("sk-secret-value"));
-        assert!(!text.contains("Bearer abc"));
-        assert_eq!(clean["options"]["apiKey"], Value::Null);
-        assert_eq!(clean["options"]["headers"]["Authorization"], Value::Null);
-        assert_eq!(clean["options"]["headers"]["x-trace"], "1");
-        assert_eq!(clean["options"]["baseURL"], "https://api.example/v1");
-        assert_eq!(clean["models"]["m1"]["limit"]["context"], 1);
+    fn export_keeps_provider_credentials() {
+        let root = serde_json::json!({ "provider": { "relay": provider_fixture() } });
+        let map = collect_entries(root.get("provider"), |id| providers::valid_id(id).is_ok());
+        let clean = Value::Object(map);
+        assert_eq!(clean["relay"]["options"]["apiKey"], "sk-secret-value");
+        assert_eq!(clean["relay"]["options"]["headers"]["Authorization"], "Bearer abc");
+        assert_eq!(clean["relay"]["options"]["headers"]["x-trace"], "1");
+        assert_eq!(clean["relay"]["models"]["m1"]["limit"]["context"], 1);
     }
 
     /// 换机恢复：本地没密钥时不会留下 null；本机恢复：原有密钥和界面不认识的键都保留
     #[test]
     fn import_merges_and_keeps_local_keys() {
         let mut clean = provider_fixture();
-        redact(&mut clean);
+        clean["options"]["apiKey"] = Value::Null;
+        clean["options"]["headers"]["Authorization"] = Value::Null;
 
         let mut fresh = Value::Object(Map::new());
         merge_into(&mut fresh, &clean);
@@ -1010,9 +820,9 @@ mod tests {
         assert_eq!(local["options"]["timeout"], 120000);
     }
 
-    /// 导出 → 导入整条链：模型和 MCP 能还原形状，密钥不跟着走，本机已有密钥不被覆盖
+    /// 导出 → 导入整条链：模型、MCP 和密钥都能还原，明文备份把凭据一起带走
     #[test]
-    fn bundle_round_trip_restores_config_without_secrets() {
+    fn bundle_round_trip_restores_config_with_secrets() {
         let ws = std::env::temp_dir().join(format!(
             "codearts-backup-ws-{}-{}",
             std::process::id(),
@@ -1046,11 +856,12 @@ mod tests {
             &root,
             serde_json::json!({ "theme": "dark" }),
             Value::Array(Vec::new()),
-            None,
+            &|_| None,
         );
         let text = bundle.to_string();
-        assert!(!text.contains("sk-secret-value"));
-        assert!(!text.contains("ghp_x"));
+        assert!(text.contains("sk-secret-value"));
+        assert!(text.contains("ghp_x"));
+        // enc: 解不开，留空
         assert!(!text.contains("enc:keep"));
         // 内核自带的提供商不归壳管，不出现在备份里
         assert!(bundle["providers"].get("huaweicloud-maas").is_none());
@@ -1072,22 +883,22 @@ mod tests {
         let mut report = ImportReport::default();
         assert!(apply_config(&mut fresh, &hand, &mut report).unwrap());
         assert_eq!((report.providers, report.providers_skipped), (1, 2));
-        assert_eq!(report.keys_missing, 1);
+        assert_eq!(report.keys_missing, 0);
         assert_eq!((report.mcp, report.mcp_skipped), (1, 1));
         assert_eq!(fresh["provider"]["relay"]["options"]["baseURL"], "https://api.example/v1");
-        assert!(fresh["provider"]["relay"]["options"].get("apiKey").is_none());
+        assert_eq!(fresh["provider"]["relay"]["options"]["apiKey"], "sk-secret-value");
         assert_eq!(fresh["provider"]["relay"]["options"]["headers"]["x-trace"], "1");
         assert_eq!(fresh["provider"]["relay"]["models"]["m1"]["limit"]["output"], 1);
-        assert!(fresh["mcp"]["gh"]["environment"].get("GITHUB_TOKEN").is_none());
+        assert_eq!(fresh["mcp"]["gh"]["environment"]["GITHUB_TOKEN"], "ghp_x");
         assert_eq!(fresh["mcp"]["gh"]["environment"]["PLAIN"], "1");
         assert_eq!(fresh["mcp"]["gh"]["command"], "npx");
 
-        // 本机已有密钥：再导一次保留原值，也不再计入 keys_missing
+        // 明文备份里的密钥会覆盖本机旧值
         let mut again = fresh.clone();
         again["provider"]["relay"]["options"]["apiKey"] = serde_json::json!("sk-local");
         let mut report = ImportReport::default();
         apply_config(&mut again, &bundle, &mut report).unwrap();
-        assert_eq!(again["provider"]["relay"]["options"]["apiKey"], "sk-local");
+        assert_eq!(again["provider"]["relay"]["options"]["apiKey"], "sk-secret-value");
         assert_eq!(report.keys_missing, 0);
 
         let _ = std::fs::remove_dir_all(&ws);
@@ -1117,13 +928,13 @@ mod tests {
         let root = serde_json::json!({ "provider": { "relay": provider_fixture() } });
         write_bundle(
             &path,
-            &build_bundle(&settings, &root, Value::Null, Value::Array(Vec::new()), None),
+            &build_bundle(&settings, &root, Value::Null, Value::Array(Vec::new()), &|_| None),
         )
         .unwrap();
         let doc: Value = serde_json::from_str(&read_bundle(&path).unwrap()).unwrap();
         assert_eq!(doc["settings"]["keepAwake"], true);
         assert_eq!(doc["providers"]["relay"]["options"]["baseURL"], "https://api.example/v1");
-        assert!(doc["providers"]["relay"]["options"]["apiKey"].is_null());
+        assert_eq!(doc["providers"]["relay"]["options"]["apiKey"], "sk-secret-value");
         // 目标是个目录时明确报错，别把临时文件留在旁边
         assert!(write_bundle(&dir, &serde_json::json!({})).is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1139,82 +950,46 @@ mod tests {
         }
     }
 
-    /// 口令加密：原文不出现在文件里，口令对了能原样解开，错口令和改过的密文都要拒绝
+    /// 导出：盘上明文优先，enc: 的才退回壳留的副本；headers 里的凭据原样带走
     #[test]
-    fn passphrase_sealed_backup_round_trips() {
-        let bundle = serde_json::json!({
-            "app": APP,
-            "kind": KIND,
-            "version": VERSION,
-            "providers": { "relay": { "options": { "apiKey": "sk-secret-value" } } }
-        });
-        let sealed = seal(&bundle, "correct horse").unwrap();
-        assert_eq!(sealed["kind"], KIND_ENC);
-        assert!(!sealed.to_string().contains("sk-secret-value"));
-
-        assert_eq!(open(&sealed, "correct horse").unwrap(), bundle);
-        assert!(open(&sealed, "wrong").is_err());
-        assert!(open(&sealed, "").is_err());
-
-        // 改一个字节就解不开，不会悄悄返回半份配置
-        let mut tampered = sealed.clone();
-        let mut raw = B64.decode(tampered["crypto"]["data"].as_str().unwrap()).unwrap();
-        raw[0] ^= 1;
-        tampered["crypto"]["data"] = B64.encode(raw).into();
-        assert!(open(&tampered, "correct horse").is_err());
-
-        // 外层缺口令时明确拒绝，别当成明文备份继续走
-        assert!(unwrap_bundle(sealed.clone(), None).is_err());
-        assert!(unwrap_bundle(sealed, Some("correct horse")).unwrap().1);
-    }
-
-    /// 加密导出：模型密钥优先用壳留的明文副本；盘上 enc: 的换机解不开，留空
-    #[test]
-    fn encrypted_export_prefers_plaintext_vault_keys() {
+    fn export_prefers_disk_plaintext_then_vault() {
         let root = serde_json::json!({
             "provider": {
                 "relay": { "options": {
                     "baseURL": "https://api.example/v1",
-                    "apiKey": "enc:v3:disk",
+                    "apiKey": "enc:v4:disk",
                     "headers": { "Authorization": "Bearer abc" }
                 } },
-                "other": { "options": { "apiKey": "enc:v3:other" } },
-                "plain": { "options": { "apiKey": "sk-disk-plain" } }
+                "other": { "options": { "apiKey": "enc:v4:other" } },
+                "plain": { "options": { "apiKey": "sk-disk-plain" } },
+                "both": { "options": { "apiKey": "sk-disk-newest" } }
             }
         });
         let settings = Settings::default();
-        let vault = |id: &str| (id == "relay").then(|| "sk-vault".to_string());
+        let vault = |id: &str| match id {
+            "relay" => Some("sk-vault".to_string()),
+            "both" => Some("sk-vault-stale".to_string()),
+            _ => None,
+        };
         let full = build_bundle(
             &settings,
             &root,
             Value::Null,
             Value::Array(Vec::new()),
-            Some(&vault as &dyn Fn(&str) -> Option<String>),
+            &vault,
         );
         assert_eq!(full["providers"]["relay"]["options"]["apiKey"], "sk-vault");
         assert_eq!(
             full["providers"]["relay"]["options"]["headers"]["Authorization"],
-            "Bearer abc",
-            "加密备份连 headers 里的凭据一起带走"
+            "Bearer abc"
         );
         assert!(full["providers"]["other"]["options"]["apiKey"].is_null());
         assert_eq!(full["providers"]["plain"]["options"]["apiKey"], "sk-disk-plain");
-
-        // 不加密时不带上任何密钥
-        let plain = build_bundle(
-            &settings,
-            &root,
-            Value::Null,
-            Value::Array(Vec::new()),
-            None,
-        );
-        assert!(plain["providers"]["relay"]["options"]["apiKey"].is_null());
-        assert!(plain["providers"]["plain"]["options"]["apiKey"].is_null());
-        assert!(plain["providers"]["relay"]["options"]["headers"]["Authorization"].is_null());
+        assert_eq!(full["providers"]["both"]["options"]["apiKey"], "sk-disk-newest");
     }
 
     #[test]
-    fn credentials_only_come_from_full_backups() {
+    fn credentials_require_both_halves() {
         let doc = serde_json::json!({ "credentials": { "ak": "AK1", "sk": " SK1 " } });
         assert_eq!(credentials_of(&doc), Some(("AK1", "SK1")));
         assert_eq!(

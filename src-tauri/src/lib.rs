@@ -144,31 +144,20 @@ fn mask_ak(ak: &str) -> String {
 }
 
 /// 设置备份：配置由 Rust 侧汇总，前端只把 localStorage 那部分偏好带进来。
-/// 给了口令就整份加密，并带上 AK/SK 和模型密钥；不给就是不含凭据的明文备份。
+/// 备份是明文，AK/SK 和模型密钥都原样写入。
 #[tauri::command]
 fn settings_export(
     app: tauri::AppHandle,
     path: String,
     prefs: Value,
-    passphrase: Option<String>,
 ) -> Result<String, Error> {
-    backup::export(&app, &path, prefs, passphrase.as_deref())
+    backup::export(&app, &path, prefs)
 }
 
-/// 导入备份：工作区只并已存在的目录，模型和 MCP 与本地配置合并，凭据只从加密备份恢复
+/// 导入备份：工作区只并已存在的目录，模型和 MCP 与本地配置合并；明文备份连凭据一起恢复
 #[tauri::command]
-fn settings_import(
-    app: tauri::AppHandle,
-    path: String,
-    passphrase: Option<String>,
-) -> Result<backup::ImportReport, Error> {
-    backup::import(&app, &path, passphrase.as_deref())
-}
-
-/// 选完文件先问一句是不是加密的，前端据此决定弹不弹口令框
-#[tauri::command]
-fn settings_backup_encrypted(path: String) -> Result<bool, Error> {
-    backup::is_encrypted(&path)
+fn settings_import(app: tauri::AppHandle, path: String) -> Result<backup::ImportReport, Error> {
+    backup::import(&app, &path)
 }
 
 /// 第三方模型提供商：写进内核的全局配置，密钥只回显脱敏形态
@@ -279,7 +268,6 @@ pub fn run() {
             credentials_status,
             settings_export,
             settings_import,
-            settings_backup_encrypted,
             providers_list,
             providers_save,
             providers_remove,
