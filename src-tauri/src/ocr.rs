@@ -9,6 +9,8 @@ pub async fn ocr_image(data_url: String) -> Result<String, String> {
         .map_err(|e| format!("OCR 任务异常：{e}"))?
 }
 
+/// 非 macOS 平台暂时没有调用方（Windows/Linux 的本地 OCR 还没接），允许 dead_code
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn decode_data_url(data_url: &str) -> Result<Vec<u8>, String> {
     let (head, payload) = data_url
         .split_once(',')

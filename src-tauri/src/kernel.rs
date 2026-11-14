@@ -729,7 +729,7 @@ async fn tasklist_image_is(pid: u32, image: &str) -> bool {
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .to_ascii_lowercase()
-                .contains(&format!(""{image}""))
+                .contains(&format!("\"{image}\""))
         })
         .unwrap_or(false)
 }
