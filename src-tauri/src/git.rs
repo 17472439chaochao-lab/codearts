@@ -357,7 +357,7 @@ async fn git(root: &Path, args: &[&str]) -> Result<Output> {
 }
 
 async fn git_t(root: &Path, args: &[&str], limit: Duration) -> Result<Output> {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::kernel::spawn_cmd("git");
     cmd.arg("-C")
         .arg(root)
         .args(args)

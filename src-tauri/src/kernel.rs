@@ -11,6 +11,18 @@ use crate::error::{Error, MsgExt, Result};
 use crate::settings::Settings;
 use crate::{secrets, trust};
 
+/// Windows 上控制台子进程（内核、git、tasklist…）默认各弹一个黑窗口，
+/// 用户一关还会把内核带走；CREATE_NO_WINDOW 让它们后台静默跑。
+/// unix 上无此标志，原样返回。
+pub(crate) fn spawn_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    // mac 上不走 creation_flags 分支，mut 用不到
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
 const HEALTH_PATH: &str = "/global/health";
 const LOG_TAIL: usize = 4000;
 const PROBE_FRESH: Duration = Duration::from_secs(2);
@@ -267,7 +279,7 @@ impl Kernel {
             password: random_password(),
             pid: None,
         };
-        let mut cmd = Command::new(&bin);
+        let mut cmd = spawn_cmd(&bin);
         cmd.args([
             "serve",
             "--port",
@@ -374,7 +386,7 @@ impl Kernel {
             (bin, home, data_dir, project, ak, sk, restart)
         };
 
-        let mut cmd = Command::new(&bin);
+        let mut cmd = spawn_cmd(&bin);
         cmd.arg("upgrade").current_dir(&project);
         kernel_env(&mut cmd, &home, &data_dir, &ak, &sk);
         scenario_env(&mut cmd, &home);
@@ -649,7 +661,7 @@ async fn reap_stored_pid() {
 /// pid 会被系统复用：要求命令行里既有名为 codearts 的可执行文件，又有 serve 参数
 #[cfg(not(windows))]
 async fn unix_reap(pid: u32) {
-    let cmdline = tokio::process::Command::new("ps")
+    let cmdline = spawn_cmd("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
         .await
@@ -661,7 +673,7 @@ async fn unix_reap(pid: u32) {
         return;
     }
     eprintln!("[kernel] 回收上次遗留的内核 pid={pid}");
-    let _ = tokio::process::Command::new("kill")
+    let _ = spawn_cmd("kill")
         .args(["-TERM", &pid.to_string()])
         .status()
         .await;
@@ -672,7 +684,7 @@ async fn unix_reap(pid: u32) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let _ = tokio::process::Command::new("kill")
+    let _ = spawn_cmd("kill")
         .args(["-KILL", &pid.to_string()])
         .status()
         .await;
@@ -701,7 +713,7 @@ fn is_codearts_serve(cmdline: &str) -> bool {
 async fn pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        tokio::process::Command::new("tasklist")
+        spawn_cmd("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH"])
             .output()
             .await
@@ -710,7 +722,7 @@ async fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
-        tokio::process::Command::new("kill")
+        spawn_cmd("kill")
             .args(["-0", &pid.to_string()])
             .status()
             .await
@@ -722,7 +734,7 @@ async fn pid_alive(pid: u32) -> bool {
 /// `tasklist` 里该 pid 的镜像名是否恰好是 image（不区分大小写）
 #[cfg(windows)]
 async fn tasklist_image_is(pid: u32, image: &str) -> bool {
-    tokio::process::Command::new("tasklist")
+    spawn_cmd("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output()
         .await
@@ -742,7 +754,7 @@ async fn windows_reap(pid: u32) {
         return;
     }
     eprintln!("[kernel] 回收上次遗留的内核 pid={pid}");
-    let _ = tokio::process::Command::new("taskkill")
+    let _ = spawn_cmd("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .status()
         .await;

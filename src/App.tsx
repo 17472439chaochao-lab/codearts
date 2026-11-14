@@ -55,12 +55,19 @@ export function useAppVersion(): string | null {
 
 type Runner = <T>(fn: () => Promise<T>) => Promise<T | null>;
 
+/** WebView2 的 UA 里带 Windows NT，够分辨平台了，不必再引 plugin-os */
+const IS_WINDOWS = /Windows/.test(navigator.userAgent);
 /** 官方安装命令照抄文档，别自己编；复制按钮只给这一句 */
-const KERNEL_INSTALL_CMD =
-  'sh -c "$(curl -L https://cnnorth4-cloudide-marketplace.obs.cn-north-4.myhuaweicloud.com/codearts/cli_tui/install_script/install.sh)"';
+const KERNEL_INSTALL_CMD = IS_WINDOWS
+  ? "irm https://cnnorth4-cloudide-marketplace.obs.cn-north-4.myhuaweicloud.com/codearts/cli_tui/install_script/install.ps1 | iex"
+  : 'sh -c "$(curl -L https://cnnorth4-cloudide-marketplace.obs.cn-north-4.myhuaweicloud.com/codearts/cli_tui/install_script/install.sh)"';
 /** 装完还要把 installers 目录放进 PATH，这句留在说明里，不混进复制的命令 */
-const KERNEL_PATH_CMD = "export PATH=~/.codeartsdoer/installers:$PATH";
-const KERNEL_REL_PATH = ".codeartsdoer/installers/bin/codearts";
+const KERNEL_PATH_CMD = IS_WINDOWS
+  ? 'set "PATH=%USERPROFILE%\.codeartsdoer\installers\bin;%PATH%"'
+  : "export PATH=~/.codeartsdoer/installers:$PATH";
+const KERNEL_REL_PATH = IS_WINDOWS
+  ? ".codeartsdoer\installers\bin\codearts.exe"
+  : ".codeartsdoer/installers/bin/codearts";
 
 export default function App() {
   const [check, setCheck] = useState<EnvCheck | null>(null);
@@ -314,12 +321,14 @@ function Setup({
           ) : (
             <>
               <p className="hint">
-                没有在 <code>{`${check?.kernelHome ?? "~"}/${KERNEL_REL_PATH}`}</code> 找到内核。
-                请在终端执行官方安装命令：
+                没有在 <code>{`${check?.kernelHome ?? "~"}${IS_WINDOWS ? "\\" : "/"}${KERNEL_REL_PATH}`}</code> 找到内核。
+                请在{IS_WINDOWS ? " PowerShell" : "终端"}执行官方安装命令：
               </p>
               <CopyLine text={KERNEL_INSTALL_CMD} onError={onError} />
               <p className="hint">
-                装完把 <code>{KERNEL_PATH_CMD}</code> 加进 shell 配置，再点重新检测。
+                {IS_WINDOWS
+                  ? <>装完在当前 PowerShell 执行 <code>{KERNEL_PATH_CMD}</code>（或把它加进系统 PATH），再点重新检测。</>
+                  : <>装完把 <code>{KERNEL_PATH_CMD}</code> 加进 shell 配置，再点重新检测。</>}
               </p>
             </>
           )}
