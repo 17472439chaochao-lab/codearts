@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "test": "node --test src/messageState.test.mjs src/toolOutput.test.mjs",
     "test:ui": "node tests/run-ui.mjs",
-    "tauri": "tauri"
+    "tauri": "node scripts/tauri.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
