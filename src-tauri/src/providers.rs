@@ -440,6 +440,34 @@ pub fn remove(app: &tauri::AppHandle, id: &str) -> Result<Vec<ProviderView>> {
     list(app)
 }
 
+/// 从 /models 的一项里尽量抠出上下文窗口。字段名没有统一标准：
+/// OpenRouter 是 context_length，vLLM/SGLang 是 max_model_len，Anthropic 兼容层是
+/// max_input_tokens，Ollama 风格在 meta.n_ctx_train，还有一批用 context_window。
+fn model_context(m: &Value) -> Option<u64> {
+    const FLAT: [&str; 7] = [
+        "context_length",
+        "max_context_length",
+        "max_model_len",
+        "max_input_tokens",
+        "input_token_limit",
+        "context_window",
+        "max_tokens",
+    ];
+    FLAT.iter()
+        .find_map(|k| m.get(*k).and_then(Value::as_u64))
+        .or_else(|| {
+            m.get("top_provider")
+                .and_then(|t| t.get("context_length"))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            m.get("meta")
+                .and_then(|x| x.get("n_ctx_train"))
+                .and_then(Value::as_u64)
+        })
+        .filter(|n| *n > 0)
+}
+
 /// 走 OpenAI 兼容的 `GET {baseURL}/models` 探一把，顺便当连通性检查
 pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<PulledModel>> {
     valid_base_url(base_url)?;
@@ -471,11 +499,8 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<PulledMod
                     let id = m.get("id").and_then(Value::as_str)?;
                     Some(PulledModel {
                         id: id.to_string(),
-                        // 只有 OpenRouter 这类网关会在 /models 里带窗口大小，多数厂不给
-                        context: m
-                            .get("context_length")
-                            .or_else(|| m.get("max_context_length"))
-                            .and_then(Value::as_u64),
+                        // 各网关的字段名五花八门；都读一遍，读不到才由界面按兜底值填
+                        context: model_context(m),
                     })
                 })
                 .collect()
@@ -489,6 +514,22 @@ pub async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<PulledMod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_context_from_common_model_fields() {
+        assert_eq!(model_context(&serde_json::json!({"context_length": 1048576})), Some(1048576));
+        assert_eq!(model_context(&serde_json::json!({"max_model_len": 262144})), Some(262144));
+        assert_eq!(
+            model_context(&serde_json::json!({"top_provider": {"context_length": 200000}})),
+            Some(200000)
+        );
+        assert_eq!(
+            model_context(&serde_json::json!({"meta": {"n_ctx_train": 131072}})),
+            Some(131072)
+        );
+        assert_eq!(model_context(&serde_json::json!({"id": "m"})), None);
+        assert_eq!(model_context(&serde_json::json!({"context_length": 0})), None);
+    }
 
     #[test]
     fn rejects_reserved_and_bad_ids() {

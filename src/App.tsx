@@ -1448,7 +1448,11 @@ function SkillManager({
   );
 }
 
-/** 内核配置里第三方模型的窗口缺省值：/models 大多不返回，先给个能跑的先填上，用户可改 */
+/**
+ * 内核配置里第三方模型的窗口缺省值。
+ * `/models` 大多不返回窗口大小，只能先填一个保守值；填小了内核会按这个数提前压缩上下文，
+ * 所以表单里明确提示用户按模型实际规格改（1M 窗口填 1000000）。
+ */
 const DEFAULT_CONTEXT = 128000;
 
 type ModelRow = { id: string; name: string; context: string; output: string; reasoning: boolean };
@@ -1581,6 +1585,8 @@ function ModelSettings({
   /** 内核还没同步的那次操作：忙 → 重载内核，新标识 → 重启内核 */
   const [pending, setPending] = useState<PendingOp | null>(null);
   const [working, setWorking] = useState(false);
+  /** 「批量设上下文」这一格：一次把 1M 窗口刷到所有模型，免得逐个改 */
+  const [bulkCtx, setBulkCtx] = useState("");
 
   const reload = useCallback(
     () =>
@@ -1621,6 +1627,24 @@ function ModelSettings({
   function setRow(i: number, patch: Partial<ModelRow>) {
     setForm((f) =>
       f ? { ...f, models: f.models.map((r, j) => (j === i ? { ...r, ...patch } : r)) } : f,
+    );
+  }
+
+  /** 把同一个上下文窗口写到表单里的每一行；输出留空，保存时按窗口的 1/4 自动算 */
+  function applyBulkContext() {
+    const n = Math.floor(Number(bulkCtx));
+    if (!Number.isFinite(n) || n <= 0) return;
+    setForm((f) =>
+      f
+        ? {
+            ...f,
+            models: f.models.map((r) => ({
+              ...r,
+              context: String(n),
+              output: r.output || String(Math.min(8192, Math.max(1024, Math.floor(n / 4)))),
+            })),
+          }
+        : f,
     );
   }
 
@@ -1752,7 +1776,11 @@ function ModelSettings({
               }
             : f,
         );
-        setNote(`拉到 ${ids.length} 个模型，窗口大小按 ${DEFAULT_CONTEXT} 兜底，按实际改一下`);
+        setNote(
+          ids.some((m) => !m.context)
+            ? `拉到 ${ids.length} 个模型；没返回窗口大小的按 ${DEFAULT_CONTEXT / 1024}K 兜底。模型实际是 256K/1M 的话，把「上下文」改成对应数字，不然内核会按兜底值提前压缩`
+            : `拉到 ${ids.length} 个模型，窗口大小已按接口返回值填好`,
+        );
       }
     } catch (e) {
       // 已存的密钥内核是加密放的，这一趟没法替你解密，只能让用户重填
@@ -1920,6 +1948,22 @@ function ModelSettings({
               spellCheck={false}
               autoComplete="off"
             />
+          </div>
+          <div className="row">
+            <input
+              value={bulkCtx}
+              onChange={(e) => setBulkCtx(e.target.value)}
+              placeholder="例如 1000000"
+              inputMode="numeric"
+              style={{ flex: "0 0 150px" }}
+              title="把同一个上下文窗口写到下面所有模型"
+            />
+            <button onClick={applyBulkContext} disabled={!bulkCtx.trim()}>
+              应用到所有模型
+            </button>
+            <span className="hint" style={{ margin: 0 }}>
+              填小了内核会提前压缩；1M 窗口填 1000000
+            </span>
           </div>
           <div className="mhead">
             <span>模型 ID</span>

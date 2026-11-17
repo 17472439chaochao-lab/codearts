@@ -101,15 +101,24 @@ impl Default for Kernel {
 
 impl Kernel {
     pub fn new() -> Self {
+        // 内核永远在 127.0.0.1 上，绝不能走系统代理：Windows 上 Clash/杀毒软件把
+        // HTTP_PROXY 设成全局时，localhost 也会被塞进代理，短请求能过、SSE 长连接被
+        // 缓冲或掐断，表现就是「内核在线但事件流一直中断」。
         let client = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(120))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
             .expect("reqwest client");
-        // /event 有心跳但间隔不定，65s 收不到任何字节视为链路已死，让 pump 重连
+        // SSE 不设读超时：内核的心跳是 10s 一帧，但 Windows 上 Bun 的小包可能先攒在
+        // 缓冲区里，空闲会话时 65s 收不到字节就会把一条好连接误判成断线，表现成
+        // 「内核在线但事件流反复中断」。进程真的僵死由 watch 的健康探测兜底，
+        // 半开连接交给 30s TCP keepalive（Windows 默认是 2 小时，太晚）。
         let sse = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(Duration::from_secs(3))
-            .read_timeout(Duration::from_secs(65))
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
             .expect("reqwest sse client");
         Self {

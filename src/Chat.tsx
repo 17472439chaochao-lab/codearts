@@ -393,6 +393,8 @@ export default function Chat({
   const [alert, setAlert] = useState<{ text: string; cmd: string } | null>(null);
   /** 事件流链路状态：断线期间帧会丢，重连后要补拉一次数据 */
   const [bridge, setBridge] = useState<"open" | "down">("open");
+  /** 最近一次断线原因：横幅不展开，但鼠标悬停能看，出问题时可截图定位 */
+  const [bridgeMsg, setBridgeMsg] = useState<string | null>(null);
   const bridgeDown = useRef(false);
   /** file.edited 的脉冲：让正在跑的那轮小结胶囊跳动一下 */
   const [editPulse, setEditPulse] = useState(0);
@@ -407,7 +409,11 @@ export default function Chat({
   /** 内核的 question 工具在等人选项：不接住就只能看着一张 JSON 卡片卡在"执行中" */
   const [asks, setAsks] = useState<QuestionRequest[]>([]);
   const [models, setModels] = useState<ModelInfo[]>([]);
+  const modelsRef = useRef<ModelInfo[]>([]);
+  modelsRef.current = models;
   const [model, setModel] = useState<ModelRef | null>(null);
+  const modelRef = useRef<ModelRef | null>(null);
+  modelRef.current = model;
   const [rules, setRules] = useState<PermRule[] | null>(null);
   const [bashMode, setBashMode] = useState<BashMode | null>(null);
   const thread = useRef<HTMLDivElement>(null);
@@ -1120,10 +1126,11 @@ export default function Chat({
 
   /** Rust 侧 SSE 桥的链路状态；从 down 恢复到 open 才补数据（首连不补） */
   useEffect(() => {
-    const stop = listen<{ state?: string }>("kernel-bridge", ({ payload }) => {
+    const stop = listen<{ state?: string; message?: string }>("kernel-bridge", ({ payload }) => {
       if (payload?.state === "down") {
         bridgeDown.current = true;
         setBridge("down");
+        setBridgeMsg(payload.message ?? null);
       } else if (payload?.state === "open") {
         const wasDown = bridgeDown.current;
         bridgeDown.current = false;
@@ -1347,7 +1354,18 @@ export default function Chat({
           break;
         // 压缩在时间线上不留别的痕迹，不提示只会觉得"聊着聊着忘事了"
         case "session.compacted":
-          if (sid === cur) setToast("上下文已压缩，内核会带着摘要继续");
+          if (sid === cur) {
+            const sel = modelRef.current;
+            const m = modelsRef.current.find(
+              (x) => x.providerID === sel?.providerID && x.modelID === sel?.modelID,
+            );
+            const ctx = m?.context;
+            setToast(
+              ctx
+                ? `上下文已压缩（当前模型按 ${Math.round(ctx / 1024)}K 窗口配置；如果模型实际更大，去 设置 → 模型 把上下文改大）`
+                : "上下文已压缩，内核会带着摘要继续",
+            );
+          }
           break;
         // 改动明细：内核已按轮写入用户消息的 summary.diffs，idle 重拉时自然带上，不再单独接
         // 文件被改（无 sessionID，不冒充精确归属）：让跑着的那轮胶囊脉冲一下即可
@@ -1651,6 +1669,36 @@ export default function Chat({
     void addImages(files);
   }
 
+  /**
+   * 只认「这一轮根本没被内核接下」的错误；provider 报的 4xx/5xx 不在这里重发，避免重复一轮。
+   * `SyncEvent.run: "sessionID" required` 是内核记忆插件发的「记忆已更新」注入缺 sessionID，
+   * 会让 prompt_async 在入口直接 500；重发时那条注入已经消费掉，正好能过。
+   */
+  function isPromptTransportError(e: unknown): boolean {
+    const text = String((e as { message?: unknown })?.message ?? e ?? "");
+    return /Session not found|会话不存在|SyncEvent\.run|"sessionID" required|error sending request|connection (refused|reset|closed)|timed out|ECONN/i.test(
+      text,
+    );
+  }
+
+  /** 内核入口级的瞬时失败最多补发两次；间隔递增，给目录实例/记忆注入一点时间 */
+  async function promptWithRetry(
+    id: string,
+    parts: unknown[],
+    target: string | null,
+    model: ModelRef | null,
+    agent: string | null,
+  ) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await sessions.prompt(id, parts, target, model, agent);
+      } catch (e) {
+        if (attempt >= 2 || !isPromptTransportError(e)) throw e;
+        await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+      }
+    }
+  }
+
   async function send() {
     if (sending.current || readOnly || busy || perms.length > 0 || asks.length > 0) return;
     const raw = input.trim();
@@ -1725,7 +1773,9 @@ export default function Chat({
       setBusySet((s) => new Set(s).add(id));
       runSeen.current.add(id);
       try {
-        await sessions.prompt(id, parts, target, model, agent);
+        // 新建会话后目录实例可能还没登记完，prompt 偶发 404/连接被打断；
+        // 这类错误内核没接下这一轮，稍等补发就能过，不必让用户手动点重试
+        await promptWithRetry(id, parts, target, model, agent);
         setFollow(true);
       } catch (e) {
         runSeen.current.delete(id);
@@ -1759,7 +1809,7 @@ export default function Chat({
     setBusySet((s) => new Set(s).add(id));
     runSeen.current.add(id);
     try {
-      await sessions.prompt(id, retryParts, dirOf(id), model, agent);
+      await promptWithRetry(id, retryParts, dirOf(id), model, agent);
       setFollow(true);
     } catch (e) {
       runSeen.current.delete(id);
@@ -2122,6 +2172,9 @@ export default function Chat({
         rows.push({ key: m.info.id, owner: m.info.id, user: m, assistants: [] });
         continue;
       }
+      // 压缩摘要（summary=true）是内核喂给下一轮的内部上下文，不是用户想看的回复；
+      // 里头还会带上注入的整份记忆索引，摊在时间线上又长又像"记忆被全量吐出来"。
+      if ((m.info as { summary?: boolean }).summary) continue;
       const last = rows[rows.length - 1];
       if (last) last.assistants.push(m);
       else rows.push({ key: m.info.id, owner: "", assistants: [m] });
@@ -2670,7 +2723,7 @@ export default function Chat({
         </header>
 
         {bridge === "down" && (
-          <p className="hint bridge">
+          <p className="hint bridge" title={bridgeMsg ?? undefined}>
             事件流中断，正在自动重连…重连后会自动补齐期间的数据
           </p>
         )}

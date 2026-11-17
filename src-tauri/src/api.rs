@@ -190,11 +190,24 @@ pub fn spawn_pump(app: tauri::AppHandle, ep: Endpoint) {
             if kernel.current_endpoint() != Some(ep.clone()) {
                 return;
             }
-            if let Err(e) = stream(&app, &kernel, &ep).await {
-                let _ = app.emit(
-                    "kernel-bridge",
-                    serde_json::json!({ "state": "down", "message": e.to_string() }),
-                );
+            match stream(&app, &kernel, &ep).await {
+                Ok(()) => {
+                    // 服务端/代理干净地关掉长连接时不会报错；这时也要告知前端并补数据，
+                    // 否则界面一直以为链路是通的，断线期间的事件就悄悄丢了
+                    if kernel.current_endpoint() != Some(ep.clone()) {
+                        return;
+                    }
+                    let _ = app.emit(
+                        "kernel-bridge",
+                        serde_json::json!({ "state": "down", "message": "事件流已关闭" }),
+                    );
+                }
+                Err(e) => {
+                    let _ = app.emit(
+                        "kernel-bridge",
+                        serde_json::json!({ "state": "down", "message": e.to_string() }),
+                    );
+                }
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
