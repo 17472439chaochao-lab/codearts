@@ -9,6 +9,58 @@ pub async fn ocr_image(data_url: String) -> Result<String, String> {
         .map_err(|e| format!("OCR 任务异常：{e}"))?
 }
 
+/// 读取剪贴板中的图片（解决 macOS WebKit 无法通过 navigator.clipboard 读取图片的问题）
+#[tauri::command]
+pub fn read_clipboard_image() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::msg_send;
+        use objc2::rc::autoreleasepool;
+        use objc2::runtime::{AnyClass, AnyObject};
+        use objc2_foundation::{NSData, NSString};
+
+        autoreleasepool(|_| {
+            let cls = AnyClass::get(c"NSPasteboard")?;
+            let pboard: *mut AnyObject = unsafe { msg_send![cls, generalPasteboard] };
+            if pboard.is_null() {
+                return None;
+            }
+
+            // 优先检查 png
+            let png_type = NSString::from_str("public.png");
+            let data: *mut NSData = unsafe { msg_send![pboard, dataForType: &*png_type] };
+            if let Some(data) = unsafe { data.as_ref() } {
+                let bytes_ptr: *const u8 = unsafe { msg_send![data, bytes] };
+                let len: usize = unsafe { msg_send![data, length] };
+                if !bytes_ptr.is_null() && len > 0 {
+                    let slice = unsafe { std::slice::from_raw_parts(bytes_ptr, len) };
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(slice);
+                    return Some(format!("data:image/png;base64,{b64}"));
+                }
+            }
+
+            // 次选 tiff (macOS 截图原生支持 tiff)
+            let tiff_type = NSString::from_str("public.tiff");
+            let data: *mut NSData = unsafe { msg_send![pboard, dataForType: &*tiff_type] };
+            if let Some(data) = unsafe { data.as_ref() } {
+                let bytes_ptr: *const u8 = unsafe { msg_send![data, bytes] };
+                let len: usize = unsafe { msg_send![data, length] };
+                if !bytes_ptr.is_null() && len > 0 {
+                    let slice = unsafe { std::slice::from_raw_parts(bytes_ptr, len) };
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(slice);
+                    return Some(format!("data:image/tiff;base64,{b64}"));
+                }
+            }
+
+            None
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// 非 macOS 平台暂时没有调用方（Windows/Linux 的本地 OCR 还没接），允许 dead_code
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn decode_data_url(data_url: &str) -> Result<Vec<u8>, String> {

@@ -126,8 +126,6 @@ export type ModelInfo = {
   providerName: string;
   context?: number;
   reasoning?: boolean;
-  /** 模型能不能直接看图；不能时壳用本机 OCR 兜底 */
-  image?: boolean;
   /** 是不是接进来的第三方提供商；内核自带的那两家不算 */
   custom: boolean;
 };
@@ -157,7 +155,6 @@ export function normalizeProviders(root: any): { models: ModelInfo[]; default: M
         providerName: providerLabel(p.id, p.name),
         context: m.limit?.context,
         reasoning: m.capabilities?.reasoning,
-        image: m.capabilities?.input?.image === true,
         custom: isCustomProvider(p.id),
       });
     }
@@ -562,4 +559,142 @@ export type VcsInfo = { branch?: string; default_branch?: string };
 export const vcs = {
   info: (dir?: string | null) => api<VcsInfo>("GET", "/vcs", undefined, dir),
 };
+
+export type OverviewStats = {
+  sessions: number;
+  messages: number;
+  days: number;
+};
+
+export type CostTokensStats = {
+  total_cost: string;
+  avg_cost_per_day: string;
+  avg_tokens_per_session: string;
+  median_tokens_per_session: string;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read: string;
+  cache_write: string;
+};
+
+export type ToolUsageItem = {
+  tool: string;
+  count: number;
+  percent: number;
+};
+
+export type ModelUsageItem = {
+  model: string;
+  messages: number;
+  input_tokens: string;
+  output_tokens: string;
+  cache_read: string;
+  cache_write: string;
+  cost: string;
+};
+
+export type StatsReport = {
+  overview: OverviewStats;
+  cost_tokens: CostTokensStats;
+  tool_usage: ToolUsageItem[];
+  model_usage: ModelUsageItem[];
+  raw: string;
+  cached_at?: number | null;
+  from_db?: boolean;
+};
+
+export const statsApi = {
+  report: (days?: number, project?: string, force = false) =>
+    invoke<StatsReport>("stats_report", {
+      days: days ?? null,
+      project: project ?? null,
+      force,
+    }),
+  lspStatus: () => invoke<boolean>("lsp_status"),
+  lspToggle: (enable: boolean) => invoke<boolean>("lsp_toggle", { enable }),
+  exportNative: (sessionId: string, path: string) =>
+    invoke<string>("session_native_export", { sessionId, path }),
+  importNative: (path: string) => invoke<string>("session_native_import", { path }),
+};
+
+export type CodebaseStatus = {
+  indexed: boolean;
+  message: string;
+  raw: string;
+};
+
+export type MemoryConfig = {
+  status: boolean;
+  enable_dream: boolean;
+  dream_min_hours?: number;
+  dream_min_sessions?: number;
+};
+
+export type MemoryFileItem = {
+  name: string;
+  path: string;
+  size: number;
+};
+
+export const codebaseApi = {
+  status: (project?: string | null) =>
+    invoke<CodebaseStatus>("codebase_status", { project: project ?? null }),
+  action: (action: "init" | "update" | "delete", project?: string | null) =>
+    invoke<string>("codebase_action", { action, project: project ?? null }),
+};
+
+export const memoryApi = {
+  status: () => invoke<MemoryConfig>("memory_status"),
+  toggle: (enable: boolean) => invoke<boolean>("memory_toggle", { enable }),
+  listFiles: (project?: string | null) =>
+    invoke<MemoryFileItem[]>("memory_list_files", { project: project ?? null }),
+  readFile: (filename: string, project?: string | null) =>
+    invoke<string>("memory_read_file", { filename, project: project ?? null }),
+  saveFile: (filename: string, content: string, project?: string | null) =>
+    invoke<void>("memory_save_file", { filename, content, project: project ?? null }),
+};
+
+export type CheckinHistoryItem = {
+  date: string;
+  time: string;
+  success: boolean;
+  channel: string;
+  message: string;
+  points?: number | null;
+};
+
+export type CheckinConfig = {
+  cookie: string;
+  auto_checkin: boolean;
+  channel: string;
+  custom_url?: string | null;
+  last_checkin_date?: string | null;
+  last_checkin_message?: string | null;
+  streak_days: number;
+  total_points: number;
+  history: CheckinHistoryItem[];
+};
+
+export type CheckinResult = {
+  success: boolean;
+  date: string;
+  message: string;
+  points?: number | null;
+  streak_days: number;
+  total_points: number;
+};
+
+export const checkinApi = {
+  getConfig: () => invoke<CheckinConfig>("checkin_get_config"),
+  saveConfig: (config: CheckinConfig) => invoke<void>("checkin_save_config", { config }),
+  executeNow: (channel?: string) =>
+    invoke<CheckinResult>("checkin_execute_now", { channel: channel ?? null }),
+  autoCheck: () => invoke<CheckinResult | null>("checkin_auto_check"),
+  openLoginWindow: (target?: string) =>
+    invoke<void>("checkin_open_login_window", { target: target ?? null }),
+  fetchWebviewCookies: () => invoke<string>("checkin_fetch_webview_cookies"),
+};
+
+
+
 

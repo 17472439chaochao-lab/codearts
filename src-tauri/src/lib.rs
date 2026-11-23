@@ -12,6 +12,8 @@ mod secrets;
 mod settings;
 mod skills;
 mod sleep;
+mod stats;
+mod checkin;
 mod tray;
 mod trust;
 
@@ -282,6 +284,7 @@ pub fn run() {
             kernel_upgrade,
             api_request,
             ocr::ocr_image,
+            ocr::read_clipboard_image,
             files::files_list,
             files::file_read,
             files::file_restore,
@@ -296,7 +299,25 @@ pub fn run() {
             skills::skills_managed,
             skills::skill_install_github,
             skills::skill_update_github,
-            skills::skill_uninstall
+            skills::skill_uninstall,
+            stats::stats_report,
+            stats::lsp_status,
+            stats::lsp_toggle,
+            stats::session_native_export,
+            stats::session_native_import,
+            stats::codebase_status,
+            stats::codebase_action,
+            stats::memory_status,
+            stats::memory_toggle,
+            stats::memory_list_files,
+            stats::memory_read_file,
+            stats::memory_save_file,
+            checkin::checkin_get_config,
+            checkin::checkin_save_config,
+            checkin::checkin_execute_now,
+            checkin::checkin_auto_check,
+            checkin::checkin_open_login_window,
+            checkin::checkin_fetch_webview_cookies
         ])
         .setup(|app| {
             let handle = app.handle().clone();

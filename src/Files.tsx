@@ -8,6 +8,7 @@ import { IS_WINDOWS } from "./App";
 import { useResolvedTheme, type ResolvedTheme } from "./theme";
 import type { ThemedToken } from "./highlight";
 import { renderMarkdown } from "./markdown";
+import { baseName } from "./workspaceUtils";
 
 /** 打开文件的坐标：rel 相对当前工作区，abs 用来和内核返回的改动路径对上 */
 export type OpenFile = {
@@ -73,7 +74,6 @@ export function relInRoot(root: string, abs: string): string | null {
   return abs.startsWith(r + "/") ? abs.slice(r.length + 1) : null;
 }
 
-const baseName = (p: string) => p.split(/[\\/]+/).filter(Boolean).pop() ?? p;
 const dirName = (rel: string) => {
   const i = rel.lastIndexOf("/");
   return i < 0 ? "" : rel.slice(0, i);

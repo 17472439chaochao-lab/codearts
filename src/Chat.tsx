@@ -1,6 +1,4 @@
 import {
-  Fragment,
-  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -10,8 +8,6 @@ import {
   type KeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
-  type RefObject,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -21,7 +17,7 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
-import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   agents,
   api,
@@ -40,7 +36,6 @@ import {
   type FileDiff,
   type KernelEvent,
   type Message,
-  type MessageInfo,
   type ModelInfo,
   type ModelRef,
   type Part,
@@ -49,18 +44,51 @@ import {
   type QuestionRequest,
   type Session,
   type Todo,
-  type ToolState,
   type VcsInfo,
 } from "./kernelApi";
-import { APP_TITLE, IS_WINDOWS, useAppVersion, type KernelStatus } from "./App";
+import { APP_TITLE, useAppVersion, type KernelStatus } from "./App";
 import { FilePanel, FileViewer, QuickOpen, relInRoot, type OpenFile } from "./Files";
-import { BranchPicker, type GitState } from "./GitBranch";
+import type { GitState } from "./GitBranch";
 import { exportName, sessionMarkdown } from "./sessionExport";
 import { getNotifyPrefs } from "./notify";
 import { applyMessageEvents, MESSAGE_EVENTS, reconcileMessages, recordSnapshotEvent, type SnapshotChanges } from "./messageState";
-import { ChatMarkdown } from "./ChatMarkdown";
-import { ConversationWindow, useConversationExpansion } from "./ConversationWindow";
-import { readableToolOutput } from "./toolOutput";
+import { ConversationWindow } from "./ConversationWindow";
+import { sameDir } from "./workspaceUtils";
+import { slashToken, slashMatches, expandSlash } from "./slashCommands";
+import { type ChipOption } from "./components/ChipSelect";
+export { ChipSelect, type ChipOption } from "./components/ChipSelect";
+import {
+  type Attachment,
+  type QueuedPrompt,
+  type MenuItem,
+  type Menu,
+  IMAGE_MAX_BYTES,
+  IMAGE_MAX_COUNT,
+  DEFAULT_TITLES,
+  imageTitle,
+  readImage,
+} from "./chatTypes";
+import { POLICIES, matchPolicy, allowedSet } from "./policyUtils";
+import { ContextMenu } from "./components/chat/ContextMenu";
+import { TurnRail } from "./components/chat/TurnRail";
+import { Sidebar } from "./components/chat/Sidebar";
+import { StatsModal } from "./components/StatsModal";
+import { ChatHeader } from "./components/chat/ChatHeader";
+import { PermBar } from "./components/chat/PermBar";
+import { ChatInput } from "./components/chat/ChatInput";
+import { TodoFly } from "./components/chat/TodoView";
+import { toolHead } from "./components/chat/ToolViews";
+import {
+  TurnRow,
+  BusyHint,
+  turnsOf,
+  estimateTurnHeight,
+  fmtNum,
+  fmtSpan,
+  type TurnRowData,
+  type TurnStat,
+  type TurnGroups,
+} from "./components/chat/TurnViews";
 
 type Props = {
   projectDir: string;
@@ -78,187 +106,16 @@ type Props = {
   onOpenSettings: () => void;
 };
 
-/** 自绘右键菜单的一项 */
-type MenuItem = { label: string; danger?: boolean; run: () => void };
 
-type Menu = { x: number; y: number; items: MenuItem[] };
-
-/** 本机 OCR：模型不能看图时，把截图里的文字带进 prompt */
-type OcrState = {
-  state: "pending" | "done" | "empty" | "error";
-  text?: string;
-  error?: string;
-};
-
-/** 粘贴进输入框的图片：有视觉模型时随 prompt 发 data URL，否则只带本机 OCR 文字 */
-type Attachment = {
-  id: string;
-  name: string;
-  mime: string;
-  url: string;
-  size: number;
-  ocr?: OcrState;
-};
-
-/** 截图通常只有几百 KB；给个上限，别让整段 base64 把输入区撑爆 */
-const IMAGE_MAX_BYTES = 8 * 1024 * 1024;
-const IMAGE_MAX_COUNT = 4;
-const DEFAULT_TITLES = new Set(["", "新会话", "New session", "Untitled", "untitled"]);
-
-function imageTitle(raw: string, images: number): string {
-  const first = raw.split(/\r?\n/).map((s) => s.trim()).find(Boolean) ?? "";
-  const compact = first.replace(/\s+/g, " ");
-  if (compact) return compact.length > 40 ? `${compact.slice(0, 40)}…` : compact;
-  return images > 1 ? `图片会话（${images} 张）` : "图片会话";
-}
-
-const imgSize = (n: number) =>
-  n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
-
-function ocrLabel(ocr?: OcrState): string {
-  if (!ocr || ocr.state === "pending") return "识别中";
-  if (ocr.state === "done") return `文字 ${ocr.text?.length ?? 0}`;
-  if (ocr.state === "empty") return "无文字";
-  return "OCR 失败";
-}
-
-function readImage(file: File): Promise<Attachment> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const url = String(reader.result ?? "");
-      if (!url.startsWith("data:")) {
-        reject(new Error("读取图片失败"));
-        return;
-      }
-      resolve({
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        name: file.name || `粘贴图片-${Date.now()}.${file.type.split("/")[1] || "png"}`,
-        mime: file.type || "image/png",
-        url,
-        size: file.size,
-        ocr: { state: "pending" },
-      });
-    };
-    reader.onerror = () => reject(new Error("读取图片失败"));
-    reader.readAsDataURL(file);
-  });
-}
 
 /** 上次用的模型：内核 /provider 的 default 每次重启都可能变，用户的选择要自己记住 */
 export const MODEL_KEY = "codearts.model";
 export const AGENT_KEY = "codearts.agent";
 /** 文件栏默认展开；用户收起一次之后记住 */
 export const FILES_KEY = "codearts.filesPanel";
-/** 每个工作区默认露出的会话条数；「加载更多」按同样步长展开，「收起」回到这个数。工作区本身不再折叠 */
-const SIDE_PAGE = 3;
 /** 置顶的会话 id（localStorage）。置顶排在各自工作区的最前面，跨工作区共用一份 */
 const PIN_KEY = "codearts.pins";
 
-/**
- * 自绘滚动条：平时完全透明，滚动时浮出、停手 900ms 后渐隐（与正文区 .threadbar 同一观感）。
- * 原生滚动条由 CSS 隐掉，否则会和这条并存。
- */
-function OverlayBar({ box }: { box: RefObject<HTMLElement | null> }) {
-  const bar = useRef<HTMLDivElement>(null);
-  const thumb = useRef<HTMLDivElement>(null);
-  const hideTimer = useRef(0);
-  const drag = useRef<{ y: number; top: number; k: number } | null>(null);
-
-  /** 把滑块尺寸和位置对齐到当前视口；内容不够长时直接藏掉 */
-  const sync = useCallback(() => {
-    const el = box.current;
-    const wrap = bar.current;
-    const th = thumb.current;
-    if (!el || !wrap || !th) return false;
-    const track = wrap.clientHeight;
-    const max = el.scrollHeight - el.clientHeight;
-    if (max <= 2 || track <= 32) {
-      wrap.classList.remove("on");
-      return false;
-    }
-    const h = Math.max(28, Math.round((el.clientHeight / el.scrollHeight) * track));
-    th.style.height = `${h}px`;
-    th.style.transform = `translateY(${Math.round((el.scrollTop / max) * (track - h))}px)`;
-    return true;
-  }, [box]);
-
-  const flash = useCallback(() => {
-    if (!sync()) return;
-    const wrap = bar.current;
-    if (!wrap) return;
-    wrap.classList.add("on");
-    window.clearTimeout(hideTimer.current);
-    hideTimer.current = window.setTimeout(() => {
-      if (!drag.current) wrap.classList.remove("on");
-    }, 900);
-  }, [sync]);
-
-  useEffect(() => {
-    const el = box.current;
-    if (!el) return;
-    el.addEventListener("scroll", flash, { passive: true });
-    // 窗口缩放、会话增删/改名都会改变内容高度，滑块要跟着重算
-    const ro = new ResizeObserver(() => sync());
-    ro.observe(el);
-    const mo = new MutationObserver(() => sync());
-    mo.observe(el, { childList: true, subtree: true, characterData: true });
-    sync();
-    return () => {
-      el.removeEventListener("scroll", flash);
-      ro.disconnect();
-      mo.disconnect();
-      window.clearTimeout(hideTimer.current);
-    };
-  }, [box, flash, sync]);
-
-  function down(e: ReactPointerEvent<HTMLDivElement>) {
-    const el = box.current;
-    const wrap = bar.current;
-    const th = thumb.current;
-    if (!el || !wrap || !th) return;
-    const track = wrap.clientHeight;
-    const h = th.offsetHeight;
-    const max = el.scrollHeight - el.clientHeight;
-    if (max <= 2 || track <= h) return;
-    e.preventDefault();
-    wrap.setPointerCapture(e.pointerId);
-    const rect = wrap.getBoundingClientRect();
-    const top = Math.max(0, Math.min(track - h, e.clientY - rect.top - h / 2));
-    el.scrollTop = (top / (track - h)) * max;
-    drag.current = { y: e.clientY, top: el.scrollTop, k: max / (track - h) };
-    window.clearTimeout(hideTimer.current);
-    wrap.classList.add("on");
-  }
-
-  function move(e: ReactPointerEvent<HTMLDivElement>) {
-    const d = drag.current;
-    const el = box.current;
-    if (d && el) el.scrollTop = d.top + (e.clientY - d.y) * d.k;
-  }
-
-  function up(e: ReactPointerEvent<HTMLDivElement>) {
-    if (!drag.current) return;
-    drag.current = null;
-    const wrap = bar.current;
-    if (wrap?.hasPointerCapture(e.pointerId)) wrap.releasePointerCapture(e.pointerId);
-    flash();
-  }
-
-  return (
-    <div
-      className="wsbar"
-      ref={bar}
-      onPointerDown={down}
-      onPointerMove={move}
-      onPointerUp={up}
-      onPointerCancel={up}
-      aria-hidden="true"
-    >
-      <div className="wsthumb" ref={thumb} />
-    </div>
-  );
-}
 /** 规划轮的回复短于这么多字符就不当计划存盘（真计划是千字级，「确认无误」这种不算） */
 const MIN_PLAN_CHARS = 120;
 /** 改动快照带前后全文，agent 连续改文件时别每 0.7 秒就重取一次，至少隔这么久 */
@@ -266,52 +123,6 @@ const DIFF_MIN_GAP_MS = 2500;
 
 /** 内核用来起标题、做摘要、压缩上下文的内部 agent，选它们当主对话只会得到一句废话 */
 const INTERNAL_AGENTS = new Set(["title", "summary", "compaction"]);
-
-const AGENT_CN: Record<string, string> = {
-  build: "执行",
-  plan: "规划",
-  "docgen-agent": "文档",
-};
-
-/** 内核返回的 agent 描述是英文，菜单里只放译好的；不认识的 agent 不硬翻 */
-const AGENT_DESC_CN: Record<string, string> = {
-  build: "默认 agent，按当前授权策略执行工具。",
-  plan: "规划模式，禁用所有修改文件的工具。",
-  "docgen-agent": "自动完成文档生成任务（docgen、codebase-cli），无需人工交互。",
-  explore: "只读探索代码和工作区，不做修改。",
-};
-
-
-/** 工作区路径可能带尾斜杠，内核返回的一定不带 */
-const sameDir = (a: string | null | undefined, b: string | null | undefined) =>
-  !!a && !!b && a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
-
-/** 正在敲一条斜杠命令时才返回它的名字部分；一旦敲空格就说明参数已经在写了，面板要收起 */
-function slashToken(text: string): string | null {
-  if (!text.startsWith("/") || /\s/.test(text)) return null;
-  return text.slice(1);
-}
-
-function slashMatches(text: string, cmds: CommandInfo[]): CommandInfo[] {
-  const tok = slashToken(text);
-  if (tok === null) return [];
-  const k = tok.toLowerCase();
-  return cmds.filter((c) => c.name.toLowerCase().includes(k)).slice(0, 8);
-}
-
-/**
- * 内核的 HTTP 侧不展开命令模板（实测直接把 "/review x" 当普通 prompt 发，
- * 模型只看到一个陌生斜杠词），所以壳子自己按 TUI 的做法替换 $ARGUMENTS。
- */
-function expandSlash(text: string, cmds: CommandInfo[]): string {
-  const m = /^\/(\S+)\s*([\s\S]*)$/.exec(text);
-  if (!m) return text;
-  const cmd = cmds.find((c) => c.name === m[1]);
-  if (!cmd?.template) return text;
-  const args = m[2].trim();
-  if (cmd.template.includes("$ARGUMENTS")) return cmd.template.replace(/\$ARGUMENTS/g, args);
-  return args ? `${cmd.template}\n\n${args}` : cmd.template;
-}
 
 export default function Chat({
   projectDir,
@@ -330,8 +141,6 @@ export default function Chat({
   const live = status?.healthy ?? false;
   const dir = projectDir;
   const ver = useAppVersion();
-  /** 侧栏滚动容器：自绘滚动条按它算滑块 */
-  const wsList = useRef<HTMLUListElement>(null);
 
   const [list, setList] = useState<Session[]>([]);
   const [active, setActive] = useState<string | null>(null);
@@ -400,11 +209,11 @@ export default function Chat({
   const [editPulse, setEditPulse] = useState(0);
   /** 标题兜底计时器：按会话 id 归堆，卸载或删会话时统一撤销 */
   const titleTimers = useRef(new Map<string, number[]>());
-  /**
-   * 公开发布前的确认弹窗（存待发布的会话 id）。
-   * 这条路由会把整段对话上传到公网，只点一次菜单不该发生，所以强制走弹窗。
-   */
-  const [shareAsk, setShareAsk] = useState<string | null>(null);
+  /** 各会话的消息排队列表：忙时排队，空闲后自动顺延发送 */
+  const [sessionQueues, setSessionQueues] = useState<Record<string, QueuedPrompt[]>>({});
+  const sessionQueuesRef = useRef(sessionQueues);
+  sessionQueuesRef.current = sessionQueues;
+  const processNextInQueueRef = useRef<(sid: string) => void>(() => {});
   const [perms, setPerms] = useState<PermissionRequest[]>([]);
   /** 内核的 question 工具在等人选项：不接住就只能看着一张 JSON 卡片卡在"执行中" */
   const [asks, setAsks] = useState<QuestionRequest[]>([]);
@@ -434,13 +243,14 @@ export default function Chat({
     if (el) el.scrollTop = el.scrollHeight;
   }, [setFollow]);
   const sending = useRef(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const dragCounter = useRef(0);
   const [railHit, setRailHit] = useState<string | null>(null);
   const body = useRef<HTMLDivElement>(null);
   const bar = useRef<HTMLDivElement>(null);
   const barThumb = useRef<HTMLDivElement>(null);
   const barTimer = useRef<number | null>(null);
   const barDrag = useRef<{ y: number; top: number; k: number } | null>(null);
-  const [tip, setTip] = useState<{ text: string; top: number } | null>(null);
   const [cmds, setCmds] = useState<CommandInfo[]>([]);
   const [agentList, setAgentList] = useState<AgentInfo[]>([]);
   const [agent, setAgent] = useState<string | null>(null);
@@ -560,6 +370,7 @@ export default function Chat({
   const [sessionDiffs, setSessionDiffs] = useState<FileDiff[]>([]);
   /** ⌘P 快捷打开浮层 */
   const [quickOpen, setQuickOpen] = useState(false);
+  const [statsOpen, setStatsOpen] = useState(false);
   /** 当前工作区的 Git 分支；内核 /vcs 在非 git 目录回空对象，那时不显示 */
   const [branch, setBranch] = useState<VcsInfo | null>(null);
   /** 分支列表 / 游离 HEAD / 未提交改动数，由壳侧的 git 命令读取 */
@@ -799,10 +610,6 @@ export default function Chat({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [live]);
-  const selectedModel = model
-    ? models.find((m) => m.providerID === model.providerID && m.modelID === model.modelID)
-    : undefined;
-  const visionReady = selectedModel?.image === true;
   /** 内置模型排前面不带副标；接进来的第三方收到「自定义」一段，段内再按提供商分组 */
   const modelOptions = (() => {
     const ref = (m: ModelInfo) => `${m.providerID}/${m.modelID}`;
@@ -1031,19 +838,38 @@ export default function Chat({
     [active],
   );
 
-  /** 待决的授权与问题都是内核侧的队列，一律只留"我这边的"（父 + 子会话） */
+  /** 当前活跃会话对应的待决项，与后台会话解耦 */
+  const activePerms = useMemo(
+    () => perms.filter((p) => mineSid(p.sessionID)),
+    [perms, mineSid],
+  );
+  const activeAsks = useMemo(
+    () => asks.filter((x) => mineSid(x.sessionID)),
+    [asks, mineSid],
+  );
+
+  /** 侧栏展示各会话待决授权/反问的数量，后台会话也能被及时发现 */
+  const pendingCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const p of perms) {
+      if (p.sessionID) counts[p.sessionID] = (counts[p.sessionID] ?? 0) + 1;
+    }
+    for (const a of asks) {
+      if (a.sessionID) counts[a.sessionID] = (counts[a.sessionID] ?? 0) + 1;
+    }
+    return counts;
+  }, [perms, asks]);
+
+  /** 待决授权与问题全量拉取，保证后台会话的授权请求不丢失 */
   const reloadPending = useCallback(() => {
-    // 队列按目录分实例，当前会话在别的工作区时要去那个区取，对着本区取到的是空表
-    const d = wsOf ?? dir;
-    permissions
-      .list(d)
-      .then((q) => setPerms(q.filter((p) => mineSid(p.sessionID))))
-      .catch(() => setPerms([]));
-    questions
-      .list(d)
-      .then((q) => setAsks(q.filter((x) => mineSid(x.sessionID))))
-      .catch(() => setAsks([]));
-  }, [dir, wsOf, mineSid]);
+    const ws = projects.length ? projects : [dir];
+    Promise.all(ws.map((w) => permissions.list(w).catch(() => []))).then((allP) => {
+      setPerms(allP.flat());
+    });
+    Promise.all(ws.map((w) => questions.list(w).catch(() => []))).then((allQ) => {
+      setAsks(allQ.flat());
+    });
+  }, [projects, dir]);
 
   /**
    * 两个队列一起重取：切会话、切目录、children 到货都要。子会话是切会话之后才异步取回来的，
@@ -1290,7 +1116,10 @@ export default function Chat({
         }
         case "session.status": {
           const st = String(p.status?.type ?? "");
-          if (st === "idle") flush();
+          if (st === "idle") {
+            flush();
+            if (sid) processNextInQueueRef.current(sid);
+          }
           if (sid) {
             const wasRunning = runSeen.current.delete(sid);
             if (st && st !== "idle") runSeen.current.add(sid);
@@ -1325,6 +1154,7 @@ export default function Chat({
             return next;
           });
           setRetry((r) => (r?.sid === sid ? null : r));
+          if (sid) processNextInQueueRef.current(sid);
           // 轮次收尾时内核才把 summary.diffs 写进用户消息，重拉一次才有每轮改动
           if (sid === cur) {
             const want = sid;
@@ -1399,26 +1229,26 @@ export default function Chat({
             if (k && k.sid === p.sessionID) setTurnTodos((prev) => ({ ...prev, [k.id]: next }));
           }
           break;
-        // 授权请求：不接住就只能看着"内核处理中"卡死；子会话自己发起的也一样卡，一并摊到父会话来
+        // 授权请求：全局接住记账，侧栏点亮待审批角标，切会话也不会卡死
         case "permission.asked":
-          if (mine && p.id)
+          if (p.id)
             setPerms((q) => (q.some((x) => x.id === p.id) ? q : [...q, p as PermissionRequest]));
           break;
         case "permission.replied":
         case "permission.updated": {
           const id = p.requestID ?? p.id ?? p.permissionID;
-          if (mine && id) setPerms((q) => q.filter((x) => x.id !== id));
+          if (id) setPerms((q) => q.filter((x) => x.id !== id));
           break;
         }
-        // 反问：properties 就是 QuestionRequest 原样，不接住就只能对着 JSON 卡片发呆
+        // 反问：properties 就是 QuestionRequest 原样，全局接住
         case "question.asked":
-          if (mine && p.id)
+          if (p.id)
             setAsks((q) => (q.some((x) => x.id === p.id) ? q : [...q, p as QuestionRequest]));
           break;
         case "question.replied":
         case "question.rejected": {
           const id = p.requestID ?? p.id;
-          if (mine && id) setAsks((q) => q.filter((x) => x.id !== id));
+          if (id) setAsks((q) => q.filter((x) => x.id !== id));
           break;
         }
       }
@@ -1547,7 +1377,6 @@ export default function Chat({
   useLayoutEffect(() => {
     followLatest();
     setRailHit(null);
-    setTip(null);
   }, [active, followLatest]);
 
   const jumpTo = useCallback((id: string) => {
@@ -1556,19 +1385,6 @@ export default function Chat({
     document.getElementById(`m-${id}`)?.scrollIntoView({ behavior: "instant", block: "start" });
   }, [setFollow]);
 
-  /** 悬浮预览：跟随刻度条的位置，用 absolute 挂在 .body 上，不受滚动容器裁剪 */
-  function showTip(el: HTMLElement, text: string) {
-    const box = body.current;
-    if (!box) return;
-    const b = box.getBoundingClientRect();
-    const t = el.getBoundingClientRect();
-    setTip({ text, top: t.top - b.top + t.height / 2 });
-  }
-
-  /**
-   * 内核自动起名插件偶发 AI_NoOutputGeneratedError，会把标题停在「新会话」。
-   * 壳侧在首轮后隔几秒补一次标题；若内核随后自己起好了就不再覆盖。
-   */
   function cancelTitleFallback(sid: string) {
     const ids = titleTimers.current.get(sid);
     if (!ids) return;
@@ -1669,19 +1485,57 @@ export default function Chat({
     void addImages(files);
   }
 
+  function onDragEnter(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current++;
+    if (e.dataTransfer?.items && e.dataTransfer.items.length > 0) {
+      setIsDragging(true);
+    }
+  }
+
+  function onDragLeave(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current--;
+    if (dragCounter.current <= 0) {
+      dragCounter.current = 0;
+      setIsDragging(false);
+    }
+  }
+
+  function onDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current = 0;
+    setIsDragging(false);
+    const files = Array.from(e.dataTransfer?.files ?? []).filter((f) =>
+      f.type.startsWith("image/"),
+    );
+    if (files.length) {
+      void addImages(files);
+    }
+  }
+
   /**
-   * 只认「这一轮根本没被内核接下」的错误；provider 报的 4xx/5xx 不在这里重发，避免重复一轮。
-   * `SyncEvent.run: "sessionID" required` 是内核记忆插件发的「记忆已更新」注入缺 sessionID，
-   * 会让 prompt_async 在入口直接 500；重发时那条注入已经消费掉，正好能过。
+   * 判定可重发的瞬时错误：
+   * 1. 传输层/连接异常（网络闪断、超时、连接重置）；
+   * 2. 内核后置任务锁/状态未就绪（SyncEvent 记忆更新缺 sessionID、目录未就绪、409 忙碌冲突、锁竞争等）；
+   * 遇到这类瞬时错误自动重发，避免用户第二次请求时因后台后置任务未收尾而报红错。
    */
   function isPromptTransportError(e: unknown): boolean {
     const text = String((e as { message?: unknown })?.message ?? e ?? "");
-    return /Session not found|会话不存在|SyncEvent\.run|"sessionID" required|error sending request|connection (refused|reset|closed)|timed out|ECONN/i.test(
+    return /Session not found|会话不存在|SyncEvent\.run|"sessionID" required|error sending request|connection (refused|reset|closed)|timed out|ECONN|busy|conflict|locked|in progress|still processing|HTTP 409|HTTP 500|HTTP 502|HTTP 503|HTTP 504/i.test(
       text,
     );
   }
 
-  /** 内核入口级的瞬时失败最多补发两次；间隔递增，给目录实例/记忆注入一点时间 */
+  /** 内核入口级的瞬时失败最多补发三次；间隔递增，给目录实例/记忆注入/后置起名充分时间 */
   async function promptWithRetry(
     id: string,
     parts: unknown[],
@@ -1694,13 +1548,139 @@ export default function Chat({
         return await sessions.prompt(id, parts, target, model, agent);
       } catch (e) {
         if (attempt >= 2 || !isPromptTransportError(e)) throw e;
-        await new Promise((r) => setTimeout(r, 600 * (attempt + 1)));
+        await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
       }
     }
   }
 
+  /** 异步消费排队消息 */
+  const sendQueued = useCallback(
+    async (item: QueuedPrompt) => {
+      const { id, raw, imgs, model: itemModel, agent: itemAgent, target } = item;
+      try {
+        const ocrTexts = imgs.length
+          ? await Promise.all(
+              imgs.map((a) => ocrJobs.current.get(a.id) ?? Promise.resolve(a.ocr?.text ?? "")),
+            )
+          : [];
+        const ocrBlock = ocrTexts
+          .map((t, i) => (t ? (imgs.length > 1 ? `--- 截图 ${i + 1} ---\n${t}` : t) : ""))
+          .filter(Boolean)
+          .join("\n\n");
+        const text = expandSlash(raw, cmds).trim();
+        const parts: unknown[] = [];
+        if (text) {
+          parts.push({ type: "text", text });
+        } else if (!ocrBlock) {
+          parts.push({ type: "text", text: "" });
+        }
+        if (ocrBlock) {
+          parts.push({
+            type: "text",
+            text: `【附图内容】\n${ocrBlock}`,
+            synthetic: true,
+            metadata: { synthetic: true },
+          });
+        }
+        cancelTitleFallback(id);
+        setBusySet((s) => new Set(s).add(id));
+        runSeen.current.add(id);
+        await promptWithRetry(id, parts, target, itemModel, itemAgent);
+        if (activeRef.current === id) setFollow(true);
+      } catch (e) {
+        runSeen.current.delete(id);
+        setBusySet((s) => {
+          if (!s.has(id)) return s;
+          const next = new Set(s);
+          next.delete(id);
+          return next;
+        });
+        if (activeRef.current === id) setErr(`排队任务发送失败：${String(e)}`);
+      }
+    },
+    [cmds, promptWithRetry, setFollow],
+  );
+
+  const processNextInQueue = useCallback(
+    (sid: string) => {
+      const queue = sessionQueuesRef.current[sid];
+      if (!queue || !queue.length) return;
+      const nextItem = queue[0];
+      setSessionQueues((prev) => {
+        const list = prev[sid] ?? [];
+        const rest = list.slice(1);
+        if (!rest.length) {
+          const copy = { ...prev };
+          delete copy[sid];
+          return copy;
+        }
+        return { ...prev, [sid]: rest };
+      });
+      void sendQueued(nextItem);
+    },
+    [sendQueued],
+  );
+  processNextInQueueRef.current = processNextInQueue;
+
+  /** 将当前输入放入排队队列，等上一轮收尾后自动发 */
+  function enqueueCurrent() {
+    const raw = input.trim();
+    const imgs = attachments;
+    if (!raw && !imgs.length) return;
+    const sid = active;
+    if (!sid) return;
+    const item: QueuedPrompt = {
+      id: sid,
+      raw,
+      imgs,
+      model,
+      agent,
+      target: dirOf(sid),
+    };
+    setSessionQueues((prev) => ({
+      ...prev,
+      [sid]: [...(prev[sid] ?? []), item],
+    }));
+    setInput("");
+    setAttachments([]);
+    setToast("已加入排队：当前任务完成后将自动发送");
+  }
+
+  /** 取消排队队列中的某一项 */
+  function cancelQueue(sid: string, index: number) {
+    setSessionQueues((prev) => {
+      const list = prev[sid] ?? [];
+      const next = list.filter((_, i) => i !== index);
+      if (!next.length) {
+        const copy = { ...prev };
+        delete copy[sid];
+        return copy;
+      }
+      return { ...prev, [sid]: next };
+    });
+  }
+
+  /** 打断并发送：会话正在出活时，先中止当前轮，再立即提交新输入 */
+  async function interruptAndSend() {
+    const id = active;
+    if (!id || sending.current || readOnly || activePerms.length > 0 || activeAsks.length > 0) return;
+    const raw = input.trim();
+    const imgs = attachments;
+    if (!raw && !imgs.length) {
+      setErr("输入为空");
+      return;
+    }
+    if (busySet.has(id)) {
+      try {
+        await sessions.abort(id, dirOf(id));
+      } catch {}
+      await new Promise((r) => setTimeout(r, 260));
+    }
+    await send();
+  }
+
   async function send() {
-    if (sending.current || readOnly || busy || perms.length > 0 || asks.length > 0) return;
+    if (sending.current || readOnly || busy || activePerms.length > 0 || activeAsks.length > 0) return;
     const raw = input.trim();
     const imgs = attachments;
     if (!raw && !imgs.length) {
@@ -1725,34 +1705,34 @@ export default function Chat({
       }
     }
     try {
-      const vision = visionReady;
-      // 模型不能看图时，等粘贴时启动的本机 OCR 落地；一个字都没读到就不发空图
-      const ocrTexts =
-        imgs.length && !vision
-          ? await Promise.all(
-              imgs.map((a) => ocrJobs.current.get(a.id) ?? Promise.resolve(a.ocr?.text ?? "")),
-            )
-          : [];
+      const ocrTexts = imgs.length
+        ? await Promise.all(
+            imgs.map((a) => ocrJobs.current.get(a.id) ?? Promise.resolve(a.ocr?.text ?? "")),
+          )
+        : [];
       const ocrBlock = ocrTexts
-        .map((t, i) => (t ? `【图片 ${i + 1} 的本地 OCR 文字】\n${t}` : ""))
+        .map((t, i) => (t ? (imgs.length > 1 ? `--- 截图 ${i + 1} ---\n${t}` : t) : ""))
         .filter(Boolean)
         .join("\n\n");
-      if (imgs.length && !vision && !ocrBlock) {
-        setErr(
-          "当前模型不支持看图，本机 OCR 也没有从截图里识别到文字；换一个支持视觉的模型，或先把文字复制进输入框。",
-        );
+      if (imgs.length && !ocrBlock) {
+        setErr("未能从截图中识别到有效文字，请直接把文字或代码复制进输入框。");
         return;
       }
       // 侧栏标题用原始输入：命令模板展开后是几百字，标题栏放不下
-      const text = expandSlash(raw, cmds);
-      const promptText =
-        !vision && ocrBlock ? (text ? `${text}\n\n${ocrBlock}` : ocrBlock) : text;
+      const text = expandSlash(raw, cmds).trim();
       const parts: unknown[] = [];
-      if (promptText) parts.push({ type: "text", text: promptText });
-      if (vision) {
-        for (const a of imgs) {
-          parts.push({ type: "file", mime: a.mime, url: a.url, filename: a.name });
-        }
+      if (text) {
+        parts.push({ type: "text", text });
+      } else if (!ocrBlock) {
+        parts.push({ type: "text", text: "" });
+      }
+      if (ocrBlock) {
+        parts.push({
+          type: "text",
+          text: `【附图内容】\n${ocrBlock}`,
+          synthetic: true,
+          metadata: { synthetic: true },
+        });
       }
       setInput("");
       setAttachments([]);
@@ -1768,6 +1748,8 @@ export default function Chat({
         reloadList();
       } else {
         target = dirOf(id);
+        // 主动取消前序标题定时器，避免与本轮并发写产生锁冲突
+        cancelTitleFallback(id);
       }
       // 先标 busy：prompt 返回前 SSE 可能已 idle，事后再 add 会卡在 Stop
       setBusySet((s) => new Set(s).add(id));
@@ -1801,10 +1783,11 @@ export default function Chat({
   /** 重试 = 把最后一条用户消息原样再发一次，不用重新打字 */
   async function retryTurn() {
     const id = active;
-    if (!retryParts || !id || sending.current || busy || perms.length > 0 || asks.length > 0) return;
+    if (!retryParts || !id || sending.current || busy || activePerms.length > 0 || activeAsks.length > 0) return;
     sending.current = true;
     setErr(null);
     setToast(null);
+    cancelTitleFallback(id);
     // 先标 busy：prompt 返回前 SSE 可能已 idle，事后再 add 会卡在 Stop
     setBusySet((s) => new Set(s).add(id));
     runSeen.current.add(id);
@@ -1997,32 +1980,6 @@ export default function Chat({
     }
   }
 
-  /** 公开发布：整段对话（含文件路径、命令输出）上传到 opncd.ai 换一条外链 */
-  async function doShare(id: string) {
-    try {
-      const s = await sessions.share(id, dirOf(id));
-      mergeSession(s);
-      const url = s.share?.url;
-      if (url) await copy(url).catch(() => {});
-      setToast(url ? `已发布，链接已复制：${url}` : "已发布");
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setShareAsk(null);
-    }
-  }
-
-  async function doUnshare(id: string) {
-    try {
-      const s = await sessions.unshare(id, dirOf(id));
-      // 显式抹掉 share：内核这里可能只回摘要，不带空字段
-      mergeSession({ ...s, share: undefined });
-      setToast("已取消发布，公网链接失效（已经转出去的复制件收不回）");
-    } catch (e) {
-      setErr(String(e));
-    }
-  }
-
   /**
    * `!` 前缀 = 在项目里跑一条命令，输出直接进上下文、不派模型（原生 TUI 的同名行为）。
    * busy 交给内核的帧驱动，这里不自己标，免得它没发 idle 时永久卡在停止按钮。
@@ -2120,24 +2077,6 @@ export default function Chat({
    * 某个工作区要显示哪些会话：先按过滤词筛，再把置顶的按置顶顺序提到前面，
    * 其余保持 `list` 里的时间倒序（sort 是稳定的）。
    */
-  const kw = query.trim().toLowerCase();
-  // 侧栏每个工作区都要过滤+排序一遍；list 没变时别跟着流式帧重算
-  const wsItems = useMemo(() => {
-    const rank = (id: string) => {
-      const i = pins.indexOf(id);
-      return i < 0 ? Number.MAX_SAFE_INTEGER : i;
-    };
-    const map = new Map<string, Session[]>();
-    for (const p of projects) {
-      const items = list.filter((s) => sameDir(s.directory, p));
-      const hit = kw
-        ? items.filter((s) => `${s.title ?? ""} ${s.id}`.toLowerCase().includes(kw))
-        : items;
-      map.set(p, [...hit].sort((a, b) => rank(a.id) - rank(b.id)));
-    }
-    return map;
-  }, [projects, list, kw, pins]);
-  const ofWs = (p: string) => wsItems.get(p) ?? [];
   /** 会话级汇总只在消息数组变化时重算：悬停、待办刷新等无关渲染不必再扫一遍 */
   const { turns, spend, toolCalls } = useMemo(() => {
     const turns = msgs.filter((m) => m.info.role === "user" && m.info.time.created > 0);
@@ -2262,7 +2201,14 @@ export default function Chat({
     e.preventDefault();
     // 输入法还在拼词，这个 Enter 是提交候选词，不是发送
     if (e.nativeEvent.isComposing) return;
-    if (busy || perms.length > 0 || asks.length > 0) return;
+    if (activePerms.length > 0 || activeAsks.length > 0) return;
+    if (busy) {
+      // 正在跑时按回车：如果输入框有内容，触发打断并插话
+      if (input.trim() || attachments.length > 0) {
+        void interruptAndSend();
+      }
+      return;
+    }
     void send();
   }
 
@@ -2273,10 +2219,7 @@ export default function Chat({
   function clearView() {
     setActive(null);
     setMsgs([]);
-    setPerms([]);
-    setAsks([]);
     setRetry(null);
-    setTip(null);
   }
 
   /**
@@ -2347,32 +2290,7 @@ export default function Chat({
     [wsDir],
   );
 
-  /** 原生右键菜单已被全局压掉，工作区与会话的菜单在这里自绘 */
   const [menu, setMenu] = useState<Menu | null>(null);
-  const menuBox = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    if (!menu) return;
-    const close = () => setMenu(null);
-    const onDown = (e: MouseEvent) => {
-      if (!menuBox.current?.contains(e.target as Node)) close();
-    };
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") close();
-    };
-    window.addEventListener("mousedown", onDown, true);
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("resize", close);
-    window.addEventListener("blur", close);
-    document.addEventListener("scroll", close, true);
-    return () => {
-      window.removeEventListener("mousedown", onDown, true);
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("resize", close);
-      window.removeEventListener("blur", close);
-      document.removeEventListener("scroll", close, true);
-    };
-  }, [menu]);
 
   function openMenu(e: ReactMouseEvent, items: MenuItem[]) {
     e.preventDefault();
@@ -2397,7 +2315,6 @@ export default function Chat({
     const onActive = id === active && !readOnly;
     const lastUser = [...msgs].reverse().find((m) => m.info.role === "user")?.info.id;
     const canWrite = onActive && !busy;
-    const url = s?.share?.url;
     return [
       { label: pins.includes(id) ? "取消置顶" : "置顶会话", run: () => togglePin(id) },
       ...(cur ? [] : [{ label: "切到该工作区", run: () => switchTo(p) }]),
@@ -2409,26 +2326,49 @@ export default function Chat({
       ...(canWrite ? [{ label: "生成 / 更新 AGENTS.md", run: () => void initAgentsMd() }] : []),
       { label: "导出为 Markdown…", run: () => void exportSession(id) },
       { label: "分叉为新会话", run: () => void forkSession(id) },
-      // 已发布的会话把外链摊出来：复制链接 / 直接打开，省得再点一次"发布"才发现早就发过了
-      ...(url
-        ? [
-            { label: "复制分享链接", run: () => void copy(url) },
-            { label: "在浏览器打开分享页", run: () => void openUrl(url).catch((e) => setErr(String(e))) },
-            { label: "取消公开发布", run: () => void doUnshare(id) },
-          ]
-        : [{ label: "公开发布到公网…", danger: true, run: () => setShareAsk(id) }]),
       { label: "删除会话", danger: true, run: () => void removeSession(id) },
     ];
   }
 
-  /** 右键时间线上的消息：撤销以「这一条」为锚点，会话在跑的时候不给点 */
+  /** 右键时间线上的消息：支持选中文字复制、整条消息复制，以及撤销与删除 */
   function msgMenu(m: Message): MenuItem[] {
-    if (!active || readOnly || busy || !live) return [];
     const items: MenuItem[] = [];
-    // 已经撤销过一次就不再叠第二次，锚点会互相盖掉，只留「恢复」
-    if (m.info.role === "user" && !activeSess?.revert)
-      items.push({ label: "从这里撤销（含文件回滚）", run: () => void revertTo(m.info.id) });
-    items.push({ label: "只删除这条消息", danger: true, run: () => void removeMessage(m.info.id) });
+    const selected = window.getSelection()?.toString() ?? "";
+    if (selected.trim()) {
+      items.push({
+        label: "复制",
+        run: () => void copy(selected),
+      });
+    }
+
+    const fullText = m.parts
+      .filter((p) => p.type === "text" && !isSyntheticPart(p))
+      .map((p) => p.text ?? "")
+      .join("\n\n")
+      .trim();
+    if (fullText && (!selected.trim() || fullText !== selected.trim())) {
+      items.push({
+        label: "复制整条消息",
+        run: () => void copy(fullText),
+      });
+    }
+
+    // 撤销与删除属于写操作：跑着、只读或内核未连接时不给操作
+    const canMutate = active && !readOnly && !busy && live;
+    if (canMutate) {
+      if (m.info.role === "user" && !activeSess?.revert) {
+        items.push({
+          label: "从这里撤销（含文件回滚）",
+          run: () => void revertTo(m.info.id),
+        });
+      }
+      items.push({
+        label: "只删除这条消息",
+        danger: true,
+        run: () => void removeMessage(m.info.id),
+      });
+    }
+
     return items;
   }
 
@@ -2441,306 +2381,69 @@ export default function Chat({
     openMenuRef.current(e, msgMenuRef.current(m));
   }, []);
 
+  const onThreadMenu = useCallback((e: ReactMouseEvent) => {
+    if (e.defaultPrevented) return;
+    const selected = window.getSelection()?.toString() ?? "";
+    if (selected.trim()) {
+      openMenuRef.current(e, [{ label: "复制", run: () => void copy(selected) }]);
+    }
+  }, [copy]);
+
   return (
     <div className="shell2">
-      <aside className="side">
-        {/* 标题栏已沉浸（titleBarStyle Overlay），这条空带子就是拖窗口的把手，红绿灯压在它上面 */}
-        <div className="drag" data-tauri-drag-region="deep">
-          <span className="wtitle">{APP_TITLE}</span>
-          {ver ? <span className="wver">{ver}</span> : null}
-        </div>
-        <div className="newbox">
-          <button className="primary" onClick={createSession} disabled={!live}>
-            + 新建会话
-          </button>
-        </div>
-        {/* 会话多了以后靠着时间翻很不方便；过滤只在本地跑，不打扰内核 */}
-        <div className="sessfind">
-          <svg viewBox="0 0 16 16" aria-hidden="true">
-            <circle cx="7" cy="7" r="4.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
-            <path
-              d="M10.4 10.4L13.6 13.6"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.3"
-              strokeLinecap="round"
-            />
-          </svg>
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") setQuery("");
-            }}
-            placeholder="搜索会话"
-            aria-label="按标题搜索会话"
-            spellCheck={false}
-          />
-          {query && (
-            <button className="x" onClick={() => setQuery("")} title="清空" aria-label="清空搜索">
-              ×
-            </button>
-          )}
-        </div>
-        <div className="wsbox">
-          <header>
-            <span className="muted small">工作区</span>
-            <button className="ico-btn" onClick={onAddDir} title="添加工作区" aria-label="添加工作区">
-              <svg viewBox="0 0 16 16" aria-hidden="true">
-                <path
-                  d="M8 3.2v9.6M3.2 8h9.6"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.4"
-                  strokeLinecap="round"
-                />
-              </svg>
-            </button>
-          </header>
-          {/* 工作区全量列出；会话仍按 SIDE_PAGE 分批。滚动条是自绘的，只在滚动时渐显 */}
-          <div className="wslistwrap">
-            <ul className="wslist" data-tauri-drag-region="deep" ref={wsList}>
-              {projects.map((p) => {
-                const cur = sameDir(p, projectDir);
-                const items = ofWs(p);
-                // 搜索时把命中的全摊开：翻"加载更多"去找一条匹配结果是折磨
-                const cap = kw ? items.length : (sessShown[p] ?? SIDE_PAGE);
-                const head = items.slice(0, cap);
-                // 当前打开的那条如果落在折叠区，单独补一行，不必把中间全部摊开
-                const pinned = head.some((s) => s.id === active)
-                  ? undefined
-                  : items.find((s) => s.id === active);
-                const visible = pinned ? [...head, pinned] : head;
-                const shown = new Set(visible.map((s) => s.id));
-                const rest = items.filter((s) => !shown.has(s.id)).length;
-                const expanded = cap > SIDE_PAGE;
-                return (
-                  <li key={p} className={`ws ${cur ? "on" : ""}`}>
-                    <div className="wsrow" onContextMenu={(e) => openMenu(e, wsMenu(p, cur))}>
-                      <button
-                        className="wsname"
-                        onClick={() => switchTo(p)}
-                        title={cur ? p : `切到 ${p}`}
-                      >
-                        <svg className="ico" viewBox="0 0 16 16" aria-hidden="true">
-                          <path
-                            d="M1.5 4.3A1.5 1.5 0 0 1 3 2.8h2.9l1.4 1.6H13a1.5 1.5 0 0 1 1.5 1.5v6A1.5 1.5 0 0 1 13 13.4H3a1.5 1.5 0 0 1-1.5-1.5z"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth="1.2"
-                          />
-                        </svg>
-                        {baseName(p)}
-                      </button>
-                      {!cur && (
-                        <button
-                          className="x"
-                          onClick={() => dropWs(p)}
-                          title="从列表移除（不删除文件夹）"
-                          aria-label="从列表移除该工作区（不删除文件夹）"
-                        >
-                          ×
-                        </button>
-                      )}
-                    </div>
-                    <ul className="sess">
-                      {visible.map((s) => (
-                        <li
-                          key={s.id}
-                          className={s.id === active ? "on" : ""}
-                          onContextMenu={(e) => openMenu(e, sessMenu(p, s.id, cur))}
-                        >
-                          <button
-                            className="link"
-                            onClick={() => openSession(s.id)}
-                            title={s.parentID ? `子任务会话 · ${s.id}` : s.id}
-                          >
-                            {pins.includes(s.id) && (
-                              <span className="pin" aria-label="已置顶" title="已置顶">
-                                ★
-                              </span>
-                            )}
-                            {s.parentID ? `↳ ${s.title || s.id}` : s.title || s.id}
-                          </button>
-                          <button
-                            className="x"
-                            onClick={() => void removeSession(s.id)}
-                            title="删除会话"
-                            aria-label="删除会话"
-                          >
-                            ×
-                          </button>
-                        </li>
-                      ))}
-                      {(rest > 0 || expanded) && (
-                        <li className="ops">
-                          {rest > 0 && (
-                            <button
-                              className="link more"
-                              onClick={() =>
-                                setSessShown((prev) => ({ ...prev, [p]: cap + SIDE_PAGE }))
-                              }
-                            >
-                              加载更多（{rest}）
-                            </button>
-                          )}
-                          {expanded && (
-                            <button
-                              className="link more"
-                              onClick={() =>
-                                setSessShown((prev) => {
-                                  const next = { ...prev };
-                                  delete next[p];
-                                  return next;
-                                })
-                              }
-                            >
-                              收起
-                            </button>
-                          )}
-                        </li>
-                      )}
-                      {!items.length && (
-                        <li className="muted pad">{kw ? "没有匹配的会话" : "暂无会话"}</li>
-                      )}
-                    </ul>
-                  </li>
-                );
-              })}
-            </ul>
-            <OverlayBar box={wsList} />
-          </div>
-        </div>
-        <footer>
-          <button className="ico-btn" onClick={onOpenSettings} title="设置" aria-label="设置">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinejoin="round"
-              />
-              <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" strokeWidth="2" />
-            </svg>
-          </button>
-        </footer>
-      </aside>
+      <Sidebar
+        projects={projects}
+        projectDir={projectDir}
+        list={list}
+        active={active}
+        query={query}
+        pins={pins}
+        sessShown={sessShown}
+        busySet={busySet}
+        pendingCounts={pendingCounts}
+        sessionQueues={sessionQueues}
+        ver={ver ?? ""}
+        live={live}
+        onQueryChange={setQuery}
+        onAddDir={onAddDir}
+        onSwitchDir={switchTo}
+        onDropDir={dropWs}
+        onOpenSession={openSession}
+        onCreateSession={createSession}
+        onRemoveSession={(id) => void removeSession(id)}
+        onSetSessShown={setSessShown}
+        onOpenSettings={onOpenSettings}
+        onOpenStats={() => setStatsOpen(true)}
+        onOpenWsMenu={(e, p, cur) => openMenu(e, wsMenu(p, cur))}
+        onOpenSessMenu={(e, p, id, cur) => openMenu(e, sessMenu(p, id, cur))}
+      />
 
       <div className="main">
-        <header className="bar" data-tauri-drag-region="deep">
-          <span className={`dot ${live ? "ok" : ""}`} />
-          <span className="muted">
-            {live ? `内核在线 · ${status?.version}` : "内核未运行"}
-          </span>
-          {activeSess?.share?.url && (
-            <button
-              className="sharechip"
-              onClick={() =>
-                void openUrl(activeSess.share!.url).catch((e) => setErr(String(e)))
-              }
-              title={`已公开发布到公网：${activeSess.share.url}（点击在浏览器打开）`}
-            >
-              已发布
-            </button>
-          )}
-          {(gitState?.repo || branch?.branch) && (
-            <BranchPicker
-              dir={wsDir}
-              name={
-                gitState?.repo
-                  ? (gitState.current ?? (gitState.head ? `(${gitState.head})` : "无分支"))
-                  : (branch?.branch ?? "")
-              }
-              blocked={
-                busySet.size
-                  ? "还有会话在运行，等这一轮结束再切分支（避免切到一半文件被换掉）"
-                  : null
-              }
-              onSwitched={onBranchSwitched}
-            />
-          )}
-          <button
-            className="ico-btn"
-            onClick={() => void (live ? onStop() : onStart())}
-            disabled={kernelBusy}
-            title={live ? "停止内核" : "启动内核"}
-            aria-label={live ? "停止内核" : "启动内核"}
-          >
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path
-                d="M8 2.4v5"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.4"
-                strokeLinecap="round"
-              />
-              <path
-                d="M5.1 4.7a4.2 4.2 0 1 0 5.8 0"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.4"
-                strokeLinecap="round"
-              />
-            </svg>
-          </button>
-          <button
-            className="ico-btn"
-            onClick={() => setQuickOpen(true)}
-            disabled={!live}
-            title={`按文件名打开文件（${IS_WINDOWS ? "Ctrl+P" : "⌘P"}）`}
-            aria-label="按文件名打开文件"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" strokeWidth="2" />
-              <path
-                d="M20 20l-3.6-3.6"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-              />
-            </svg>
-          </button>
-          <button
-            className={`filesbtn ${filesOpen ? "on" : ""}`}
-            onClick={toggleFiles}
-            title={`${filesOpen ? "收起" : "打开"}资源管理器${
-              sessionDiffs.length ? ` · 当前会话 ${sessionDiffs.length} 个文件有改动` : ""
-            }`}
-            aria-label={filesOpen ? "收起资源管理器" : "打开资源管理器"}
-            aria-pressed={filesOpen}
-          >
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path
-                d="M1.5 4.3A1.5 1.5 0 0 1 3 2.8h2.9l1.4 1.6H13a1.5 1.5 0 0 1 1.5 1.5v6A1.5 1.5 0 0 1 13 13.4H3a1.5 1.5 0 0 1-1.5-1.5z"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.3"
-              />
-            </svg>
-          </button>
-        </header>
-
-        {bridge === "down" && (
-          <p className="hint bridge" title={bridgeMsg ?? undefined}>
-            事件流中断，正在自动重连…重连后会自动补齐期间的数据
-          </p>
-        )}
-
-        {activeSess?.revert && (
-          <p className="hint revertbar">
-            <span className="grow">已撤销到这条之前：后面的回复和文件改动都跟着退回了</span>
-            {!busy && (
-              <button onClick={() => void redoUndo()} title="把撤掉的这段历史和文件快照放回来">
-                恢复撤销
-              </button>
-            )}
-          </p>
-        )}
+        <ChatHeader
+          live={live}
+          status={status}
+          activeSess={activeSess ?? undefined}
+          gitState={gitState}
+          branch={branch}
+          wsDir={wsDir}
+          busySet={busySet}
+          kernelBusy={kernelBusy}
+          filesOpen={filesOpen}
+          sessionDiffs={sessionDiffs}
+          bridge={bridge}
+          bridgeMsg={bridgeMsg}
+          busy={busy}
+          onBranchSwitched={onBranchSwitched}
+          onStart={onStart}
+          onStop={onStop}
+          onQuickOpen={() => setQuickOpen(true)}
+          onToggleFiles={toggleFiles}
+          onRedoUndo={() => void redoUndo()}
+        />
 
         <div className={`body ${turns.length > 1 ? "hasrail" : ""}`} ref={body}>
           <section className="thread" ref={thread} onScroll={onScroll} tabIndex={0} aria-label="会话消息"
+            onContextMenu={onThreadMenu}
             onWheel={(e) => {
               scrollDirection.current = e.deltaY < 0 ? "up" : "down";
             }}
@@ -2810,8 +2513,8 @@ export default function Chat({
               <BusyHint
                 // 秒表挂在组件内部：不带 key 时从忙的 A 切到忙的 B 会沿用 A 的起点
                 key={active ?? "none"}
-                waitingPerm={perms.length > 0}
-                waitingAsk={asks.length > 0}
+                waitingPerm={activePerms.length > 0}
+                waitingAsk={activeAsks.length > 0}
                 retry={retry && retry.sid === active ? retry : null}
                 activity={activityOf(msgs, (sid) => kidMsgs[sid])}
               />
@@ -2846,22 +2549,7 @@ export default function Chat({
 
           {busy && openTodos && <TodoFly todos={todos} pulse={editPulse} />}
 
-          {turns.length > 1 && (
-            <nav className="rail" aria-label="轮次导航" onMouseLeave={() => setTip(null)}>
-              <div className="railinner">
-                {turns.map((m, i) => (
-                  <button
-                    key={m.info.id}
-                    className={railHit === m.info.id ? "on" : ""}
-                    onClick={() => jumpTo(m.info.id)}
-                    onMouseEnter={(e) => showTip(e.currentTarget, `${i + 1} · ${turnText(m, 160)}`)}
-                    onFocus={(e) => showTip(e.currentTarget, `${i + 1} · ${turnText(m, 160)}`)}
-                    aria-label={`跳到第 ${i + 1} 轮`}
-                  />
-                ))}
-              </div>
-            </nav>
-          )}
+          <TurnRail turns={turns} railHit={railHit} onJumpTo={jumpTo} />
           <div
             className="threadbar"
             ref={bar}
@@ -2873,285 +2561,91 @@ export default function Chat({
           >
             <div className="threadthumb" ref={barThumb} />
           </div>
-          {tip && (
-            <div className="tip" style={{ top: tip.top }}>
-              {tip.text}
-            </div>
-          )}
+          
         </div>
 
-        <div className="composer">
-          <div className="pending">
-            {asks.map((q) => (
-              <QuestionCard
-                key={q.id}
-                q={q}
-                from={kidFrom(q.sessionID)}
-                onAnswer={(a) => void answerQuestion(q, a)}
-                onReject={() => void rejectQuestion(q)}
-              />
-            ))}
-            {perms.map((p) => (
-              <div className="ask" key={p.id}>
-                {kidFrom(p.sessionID)}
-                <header>
-                  <b>{PERM_CN[p.permission] ?? p.permission}</b>
-                  <span>请求执行授权</span>
-                </header>
-                <ul className="pat">
-                  {p.patterns.slice(0, 12).map((x, i) => (
-                    <li key={i}>{x}</li>
-                  ))}
-                  {p.patterns.length > 12 && <li className="muted">…共 {p.patterns.length} 条</li>}
-                </ul>
-                <div className="row">
-                  <button className="primary" onClick={() => void answer(p, "once")}>
-                    允许一次
-                  </button>
-                  {!!p.always?.length && (
-                    <button onClick={() => void answer(p, "always")}>始终允许</button>
-                  )}
-                  <button onClick={() => void answer(p, "reject")}>拒绝</button>
-                </div>
+        <div
+          className={`composer ${isDragging ? "dragging" : ""}`}
+          onDragEnter={onDragEnter}
+          onDragLeave={onDragLeave}
+          onDragOver={onDragOver}
+          onDrop={onDrop}
+        >
+          {isDragging && (
+            <div className="drag-overlay" aria-hidden="true">
+              <div className="drag-box">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="17 8 12 3 7 8" />
+                  <line x1="12" y1="3" x2="12" y2="15" />
+                </svg>
+                <span>释放图片以添加到输入框</span>
               </div>
-            ))}
-          </div>
-          {alert && (
-            <p className="hint alertbar">
-              <span className="grow">
-                {alert.text}
-                {alert.cmd && <code>{alert.cmd}</code>}
-              </span>
-              <button onClick={() => setAlert(null)}>知道了</button>
-            </p>
-          )}
-          {toast && (
-            <p className="hint toast">
-              <span className="grow">{toast}</span>
-              <button onClick={() => setToast(null)}>知道了</button>
-            </p>
-          )}
-          {readOnly && (
-            <p className="hint robar">
-              <span className="grow">
-                子任务会话 · task 派出去的独立会话，只能看不能接着发
-              </span>
-            </p>
-          )}
-          {!!palette.length && (
-            <ul className="slash" onMouseDown={(e) => e.preventDefault()}>
-              {palette.map((c, i) => (
-                <li key={c.name}>
-                  <button
-                    className={i === hi ? "on" : ""}
-                    onClick={() => accept(c)}
-                    onMouseEnter={() => setHi(i)}
-                    title={c.description ?? ""}
-                  >
-                    <b>/{c.name}</b>
-                    <span className="desc">{c.description}</span>
-                    {c.subtask && <span className="tag">子任务</span>}
-                  </button>
-                </li>
-              ))}
-              <li className="muted keys">
-                <span className="grow">↑↓ 选择 · Tab/Enter 补全 · Esc 收起</span>
-                <span>{cmds.length} 条命令</span>
-              </li>
-            </ul>
-          )}
-          {!!attachments.length && (
-            <div className="attachrow" aria-label="待发送的图片">
-              {attachments.map((a) => (
-                <div className="attach" key={a.id}>
-                  <img src={a.url} alt={a.name} title={`${a.name} · ${imgSize(a.size)}`} />
-                  <span
-                    className={`ocrbadge ${a.ocr?.state ?? "pending"}`}
-                    title={
-                      a.ocr?.state === "done"
-                        ? a.ocr.text
-                        : a.ocr?.state === "error"
-                          ? a.ocr.error
-                          : "本机 Vision OCR"
-                    }
-                  >
-                    {ocrLabel(a.ocr)}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setAttachments((list) => list.filter((x) => x.id !== a.id))}
-                    title="移除这张图片"
-                    aria-label={`移除 ${a.name}`}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-              <span className="muted small">
-                {visionReady
-                  ? "截图会随消息直接发给模型"
-                  : "当前模型不能看图，发送时用本机 OCR 提取文字"}
-              </span>
             </div>
           )}
-          <textarea
-            value={input}
-            disabled={readOnly}
-            placeholder={
-              readOnly
-                ? "子任务会话只读，回到父会话才能继续"
-                : live
-                  ? "描述要做的改动，可粘贴截图，/ 唤起命令，! 直接跑命令，Enter 发送"
-                  : "先启动内核"
-            }
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={onKey}
-            onPaste={onPasteImages}
+          <PermBar
+            activeAsks={activeAsks}
+            activePerms={activePerms}
+            alert={alert}
+            toast={toast}
+            readOnly={readOnly}
+            kidFrom={kidFrom}
+            onAnswerQuestion={(q, a) => void answerQuestion(q, a)}
+            onRejectQuestion={(q) => void rejectQuestion(q)}
+            onAnswerPerm={(p, c) => void answer(p, c)}
+            onDismissAlert={() => setAlert(null)}
+            onDismissToast={() => setToast(null)}
           />
-          {err && !lastErr && (
-            <div className="errbar" role="alert">
-              <svg viewBox="0 0 16 16" aria-hidden="true">
-                <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" strokeWidth="1.3" />
-                <path d="M8 4.6v4.3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                <circle cx="8" cy="11.4" r="0.9" fill="currentColor" />
-              </svg>
-              <span className="grow">{err}</span>
-              {retryBtn}
-              <button
-                type="button"
-                className="x"
-                onClick={() => setErr(null)}
-                title="关闭"
-                aria-label="关闭错误提示"
-              >
-                ×
-              </button>
-            </div>
-          )}
-          <div className="row">
-            <div className="ctrls">
-              <button
-                type="button"
-                className={`modebtn ${agent === "plan" ? "on" : ""}`}
-                aria-pressed={agent === "plan"}
-                disabled={agent === null || !agentList.some((a) => a.name === "plan")}
-                title={
-                  agent === "plan"
-                    ? "规划模式已开启：只能读代码、写计划文件，改不了业务代码。点这里退出规划。"
-                    : "规划模式：先出计划、你确认后再动手。内核不会自己进规划模式，要在这里点。"
-                }
-                onClick={() => chooseAgent(agent === "plan" ? prevAgent.current : "plan")}
-              >
-                <svg viewBox="0 0 16 16" aria-hidden="true">
-                  <path
-                    d="M3 2.6h6.4L13 6.1v7.3H3z"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.2"
-                    strokeLinejoin="round"
-                  />
-                  <path
-                    d="M5.3 6.6h5.4M5.3 9h3.6"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.2"
-                    strokeLinecap="round"
-                  />
-                </svg>
-                规划
-              </button>
-              <ChipSelect
-                className="agent"
-                value={agent ?? ""}
-                options={agentList.map((a) => ({
-                  value: a.name,
-                  label: `${AGENT_CN[a.name] ?? a.name} · ${a.name}`,
-                  hint: AGENT_DESC_CN[a.name],
-                }))}
-                placeholder="agent 加载中"
-                disabled={!agentList.length}
-                title={
-                  (agent ? AGENT_DESC_CN[agent] : undefined) ??
-                  "本轮由哪个 agent 执行；规划（plan）禁用改文件工具"
-                }
-                onChange={chooseAgent}
-              />
-              <ChipSelect
-                className="policy"
-                value={policy}
-                options={[
-                  ...POLICIES.map((p) => ({ value: p.id, label: p.label, hint: p.hint })),
-                  ...(policy === "custom" && rules
-                    ? [{ value: "custom", label: "自定义", hint: "当前规则和三种预设都不一致" }]
-                    : []),
-                ]}
-                placeholder="授权策略加载中"
-                disabled={!rules}
-                title={
-                  (POLICIES.find((p) => p.id === policy)?.hint ??
-                    "当前策略与三种预设都不一致") +
-                  (denyRules.length
-                    ? `；另有 ${denyRules.length} 项手动禁止，切换策略时保留`
-                    : "")
-                }
-                onChange={(v) => void applyPolicy(v)}
-              />
-              <ChipSelect
-                className="model"
-                align="right"
-                value={model ? `${model.providerID}/${model.modelID}` : ""}
-                options={modelOptions}
-                placeholder="无可用模型"
-                disabled={!models.length}
-                title="选择模型"
-                onChange={(v) => {
-                  // modelID 本身可含 /，只在第一个斜杠处分提供商
-                  const i = v.indexOf("/");
-                  if (i <= 0) return;
-                  const next = { providerID: v.slice(0, i), modelID: v.slice(i + 1) };
-                  setModel(next);
-                  localStorage.setItem(MODEL_KEY, v);
-                }}
-              />
-            </div>
-            <span className="grow" />
-            {busy ? (
-              <button
-                className="send stop"
-                onClick={() =>
-                  active &&
-                  sessions
-                    .abort(active, dirOf(active))
-                    .catch((e) => setErr(String(e)))
-                }
-                title="停止"
-                aria-label="停止"
-              >
-                <svg viewBox="0 0 16 16" aria-hidden="true">
-                  <rect x="4.2" y="4.2" width="7.6" height="7.6" rx="1.7" fill="currentColor" />
-                </svg>
-              </button>
-            ) : (
-              <button
-                className="send"
-                onClick={send}
-                disabled={!live || readOnly}
-                title="发送（Enter）"
-                aria-label="发送"
-              >
-                <svg viewBox="0 0 16 16" aria-hidden="true">
-                  <path
-                    d="M8 12.6V3.8M4.3 7.2 8 3.5l3.7 3.7"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.6"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              </button>
-            )}
-          </div>
+          <ChatInput
+            input={input}
+            setInput={setInput}
+            live={live}
+            readOnly={readOnly}
+            busy={busy}
+            err={err}
+            lastErr={Boolean(lastErr)}
+            retryBtn={retryBtn}
+            active={active}
+            canSend={live && !readOnly && activePerms.length === 0 && activeAsks.length === 0}
+            attachments={attachments}
+            sessionQueues={sessionQueues}
+            palette={palette}
+            paletteIndex={hi}
+            commandsCount={cmds.length}
+            agent={agent}
+            agentList={agentList}
+            policy={policy}
+            rules={rules}
+            denyRulesCount={denyRules.length}
+            model={model}
+            models={models}
+            modelOptions={modelOptions}
+            onKey={onKey}
+            onPasteImages={onPasteImages}
+            onRemoveAttachment={(id) => setAttachments((list) => list.filter((x) => x.id !== id))}
+            onCancelQueue={cancelQueue}
+            onDismissErr={() => setErr(null)}
+            onTogglePlan={() => chooseAgent(agent === "plan" ? prevAgent.current : "plan")}
+            onChooseAgent={chooseAgent}
+            onApplyPolicy={(v) => void applyPolicy(v)}
+            onSelectModel={(v) => {
+              const i = v.indexOf("/");
+              if (i <= 0) return;
+              const next = { providerID: v.slice(0, i), modelID: v.slice(i + 1) };
+              setModel(next);
+              localStorage.setItem(MODEL_KEY, v);
+            }}
+            onSend={() => void send()}
+            onAbort={() => {
+              if (active) void sessions.abort(active, dirOf(active)).catch((e) => setErr(String(e)));
+            }}
+            onEnqueueCurrent={enqueueCurrent}
+            onInterruptAndSend={() => void interruptAndSend()}
+            onAcceptPalette={accept}
+            onSetPaletteIndex={setHi}
+            onOpenMenu={openMenu}
+            onAddImages={(files) => void addImages(files)}
+          />
         </div>
       </div>
 
@@ -3183,310 +2677,21 @@ export default function Chat({
         <QuickOpen root={wsDir} onClose={closeQuickOpen} onPick={pickQuickFile} />
       )}
 
-      {shareAsk && (
-        <div className="askmask" onMouseDown={() => setShareAsk(null)}>
-          <div
-            className="askcard"
-            role="dialog"
-            aria-modal="true"
-            aria-label="公开发布确认"
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <b>把这段对话公开发布？</b>
-            <p className="hint">
-              内核会把整段会话原文上传到 opncd.ai，换一条任何拿到链接的人都能打开的页面——
-              里面的文件路径、命令和模型输出一起出去。取消发布只能让链接失效，
-              已经被人看走、转走的复制件收不回来。
-            </p>
-            <div className="row">
-              <span className="grow" />
-              <button onClick={() => setShareAsk(null)}>取消</button>
-              <button className="primary" onClick={() => void doShare(shareAsk)}>
-                确认发布
-              </button>
-            </div>
-          </div>
-        </div>
+      {statsOpen && (
+        <StatsModal
+          currentProject={projectDir}
+          activeSessionId={active}
+          kernelVersion={status?.version}
+          onClose={() => setStatsOpen(false)}
+          onSessionImported={reloadList}
+        />
       )}
 
-      {menu && (
-        <div
-          className="ctx"
-          ref={menuBox}
-          style={{
-            left: Math.min(menu.x, window.innerWidth - 172),
-            top: Math.min(menu.y, window.innerHeight - (menu.items.length + 1) * 30),
-          }}
-          onContextMenu={(e) => e.preventDefault()}
-        >
-          {menu.items.map((it) => (
-            <button
-              key={it.label}
-              className={it.danger ? "danger" : ""}
-              onClick={() => {
-                setMenu(null);
-                it.run();
-              }}
-            >
-              {it.label}
-            </button>
-          ))}
-        </div>
-      )}
+      {menu && <ContextMenu menu={menu} onClose={() => setMenu(null)} />}
     </div>
   );
 }
 
-type ChipOption = { value: string; label: string; hint?: string; group?: string; prov?: string };
-
-/**
- * 原生 select 的展开层归系统画，改不了样式；换成自绘 listbox。
- * 支持点击外部/Esc 收起、上下键移动、Enter 选中，菜单向上弹。
- */
-export function ChipSelect({
-  value,
-  options,
-  placeholder,
-  disabled,
-  title,
-  className,
-  align = "left",
-  onChange,
-}: {
-  value: string;
-  options: ChipOption[];
-  placeholder: string;
-  disabled?: boolean;
-  title?: string;
-  className?: string;
-  align?: "left" | "right";
-  onChange: (v: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [hi, setHi] = useState(-1);
-  const box = useRef<HTMLDivElement | null>(null);
-  const cur = options.find((o) => o.value === value);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    window.addEventListener("mousedown", onDown, true);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onDown, true);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
-
-  function openMenu() {
-    const i = options.findIndex((o) => o.value === value);
-    setHi(i < 0 ? 0 : i);
-    setOpen(true);
-  }
-
-  function pick(v: string) {
-    setOpen(false);
-    if (v !== value) onChange(v);
-  }
-
-  function onKeyDown(e: KeyboardEvent<HTMLButtonElement>) {
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-      e.preventDefault();
-      if (!open) {
-        openMenu();
-        return;
-      }
-      const step = e.key === "ArrowDown" ? 1 : -1;
-      setHi((h) => (Math.max(h, 0) + step + options.length) % options.length);
-    } else if (open && e.key === "Enter") {
-      e.preventDefault();
-      const o = options[hi];
-      if (o) pick(o.value);
-    }
-  }
-
-  return (
-    <div className={`chipsel ${align === "right" ? "right" : ""} ${className ?? ""}`} ref={box}>
-      <button
-        type="button"
-        className={`chip ${open ? "open" : ""}`}
-        disabled={disabled || !options.length}
-        title={title}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        onClick={() => (open ? setOpen(false) : openMenu())}
-        onKeyDown={onKeyDown}
-      >
-        <span className="chiptx">{cur?.label ?? placeholder}</span>
-        <svg className="chchev" viewBox="0 0 12 12" aria-hidden="true">
-          <path
-            d="M3 4.7l3 3 3-3"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
-      </button>
-      {open && (
-        <div className="chipmenu" role="listbox" aria-label={title}>
-          {options.map((o, i) => (
-            <Fragment key={o.value}>
-              {o.group && o.group !== options[i - 1]?.group && (
-                <div className="chipgroup">{o.group}</div>
-              )}
-              {o.prov && <div className="chipgroup sub">{o.prov}</div>}
-              <button
-                type="button"
-                role="option"
-              aria-selected={o.value === value}
-              key={o.value}
-              className={`${o.value === value ? "on" : ""} ${i === hi ? "hi" : ""}`}
-              onMouseEnter={() => setHi(i)}
-              onClick={() => pick(o.value)}
-            >
-              <span className="chiptext">
-                <span className="lbl">{o.label}</span>
-                {o.hint && <span className="sub">{o.hint}</span>}
-              </span>
-              {o.value === value && (
-                <svg className="ck" viewBox="0 0 16 16" aria-hidden="true">
-                  <path
-                    d="M3.6 8.3l3 3 5.8-6.4"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              )}
-            </button>
-            </Fragment>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** 右侧轮次导航的标题：取该轮用户输入的第一段真实文本 */
-function turnText(m: Message, max = 24): string {
-  const t = m.parts.find((p) => p.type === "text" && !isSyntheticPart(p))?.text;
-  const s = t?.replace(/\s+/g, " ").trim() ?? "";
-  return s ? `${s.slice(0, max)}${s.length > max ? "…" : ""}` : "（空）";
-}
-
-const PERM_CN: Record<string, string> = {
-  bash: "命令",
-  edit: "改文件",
-  write: "写文件",
-  read: "读文件",
-  glob: "查找文件",
-  grep: "搜索",
-  webfetch: "联网抓取",
-  browser: "浏览器",
-  task: "子任务",
-};
-
-/** 内核出厂默认就允许这两项，三种策略都留着，免得"每次询问"比默认还啰嗦 */
-const ALWAYS_ALLOWED = ["websearch", "external_directory_read"];
-
-type Policy = {
-  id: string;
-  label: string;
-  hint: string;
-  mode: BashMode;
-  /** "*" 表示全部放行，其余是在内核默认之上额外自动允许的权限 */
-  extra: string[];
-};
-
-const POLICIES: Policy[] = [
-  {
-    id: "ask",
-    label: "每次询问",
-    hint: "执行命令、改文件、访问网络前逐项确认",
-    mode: "always_ask",
-    extra: [],
-  },
-  {
-    id: "auto",
-    label: "自动审批",
-    hint: "工作区内改文件直接放行；命令走内核沙箱，只在检测到风险时询问",
-    mode: "sandbox",
-    extra: ["edit", "write"],
-  },
-  {
-    id: "full",
-    label: "完全访问",
-    hint: "不再询问，可自由访问文件、终端和网络",
-    mode: "always_allow",
-    extra: ["*"],
-  },
-];
-
-const allowedSet = (p: Policy, rules: PermRule[]) =>
-  new Set(p.extra.includes("*") ? rules.map((r) => r.permission) : [...ALWAYS_ALLOWED, ...p.extra]);
-
-function matchPolicy(rules: PermRule[] | null, mode: BashMode | null): string {
-  if (!rules || !mode) return "custom";
-  // deny 是用户额外加的手铐，不参与预设比对：否则切完策略立刻显示成「自定义」
-  const live = rules.filter((r) => r.action !== "deny");
-  for (const p of POLICIES) {
-    const allow = allowedSet(p, rules);
-    if (
-      p.mode === mode &&
-      live.every((r) => r.action === (allow.has(r.permission) ? "allow" : "ask"))
-    )
-      return p.id;
-  }
-  return "custom";
-}
-
-function label(info: MessageInfo): string {
-  if (info.role === "user") return "你";
-  // 内核把每条回复实际用的 agent 记在 info.agent，切了 plan 却看不出就是白切
-  const ag = info.agent && info.agent !== "build" ? ` · ${info.agent}` : "";
-  const mid = info.model?.modelID ?? info.modelID;
-  return mid ? `助手${ag} · ${mid}` : `助手${ag}`;
-}
-
-const fmtNum = (n: number, frac = 0) =>
-  n.toLocaleString("zh-CN", { maximumFractionDigits: frac });
-
-/**
- * 时长按量级换单位：秒 → 分 → 时 → 天，最多报两级（3分12秒 / 2小时5分 / 3天4小时）。
- * 入参是秒；不足一秒保留一位小数，跑长了的会话不会再变成 1832s 这种读数。
- */
-function fmtSpan(sec: number): string {
-  if (!Number.isFinite(sec) || sec < 0) return "";
-  if (sec === 0) return "0秒";
-  if (sec < 1) {
-    // 0.96 秒四舍五入到 1.0 后别再退回秒的小数位
-    const tenth = Math.round(sec * 10) / 10;
-    return tenth < 1 ? `${tenth.toFixed(1)}秒` : "1秒";
-  }
-  const total = Math.floor(sec);
-  if (total < 60) return `${total}秒`;
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  if (m < 60) return s ? `${m}分${s}秒` : `${m}分`;
-  const h = Math.floor(m / 60);
-  const mm = m % 60;
-  if (h < 24) return mm ? `${h}小时${mm}分` : `${h}小时`;
-  const d = Math.floor(h / 24);
-  const hh = h % 24;
-  return hh ? `${d}天${hh}小时` : `${d}天`;
-}
-
-/** 处理中要说明此刻在干什么：只有"内核处理中"四个字的时候，用户无从判断是排队还是卡死 */
-/** task 工具的正文要等子会话跑完才有，中途能拿到的只有 metadata.sessionId */
 const kidSid = (p: Part) => String((p.state as any)?.metadata?.sessionId ?? "");
 
 /**
@@ -3514,1161 +2719,4 @@ function activityOf(
   if (p.type === "reasoning") return "思考中";
   if (p.type === "text") return "输出中";
   return "生成回复";
-}
-
-/** 处理中秒数放在叶子里，避免每秒拖整棵 Chat 重绘 */
-function BusyHint({
-  waitingPerm,
-  waitingAsk,
-  retry,
-  activity,
-}: {
-  waitingPerm: boolean;
-  waitingAsk: boolean;
-  retry: { attempt: number; message: string } | null;
-  activity: string;
-}) {
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    const t0 = Date.now();
-    setElapsed(0);
-    // 每秒一次只更新这个叶子；换算成秒交给 fmtSpan，跑久了自动走分/时
-    const iv = window.setInterval(() => setElapsed(Math.floor((Date.now() - t0) / 1000)), 1000);
-    return () => window.clearInterval(iv);
-  }, []);
-  const text = waitingPerm
-    ? "等待你在下方授权…"
-    : waitingAsk
-      ? "等待你在下方回答…"
-      : retry
-        ? `自动重试中（第 ${retry.attempt} 次）：${retry.message}`
-        : `内核处理中 ${fmtSpan(elapsed)} · ${activity}`;
-  return (
-    <p className="hint busy">
-      <span className="pulse" />
-      {text}
-    </p>
-  );
-}
-
-const Block = memo(function Block({ part, assistant = false, streaming = false }: { part: Part; assistant?: boolean; streaming?: boolean }) {
-  switch (part.type) {
-    case "text":
-      // 内核会往用户消息里塞 synthetic 文本（如语言提示），不属于对话内容
-      if (isSyntheticPart(part)) return null;
-      return assistant
-        ? <ChatMarkdown text={part.text ?? ""} streaming={streaming} />
-        : <pre className="text">{part.text}</pre>;
-    case "file": {
-      const url = String(part.url ?? "");
-      const name = part.filename ?? "图片附件";
-      // 图片走 data URL 进消息；直接摊 url 会把整段 base64 当正文显示
-      if (
-        (String(part.mime ?? "").startsWith("image/") || url.startsWith("data:image/")) &&
-        (url.startsWith("data:") || url.startsWith("blob:") || url.startsWith("http"))
-      ) {
-        return <img className="partimg" src={url} alt={name} title={name} />;
-      }
-      return <p className="hint">附件：{name && name !== "图片附件" ? name : url}</p>;
-    }
-    // @提及的 agent：不渲染的话提名就在时间线上凭空消失
-    case "agent": {
-      const nm = String((part as any).name ?? "");
-      return nm ? <p className="hint">@ {nm}</p> : null;
-    }
-    // /命令派出的子任务：prompt 就是它的全部输入，折起来可查
-    case "subtask": {
-      const st = part as any;
-      const line = String(st.description || st.agent || "子任务");
-      return (
-        <details className="fold subtask">
-          <summary>
-            <b>子任务</b>
-            <span className="arg">{line}</span>
-            {st.agent && <span className="tag">{st.agent}</span>}
-          </summary>
-          <pre className="code">{String(st.prompt ?? "")}</pre>
-        </details>
-      );
-    }
-    // 压缩点：上下文被折叠的位置，留一条分隔线，回看时能解释"后面怎么变短了"
-    case "compaction": {
-      const c = part as any;
-      return (
-        <p className="hint compaction">
-          {c.auto ? "上下文已自动压缩" : "上下文已压缩"}
-          {c.overflow ? "（超出模型窗口）" : ""}
-        </p>
-      );
-    }
-    // 自动重试（限流/网络）：不显示就只能看到"处理中"干等
-    case "retry": {
-      const r = part as any;
-      const msg = r.error?.data?.message ?? r.error?.name ?? "未知错误";
-      return <p className="hint">内核重试中（第 {r.attempt ?? 1} 次）：{msg}</p>;
-    }
-    case "patch": {
-      const files = (part as any).files;
-      if (!Array.isArray(files) || !files.length) return null;
-      return (
-        <details className="fold patch">
-          <summary>
-            <b>改动</b>
-            <span className="arg">{files.length} 个文件</span>
-          </summary>
-          <ul className="flist">
-            {files.map((f: unknown, i: number) => (
-              <li key={i} title={String(f)}>
-                <span className="fname">{baseName(f)}</span>
-              </li>
-            ))}
-          </ul>
-        </details>
-      );
-    }
-    // step-start / step-finish / snapshot：内核内部标记，不渲染
-    default:
-      return null;
-  }
-});
-
-/** 工具执行的分组行：一轮里的思考和工具按发生顺序摊平，整轮只合成一张卡 */
-type RunItem = { p: Part; m: Message };
-type FlatUnit =
-  | { t: "run"; key: string; items: RunItem[]; ids: string[] }
-  | { t: "part"; key: string; p: Part; m: Message; ids: string[] };
-
-/** 内核内部标记不占行，也不该把一次连续执行截成两段 */
-const HIDDEN_PART = new Set(["step-start", "step-finish", "snapshot"]);
-
-function flattenParts(assistants: Message[]): FlatUnit[] {
-  const parts: FlatUnit[] = [];
-  const items: RunItem[] = [];
-  let ids: string[] = [];
-  // 卡片落在第一次执行的位置：开头的说明留在卡上方，其余正文和收尾回答依次排在卡下方
-  let cardAt = 0;
-  for (const m of assistants) {
-    let first = true;
-    for (const p of m.parts) {
-      if (HIDDEN_PART.has(p.type)) continue;
-      // 只带时间戳、还没有正文的思考块不占行
-      if (p.type === "reasoning" && !p.text?.trim()) continue;
-      const own = first ? [m.info.id] : [];
-      first = false;
-      if (p.type === "tool" || p.type === "reasoning") {
-        if (!items.length) cardAt = parts.length;
-        items.push({ p, m });
-        ids.push(...own);
-      } else {
-        parts.push({ t: "part", key: p.id, p, m, ids: own });
-      }
-    }
-  }
-  if (!items.length) return parts;
-  const card: FlatUnit = { t: "run", key: "execution", items, ids };
-  return [...parts.slice(0, cardAt), card, ...parts.slice(cardAt)];
-}
-
-/** 助手这一轮的全部 part：执行步骤收进一张卡，其余按原样留在卡片前后 */
-function AssistantParts({
-  assistants,
-  live,
-  onCopy,
-  onMenu,
-  kidOf,
-}: {
-  assistants: Message[];
-  live: boolean;
-  onCopy: (t: string) => void;
-  onMenu: (e: ReactMouseEvent, m: Message) => void;
-  kidOf: (p: Part) => Message[] | undefined;
-}) {
-  return (
-    <>
-      {flattenParts(assistants).map((u) => (
-        <Fragment key={u.key}>
-          {u.ids.map((id) => (
-            <span key={id} id={`m-${id}`} className="anchor" aria-hidden="true" />
-          ))}
-          {u.t === "run" ? (
-            <ToolRun items={u.items} live={live} onCopy={onCopy} onMenu={onMenu} kidOf={kidOf} />
-          ) : (
-            <div className="unit" onContextMenu={(e) => onMenu(e, u.m)}>
-              <Block part={u.p} assistant streaming={live && !u.m.info.time.completed && !u.p.time?.end} />
-            </div>
-          )}
-        </Fragment>
-      ))}
-    </>
-  );
-}
-
-/** 内核反问：把 header/question/options 摊成可点的选项，而不是一个 JSON 折叠卡 */
-function QuestionCard({
-  q,
-  from,
-  onAnswer,
-  onReject,
-}: {
-  q: QuestionRequest;
-  from?: ReactNode;
-  onAnswer: (answers: string[][]) => void;
-  onReject: () => void;
-}) {
-  const [picked, setPicked] = useState<string[][]>(() => q.questions.map(() => []));
-  const [free, setFree] = useState<string[]>(() => q.questions.map(() => ""));
-  const many = q.questions.length > 1;
-
-  function pick(i: number, label: string) {
-    setPicked((prev) =>
-      prev.map((row, j) => {
-        if (j !== i) return row;
-        if (!q.questions[i].multiple) return row[0] === label ? [] : [label];
-        return row.includes(label) ? row.filter((x) => x !== label) : [...row, label];
-      }),
-    );
-  }
-
-  const answers = q.questions.map((info, i) => {
-    const t = free[i].trim();
-    return t && info.custom !== false ? [...picked[i], t] : picked[i];
-  });
-  const ready = answers.every((a) => a.length);
-
-  return (
-    <div className="ask q">
-      {from}
-      <header>
-        <b>需要你决定</b>
-        <span>{many ? `${q.questions.length} 个问题，一次答完` : "选一项，内核按你的选择继续"}</span>
-      </header>
-      {q.questions.map((info, i) => {
-        const shown = picked[i];
-        return (
-          <div className="qone" key={i}>
-            <p className="qtext">
-              {many && <span className="qno">{i + 1}</span>}
-              <span>{info.header || info.question}</span>
-              {info.multiple && <span className="tag">可多选</span>}
-            </p>
-            {info.header && info.question !== info.header && (
-              <p className="muted small">{info.question}</p>
-            )}
-            <ul className={info.multiple ? "qopts multi" : "qopts"}>
-              {info.options.map((o) => (
-                <li key={o.label}>
-                  <button
-                    className={shown.includes(o.label) ? "on" : ""}
-                    onClick={() => pick(i, o.label)}
-                  >
-                    <span className="box" />
-                    <span className="qlabel">{o.label}</span>
-                    {o.description && <span className="qdesc">{o.description}</span>}
-                  </button>
-                </li>
-              ))}
-            </ul>
-            {info.custom !== false && (
-              <input
-                className="qfree"
-                value={free[i]}
-                placeholder="或者自己写一个答案"
-                onChange={(e) =>
-                  setFree((prev) => prev.map((x, j) => (j === i ? e.target.value : x)))
-                }
-              />
-            )}
-          </div>
-        );
-      })}
-      <footer className="qfoot">
-        <div className="row">
-          <button className="primary" disabled={!ready} onClick={() => onAnswer(answers)}>
-            提交回答
-          </button>
-          <button onClick={onReject}>不回答</button>
-        </div>
-        {!ready && <p className="asknote">每个问题至少选一项</p>}
-      </footer>
-    </div>
-  );
-}
-
-/**
- * 一行状态回显（"Wrote file successfully."）没什么可复制的，只有真正的代码/文件内容才给角标，
- * 否则每条工具消息上都挂一个按钮，等于没有。
- */
-const worthCopy = (t: string) => t.includes("\n") || t.length >= 120;
-
-/** 工具块的复制角标：悬浮或键盘聚焦才显形，挂在 wrapper 上不随块内滚动跑掉 */
-function Copyable({
-  text,
-  onCopy,
-  children,
-}: {
-  text: string;
-  onCopy: (t: string) => void;
-  children: ReactNode;
-}) {
-  if (!worthCopy(text)) return <>{children}</>;
-  return (
-    <div className="codewrap">
-      {children}
-      <button className="cp" onClick={() => onCopy(text)} title="复制" aria-label="复制这段内容">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-          <rect x="9" y="9" width="13" height="13" rx="2" />
-          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-        </svg>
-      </button>
-    </div>
-  );
-}
-
-const STATE_CN: Record<string, string> = {
-  pending: "等待中",
-  running: "执行中",
-  completed: "完成",
-  error: "失败",
-};
-
-/** 子任务日志里的状态角标 */
-function StatusChip({ status }: { status: string }) {
-  return <span className={`st st-${status}`}>{STATE_CN[status] ?? status}</span>;
-}
-
-/** 改动清单里的状态字母（git 风格） */
-const FSTATUS_CN: Record<string, string> = { added: "A", deleted: "D", modified: "M" };
-
-/** 这些工具的入参本身就写在标题行里，再摊一份 JSON 只会把正文挤成一堵墙 */
-const SELF_EXPLANATORY = new Set([
-  "read",
-  "list",
-  "grep",
-  "glob",
-  "edit",
-  "write",
-  "bash",
-  "webfetch",
-  // 反问的选项已经在下方摊成卡片了，卡片里再 dump 一遍 questions JSON 只会挡路
-  "question",
-  // 待办清单有专门的排版，见 TodoList
-  "todowrite",
-]);
-
-const baseName = (p: unknown) => {
-  const s = String(p ?? "");
-  return s.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || s;
-};
-
-/** 标题行取最能说明"在干什么"的那个字段：bash 用它的 description，读写用文件名，检索用 pattern */
-function toolHead(part: Part): string {
-  const s = part.state as any;
-  const { tool, input: i } = toolView(part);
-  const title = String(s?.title ?? "").replace(/\s+/g, " ").trim();
-  const qs = i.questions as any[] | undefined;
-  const td = i.todos as any[] | undefined;
-  const files = i.file_paths as string[] | undefined;
-  const raw =
-    tool === "bash"
-      ? (i.description ?? title ?? i.command)
-      : tool === "read" || tool === "edit" || tool === "write"
-        ? baseName(i.filePath ?? i.path ?? title)
-        : tool === "grep" || tool === "glob"
-          ? i.pattern
-          : tool === "webfetch"
-            ? i.url
-            : tool === "deleteFile" && files?.length
-              ? files.length > 1
-                ? `${files.length} 个文件`
-                : baseName(files[0])
-              : tool === "skill"
-                ? i.name
-                : tool === "tool_search" || tool === "CodeSemanticSearch"
-                  ? i.query
-                  : tool === "tool_describe"
-                    ? i.id
-                    : tool === "invalid"
-                      ? i.tool
-                      : tool === "question" && qs?.length
-                        ? `${qs[0].header ?? qs[0].question}${qs.length > 1 ? ` 等 ${qs.length} 个问题` : ""}`
-                        : tool === "todowrite" && td?.length
-                          ? `${td.length} 项待办`
-                          : title;
-  const text = String(raw ?? "").replace(/\s+/g, " ").trim();
-  // 个别步骤的标题只有内核内部 id，摆出来对用户没有意义
-  if (/^tool_[a-z0-9]{10,}$/i.test(text)) return "";
-  return text.length > 90 ? `${text.slice(0, 90)}…` : text;
-}
-
-// preview 可能截断，展开详情优先使用完整 output，并剥离内核给模型看的包装。
-function toolResult(part: Part): { text: string; truncated: boolean } {
-  const s = part.state as any;
-  const meta = s?.metadata ?? {};
-  const preview = typeof meta.preview === "string" ? meta.preview : "";
-  const output = readableToolOutput(String(s?.output ?? ""));
-  return {
-    text: output.trim() ? output : preview,
-    truncated: !!meta.truncated,
-  };
-}
-
-/** 工具细节：命令、参数、待办、子会话进展与输出；分组行展开后共用这份内容 */
-function ToolBody({
-  part,
-  onCopy,
-  kid,
-}: {
-  part: Part;
-  onCopy: (t: string) => void;
-  kid?: Message[];
-}) {
-  const s: ToolState | undefined = part.state;
-  const status = s?.status ?? "pending";
-  const { tool, input: args } = toolView(part);
-  const cmd = tool === "bash" ? String(args?.command ?? "") : "";
-  const { text: result, truncated } = toolResult(part);
-  const err = status === "error" ? String((s as any)?.error ?? "") : "";
-  const json =
-    !err && !cmd && args && !SELF_EXPLANATORY.has(tool) && Object.keys(args).length
-      ? JSON.stringify(args, null, 2)
-      : "";
-  /** `todowrite` 的 input 与 output 是同一份清单，摊成清单看，两边都不再 dump */
-  const todos =
-    tool === "todowrite"
-      ? (args?.todos as Todo[] | undefined)
-      : tool === "todoread"
-        ? parseTodos(readableToolOutput(String((s as any)?.output ?? "")))
-        : undefined;
-  return (
-    <>
-      {cmd && (
-        <Copyable text={cmd} onCopy={onCopy}>
-          <pre className="code">$ {cmd}</pre>
-        </Copyable>
-      )}
-      {json && (
-        <Copyable text={json} onCopy={onCopy}>
-          <pre className="code">{json}</pre>
-        </Copyable>
-      )}
-      {!!todos?.length && (
-        <div className="todo">
-          <p className="muted small">{todoProg(todos)}</p>
-          <TodoRows todos={todos} />
-        </div>
-      )}
-      {kid?.length ? (
-        <KidLog msgs={kid} running={status === "pending" || status === "running"} />
-      ) : null}
-      {err && <pre className="code err">{err}</pre>}
-      {!err && !todos && result && (
-        <Copyable text={result} onCopy={onCopy}>
-          <pre className="code out">{result}</pre>
-        </Copyable>
-      )}
-      {!err && !todos && truncated && <p className="hint">输出已被内核截断</p>}
-    </>
-  );
-}
-
-/** 工具名换成人话，标题行只留用户看得懂的那半句 */
-const TOOL_CN: Record<string, string> = {
-  bash: "终端命令",
-  read: "读取文件",
-  edit: "修改文件",
-  write: "写入文件",
-  grep: "搜索内容",
-  glob: "查找文件",
-  list: "列出目录",
-  webfetch: "访问网页",
-  task: "子任务",
-  question: "询问",
-  todowrite: "更新待办",
-  todoread: "查看待办",
-  deleteFile: "删除文件",
-  skill: "技能",
-  tool_call: "调用工具",
-  tool_search: "搜索工具",
-  tool_describe: "查看工具说明",
-  CodeSemanticSearch: "语义搜索",
-  invalid: "工具调用",
-};
-
-/** tool_call 是内核的工具代理：真实工具和参数在 input.id / input.args 里 */
-function toolView(part: Part): { tool: string; input: Record<string, any> } {
-  const input = ((part.state as any)?.input ?? {}) as Record<string, any>;
-  if (part.tool === "tool_call" && typeof input.id === "string") {
-    return { tool: input.id, input: (input.args ?? {}) as Record<string, any> };
-  }
-  return { tool: part.tool ?? "", input };
-}
-
-/** 完成态按工具分说法：命令是"已运行"，其余是"已完成" */
-function runVerb(part: Part, status: string): string {
-  if (status === "completed") return toolView(part).tool === "bash" ? "已运行" : "已完成";
-  return STATE_CN[status] ?? status;
-}
-
-/** 行尾那半句：命令原样留（等宽），其余用标题行取到的摘要 */
-function runPreview(part: Part): { text: string; mono: boolean } {
-  if (part.type === "reasoning")
-    return { text: String(part.text ?? "").replace(/\s+/g, " ").trim(), mono: false };
-  const { tool, input } = toolView(part);
-  if (tool === "bash")
-    return { text: String(input.command ?? "").replace(/\s+/g, " ").trim(), mono: true };
-  if (tool === "grep" || tool === "glob" || tool === "webfetch")
-    return { text: toolHead(part), mono: true };
-  return { text: toolHead(part), mono: false };
-}
-
-/** 行首状态图标：完成打勾、失败打叉、执行中转圈 */
-function RunIcon({ status }: { status: string }) {
-  if (status === "running" || status === "pending") {
-    return (
-      <svg className="tgicon spin" viewBox="0 0 16 16" aria-hidden="true">
-        <circle
-          cx="8"
-          cy="8"
-          r="6.2"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.6"
-          strokeLinecap="round"
-          strokeDasharray="12 27"
-        />
-      </svg>
-    );
-  }
-  if (status === "error") {
-    return (
-      <svg className="tgicon" viewBox="0 0 16 16" aria-hidden="true">
-        <circle cx="8" cy="8" r="6.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
-        <path
-          d="M5.7 5.7l4.6 4.6M10.3 5.7l-4.6 4.6"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.3"
-          strokeLinecap="round"
-        />
-      </svg>
-    );
-  }
-  return (
-    <svg className="tgicon" viewBox="0 0 16 16" aria-hidden="true">
-      <circle cx="8" cy="8" r="6.4" fill="none" stroke="currentColor" strokeWidth="1.3" />
-      <path
-        d="M5 8.2l2.1 2.1 3.9-4.4"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-const ToolRow = memo(function ToolRow({
-  part,
-  onCopy,
-  kid,
-}: {
-  part: Part;
-  onCopy: (t: string) => void;
-  kid?: Message[];
-}) {
-  const status = part.state?.status ?? "pending";
-  const [open, setOpen] = useConversationExpansion(part.id);
-  const { text, mono } = runPreview(part);
-  return (
-    <details className="tgr" open={open}>
-      <summary onClick={(e) => { e.preventDefault(); setOpen(!open); }} aria-expanded={open}>
-        <RunIcon status={status} />
-        <span className="tglabel">{TOOL_CN[toolView(part).tool] ?? "工具"}</span>
-        <span className={`tgverb tg-${status}`}>{runVerb(part, status)}</span>
-        {text && (
-          <>
-            <span className="tgsep" aria-hidden="true">
-              ·
-            </span>
-            <span className={`tgpreview ${mono ? "mono" : ""}`} title={text}>
-              {text}
-            </span>
-          </>
-        )}
-      </summary>
-      {open && <div className="tgbody">
-        <ToolBody part={part} onCopy={onCopy} kid={kid} />
-      </div>}
-    </details>
-  );
-});
-
-const ReasoningRow = memo(function ReasoningRow({ part }: { part: Part }) {
-  const [open, setOpen] = useConversationExpansion(part.id);
-  const preview = String(part.text ?? "").replace(/\s+/g, " ").trim();
-  return (
-    <details className="tgr" open={open}>
-      <summary onClick={(e) => { e.preventDefault(); setOpen(!open); }} aria-expanded={open}>
-        <RunIcon status="completed" />
-        <span className="tglabel">已思考</span>
-        <span className="tgpreview" title={preview}>
-          {preview}
-        </span>
-      </summary>
-      {open && <div className="tgbody">
-        <pre className="text muted scroll">{part.text}</pre>
-      </div>}
-    </details>
-  );
-});
-
-function ToolRun({
-  items,
-  live,
-  onCopy,
-  onMenu,
-  kidOf,
-}: {
-  items: RunItem[];
-  live: boolean;
-  onCopy: (t: string) => void;
-  onMenu: (e: ReactMouseEvent, m: Message) => void;
-  kidOf: (p: Part) => Message[] | undefined;
-}) {
-  const tools = items.filter((i) => i.p.type === "tool").length;
-  const running = items.some((i) => {
-    const s = i.p.type === "tool" ? i.p.state?.status : undefined;
-    return s === "running" || s === "pending";
-  });
-  const [open, setOpen] = useConversationExpansion("execution");
-  const latest = [...items].reverse().find((item) => item.p.type === "tool");
-  const activity = latest ? `${TOOL_CN[toolView(latest.p).tool] ?? "工具"} · ${runPreview(latest.p).text}` : "思考中";
-  return (
-    <details className="toolrun" open={open}>
-      <summary onClick={(e) => { e.preventDefault(); setOpen(!open); }} aria-expanded={open}>
-        <span className="tgchev" aria-hidden="true">
-          <svg viewBox="0 0 16 16">
-            <path
-              d="M6 3.6l4.4 4.4L6 12.4"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </span>
-        <span className="tgtitle">{tools ? `执行工具 ${tools} 次` : "已思考"}</span>
-        {(live || running) && <span className="tgactivity" title={activity}>{activity}</span>}
-        <span className={`tgstate ${live || running ? "tg-active" : ""}`}>{live || running ? "进行中" : "已结束"}</span>
-      </summary>
-      {open && <ol className="tglist">
-        {items.map(({ p, m }) => (
-          <li
-            key={p.id}
-            className={`tgrow tg-${p.type === "tool" ? (p.state?.status ?? "pending") : "completed"}`}
-            onContextMenu={(e) => onMenu(e, m)}
-          >
-            {p.type === "reasoning" ? (
-              <ReasoningRow part={p} />
-            ) : (
-              <ToolRow part={p} onCopy={onCopy} kid={kidOf(p)} />
-            )}
-          </li>
-        ))}
-      </ol>}
-    </details>
-  );
-}
-
-/** 待办清单：状态用符号 + 颜色双通道，只靠颜色在深色模式下分不出来 */
-const TODO_CN: Record<string, string> = {
-  pending: "待办",
-  in_progress: "进行中",
-  completed: "完成",
-  cancelled: "已取消",
-};
-
-const STATUS_TITLE: Record<string, string> = {
-  pending: "未开始",
-  in_progress: "正在执行",
-  completed: "已完成",
-  cancelled: "已取消",
-};
-
-/** `todoread`（内核默认 deny，放开就会用到）把清单放在 output 的 JSON 字符串里；解不出来就照旧摊原文 */
-function parseTodos(raw: unknown): Todo[] | undefined {
-  try {
-    const v = JSON.parse(String(raw ?? ""));
-    return Array.isArray(v) && v.every((x) => typeof x?.content === "string") ? (v as Todo[]) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** 一行进度。取消单独列出来，免得它被算进"已完成"里看着像做完了 */
-function todoProg(todos: Todo[]): string {
-  const done = todos.filter((t) => t.status === "completed").length;
-  const gone = todos.filter((t) => t.status === "cancelled").length;
-  return done + gone === 0
-    ? `${todos.length} 项待办`
-    : `已完成 ${done} / ${todos.length}${gone ? ` · 取消 ${gone}` : ""}`;
-}
-
-/** 每行的状态点：待办空圈、进行中蓝色三角、完成绿勾、取消灰叉 */
-function TodoMark({ status }: { status: string }) {
-  if (status === "completed")
-    return (
-      <svg viewBox="0 0 16 16" aria-hidden="true">
-        <circle cx="8" cy="8" r="6.2" fill="currentColor" />
-        <path
-          d="M5.1 8.2l2 2 3.9-4.3"
-          fill="none"
-          stroke="#ffffff"
-          strokeWidth="1.6"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      </svg>
-    );
-  if (status === "in_progress")
-    return (
-      <svg viewBox="0 0 16 16" aria-hidden="true">
-        <path d="M6.3 4.4l5.3 3.6-5.3 3.6z" fill="currentColor" />
-      </svg>
-    );
-  if (status === "cancelled")
-    return (
-      <svg viewBox="0 0 16 16" aria-hidden="true">
-        <circle cx="8" cy="8" r="5.6" fill="none" stroke="currentColor" strokeWidth="1.3" />
-        <path
-          d="M6 6l4 4M10 6l-4 4"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.3"
-          strokeLinecap="round"
-        />
-      </svg>
-    );
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true">
-      <circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" strokeWidth="1.3" />
-    </svg>
-  );
-}
-
-function TodoRows({ todos }: { todos: Todo[] }) {
-  return (
-    <ol className="todoRows">
-      {todos.map((t, i) => (
-        <li key={i} data-status={t.status} title={STATUS_TITLE[t.status] ?? t.status}>
-          <span className="tmark" aria-hidden="true">
-            <TodoMark status={t.status} />
-          </span>
-          <span className="tx">{t.content}</span>
-          <span className="tmeta">
-            {t.priority === "high" && <span className="pri">高优</span>}
-            <span className="st-cn">{TODO_CN[t.status] ?? t.status}</span>
-          </span>
-        </li>
-      ))}
-    </ol>
-  );
-}
-
-type TurnStat = {
-  diffs: FileDiff[];
-  /** 重开会话时事件快照没了，从这一轮的 todowrite part 还原清单 */
-  todos: Todo[];
-};
-
-/** `todowrite` 的入参就是整份清单；`todoread` 则把 JSON 放在 output 里 */
-function todosOfPart(part: Part): Todo[] | undefined {
-  if (part.type !== "tool" || (part.tool !== "todowrite" && part.tool !== "todoread")) return undefined;
-  const s = part.state as any;
-  const input = s?.input?.todos;
-  if (Array.isArray(input) && input.every((x: any) => typeof x?.content === "string")) {
-    return input as Todo[];
-  }
-  return part.tool === "todoread" ? parseTodos(s?.output) : undefined;
-}
-
-/**
- * 以用户消息切轮：统计每轮的改动明细（取该用户消息上的 summary.diffs，
- * 内核按轮写入；session.diff 是全轮累计口径，不用），并还原这一轮的待办快照。
- */
-type TurnGroups = Record<string, Message[]>;
-
-/** 单轮的底账。抽出来是为了让没变化的轮次可以整份复用对象引用 */
-function turnStatOf(arr: Message[]): TurnStat {
-  const user = arr[0];
-  const d = user ? (user.info as any).summary?.diffs : undefined;
-  let todos: Todo[] = [];
-  for (const m of arr) {
-    if (m.info.role === "user") continue;
-    for (const p of m.parts) {
-      const t = todosOfPart(p);
-      if (t) todos = t;
-    }
-  }
-  return {
-    diffs: Array.isArray(d) ? (d as FileDiff[]) : [],
-    todos,
-  };
-}
-
-/**
- * 长会话的每一帧都会重算这张表；只有正在流式输出的那一轮消息对象会变，
- * 其余轮按消息引用整份复用，避免每帧重拉几百条步骤摘要。
- */
-function turnsOf(
-  msgs: Message[],
-  busy: boolean,
-  prev: { busy: boolean; runKey: string; stat: Record<string, TurnStat>; groups: TurnGroups } | null,
-): { stat: Record<string, TurnStat>; owner: string[]; groups: TurnGroups; runKey: string } {
-  const owner: string[] = [];
-  const groups: TurnGroups = {};
-  let cur = "";
-  for (const m of msgs) {
-    if (m.info.role === "user") {
-      cur = m.info.id;
-      groups[cur] = [];
-    }
-    owner.push(cur);
-    if (cur) groups[cur].push(m);
-  }
-  const runKey = busy && owner.length ? owner[owner.length - 1] : "";
-  const sameShape = !!prev && prev.busy === busy && prev.runKey === runKey;
-  const stat: Record<string, TurnStat> = {};
-  for (const [k, arr] of Object.entries(groups)) {
-    const old = sameShape ? prev!.groups[k] : undefined;
-    const reuse =
-      !!old &&
-      old.length === arr.length &&
-      arr.every((m, i) => m === old[i]) &&
-      !!prev!.stat[k];
-    stat[k] = reuse ? prev!.stat[k] : turnStatOf(arr);
-  }
-  return { stat, owner, groups, runKey };
-}
-
-/**
- * 一轮对话的文件改动小结：步骤本身都在上面的执行卡里，这里只报这一轮改了哪些文件。
- */
-const TurnSum = memo(function TurnSum({
-  running,
-  pulse,
-  diffs,
-  onOpenFile,
-}: {
-  running: boolean;
-  pulse: number;
-  diffs: FileDiff[];
-  onOpenFile?: (d: FileDiff) => void;
-}) {
-  if (!diffs.length) return null;
-  const add = diffs.reduce((n, d) => n + (d.additions ?? 0), 0);
-  const del = diffs.reduce((n, d) => n + (d.deletions ?? 0), 0);
-  return (
-    <details className="fold turnsum">
-      <summary>
-        {running ? (
-          <span className="pulse-dot" key={pulse} aria-hidden="true" />
-        ) : (
-          <span className="ck" aria-hidden="true">
-            ✓
-          </span>
-        )}
-        <span>
-          {diffs.length} 个文件已修改
-          {(add > 0 || del > 0) && (
-            <>
-              {" "}
-              <span className="add">+{add}</span> <span className="del">-{del}</span>
-            </>
-          )}
-        </span>
-      </summary>
-      <ul className="flist">
-        {diffs.map((d, i) => (
-          <li key={i}>
-            <button
-              className="flink"
-              onClick={() => onOpenFile?.(d)}
-              title={`${d.file} · 打开 diff`}
-            >
-              <span className={`fx ${d.status ?? "modified"}`}>
-                {FSTATUS_CN[d.status ?? "modified"]}
-              </span>
-              <span className="fname">{baseName(d.file)}</span>
-              <span className="muted small">
-                {d.additions ? `+${d.additions}` : ""}
-                {d.deletions ? ` -${d.deletions}` : ""}
-              </span>
-            </button>
-          </li>
-        ))}
-      </ul>
-    </details>
-  );
-});
-
-const doneCount = (todos: Todo[]) =>
-  todos.filter((t) => t.status === "completed" || t.status === "cancelled").length;
-
-/**
- * 轮末待办：收在该轮最底部。跑着的时候不在这里出现，
- * 由 TodoFly 悬浮展示；一轮结束后才落到这里，回看时按轮归档。
- */
-const TurnTodo = memo(function TurnTodo({ todos }: { todos?: Todo[] }) {
-  if (!todos?.length) return null;
-  const done = doneCount(todos);
-  const all = done === todos.length;
-  const doing = todos.find((t) => t.status === "in_progress");
-  return (
-    <details className="fold turnTodo">
-      <summary>
-        <span className={all ? "ck" : "pin"} aria-hidden="true">
-          {all ? "✓" : "☐"}
-        </span>
-        <span>待办 {done} / {todos.length}</span>
-        {!all && doing && <span className="muted"> · {doing.content}</span>}
-      </summary>
-      <TodoRows todos={todos} />
-    </details>
-  );
-});
-
-type TurnRowData = { key: string; owner: string; user?: Message; assistants: Message[] };
-
-function estimateTurnHeight(row: TurnRowData): number {
-  let chars = 0;
-  let blocks = 0;
-  let tools = 0;
-  for (const m of [row.user, ...row.assistants]) {
-    if (!m) continue;
-    for (const p of m.parts) {
-      blocks++;
-      if (p.type === "tool") tools++;
-      if (p.type === "text" || p.type === "reasoning") chars += p.text?.length ?? 0;
-    }
-  }
-  return Math.max(180, Math.min(12000, 120 + chars * 0.5 + tools * 46 + blocks * 10));
-}
-
-/** 一整轮只报一次用量：每步各报一遍会把头部撑成一列重复数字 */
-function turnUsage(msgs: Message[]): string {
-  const n = (x: unknown) => (typeof x === "number" && x > 0 ? x : 0);
-  let inp = 0;
-  let out = 0;
-  let reas = 0;
-  let cost = 0;
-  let ms = 0;
-  for (const m of msgs) {
-    const i = m.info;
-    const t = i.tokens ?? {};
-    inp += n(t.input);
-    out += n(t.output);
-    reas += n(t.reasoning);
-    cost += n(i.cost);
-    if (i.time.completed) ms += Math.max(0, i.time.completed - i.time.created);
-  }
-  const bits: string[] = [];
-  if (inp) bits.push(`输入 ${fmtNum(inp)}`);
-  if (out) bits.push(`输出 ${fmtNum(out)}`);
-  if (reas) bits.push(`思考 ${fmtNum(reas)}`);
-  if (cost) bits.push(`成本 ${fmtNum(cost, 4)}`);
-  if (ms >= 100) bits.push(fmtSpan(ms / 1000));
-  return bits.length > 1 ? bits.join(" · ") : "";
-}
-
-type TurnRowProps = {
-  user?: Message;
-  assistants: Message[];
-  running: boolean;
-  pulse: number;
-  stat?: TurnStat;
-  todo?: Todo[];
-  retry?: ReactNode;
-  onCopy: (t: string) => void;
-  onMenu: (e: ReactMouseEvent, m: Message) => void;
-  onOpenFile: (d: FileDiff) => void;
-  kidOf: (p: Part) => Message[] | undefined;
-};
-
-/** 一轮 = 一条用户消息 + 合并成一段的助手输出 + 轮末改动小结 */
-const TurnRow = memo(function TurnRow({
-  user,
-  assistants,
-  running,
-  pulse,
-  stat,
-  todo,
-  retry,
-  onCopy,
-  onMenu,
-  onOpenFile,
-  kidOf,
-}: TurnRowProps) {
-  const tail = assistants[assistants.length - 1];
-  const u = assistants.length ? turnUsage(assistants) : "";
-  return (
-    <>
-      {user && (
-        <article
-          className="msg user"
-          onContextMenu={(e) => onMenu(e, user)}
-        >
-          <header>
-            <span>{label(user.info)}</span>
-          </header>
-          {user.parts.map((p) => (
-            <Block key={p.id} part={p} />
-          ))}
-        </article>
-      )}
-      {tail && (
-        <article className="msg assistant">
-          <header>
-            <span>{label(tail.info)}</span>
-            {u && (
-              <span className="umeta" title={u}>
-                {u}
-              </span>
-            )}
-          </header>
-          {assistants.map((m) =>
-            m.info.error ? (
-              <p className="error inline" key={m.info.id}>
-                {m.info.error.data?.message ?? m.info.error.name}
-                {m === tail && retry}
-              </p>
-            ) : null,
-          )}
-          <AssistantParts
-            assistants={assistants}
-            live={running}
-            onCopy={onCopy}
-            onMenu={onMenu}
-            kidOf={kidOf}
-          />
-        </article>
-      )}
-      {stat && (
-        <>
-          <TurnSum
-            running={running}
-            pulse={running ? pulse : 0}
-            diffs={stat.diffs}
-            onOpenFile={onOpenFile}
-          />
-          {!running && <TurnTodo todos={todo} />}
-        </>
-      )}
-    </>
-  );
-}, sameTurn);
-
-/** 流式输出时只有正在跑的那轮消息引用会变，历史轮靠引用比较整份跳过 */
-function sameTurn(a: TurnRowProps, b: TurnRowProps): boolean {
-  if (
-    a.user !== b.user ||
-    a.running !== b.running ||
-    a.pulse !== b.pulse ||
-    a.stat !== b.stat ||
-    a.todo !== b.todo ||
-    a.retry !== b.retry ||
-    a.onCopy !== b.onCopy ||
-    a.onMenu !== b.onMenu ||
-    a.onOpenFile !== b.onOpenFile ||
-    a.kidOf !== b.kidOf ||
-    a.assistants.length !== b.assistants.length
-  )
-    return false;
-  for (let i = 0; i < a.assistants.length; i++) if (a.assistants[i] !== b.assistants[i]) return false;
-  return true;
-}
-
-/** 运行中的悬浮清单：绝对定位在对话区右上角，不随消息滚走，可折叠 */
-function TodoFly({ todos, pulse }: { todos: Todo[]; pulse: number }) {
-  const [fold, setFold] = useState(false);
-  if (!todos.length) return null;
-  const done = doneCount(todos);
-  const pct = Math.round((done / todos.length) * 100);
-  return (
-    <aside className={`todofly ${fold ? "folded" : ""}`} aria-label="运行中的待办清单">
-      <button
-        type="button"
-        className="tfhead"
-        onClick={() => setFold((v) => !v)}
-        aria-expanded={!fold}
-        title={fold ? "展开待办清单" : "收起待办清单"}
-      >
-        <span className="pulse-dot" key={pulse} aria-hidden="true" />
-        <b>待办清单</b>
-        <span className="tfprog">
-          {done} / {todos.length}
-        </span>
-        <span className="grow" />
-        <span className="tfchev" aria-hidden="true">
-          <svg viewBox="0 0 16 16">
-            <path
-              d={fold ? "M6 3.6l4.4 4.4L6 12.4" : "M3.6 6L8 10.4 12.4 6"}
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-        </span>
-      </button>
-      {!fold && (
-        <>
-          <div className="tfbar" aria-hidden="true">
-            <span style={{ width: `${pct}%` }} />
-          </div>
-          <TodoRows todos={todos} />
-        </>
-      )}
-    </aside>
-  );
-}
-
-/**
- * 子任务（explore/build 等 subagent）的实时进展。内核把它的每一次检索、每一次读文件
- * 都作为独立会话的 tool part 推出来，接住了才不是一句"执行 task"干等几十分钟。
- */
-function KidLog({ msgs, running }: { msgs: Message[]; running: boolean }) {
-  const steps = msgs.flatMap((m) => m.parts).filter((p) => p.type === "tool");
-  const replies = msgs.filter((m) => m.info.role === "assistant");
-  if (!running && !steps.length) return null;
-  // 子 agent 每步前面都会自己播报一句，跟着这句走比只看工具名清楚
-  const last = replies[replies.length - 1];
-  const narr = running && last ? turnText(last, 90) : "";
-  return (
-    <div className="kidlog">
-      <p className="muted small">
-        {running
-          ? `进展 · ${activityOf(msgs)}${narr && narr !== "（空）" ? ` · ${narr}` : ""}`
-          : `共 ${steps.length} 步 · ${replies.length} 次回复`}
-      </p>
-      {!!steps.length && (
-        <ol>
-          {steps.map((p) => {
-            const st = p.state?.status ?? "pending";
-            const head = toolHead(p);
-            return (
-              <li key={p.id}>
-                <StatusChip status={st} />
-                <b>{p.tool ?? "工具"}</b>
-                {head && <span className="arg">{head}</span>}
-              </li>
-            );
-          })}
-        </ol>
-      )}
-    </div>
-  );
 }

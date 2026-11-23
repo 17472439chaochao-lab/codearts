@@ -14,6 +14,7 @@ import {
   normalizeProviders,
   reloadInstance,
   skills,
+  checkinApi,
   type CustomProvider,
   type EnvCheck,
   type McpServer,
@@ -103,6 +104,7 @@ export default function App() {
   useEffect(() => {
     refresh();
     invoke<KernelStatus>("kernel_status").then(setStatus).catch(() => {});
+    void checkinApi.autoCheck().catch(() => {});
     const s = listen<KernelStatus>("kernel-status", (e) => setStatus(e.payload));
     return () => {
       s.then((f) => f());
@@ -997,7 +999,7 @@ const EXAMPLE_MCP = `{
 function Appearance() {
   const mode = useThemeMode();
   const opts: { id: ThemeMode; label: string; desc: string }[] = [
-    { id: "system", label: "跟随系统", desc: "macOS 切换外观时自动跟随" },
+    { id: "system", label: "跟随系统", desc: `${IS_WINDOWS ? "Windows" : "macOS"} 切换外观时自动跟随` },
     { id: "light", label: "浅色", desc: "始终浅色" },
     { id: "dark", label: "深色", desc: "始终深色" },
   ];
@@ -1814,7 +1816,6 @@ function ModelSettings({
                   <b>{m.name}</b>
                   <span>
                     {m.context ? `${Math.round(m.context / 1024)}K` : ""}
-                    {m.image ? " · 可看图" : ""}
                   </span>
                   {key === current && <em className="tag">当前</em>}
                 </li>
